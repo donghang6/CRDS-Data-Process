@@ -27,7 +27,7 @@ RINGDOWN_CSV = PROJECT_ROOT / "output" / "results" / "ringdown" / "9386.2076" / 
 OUTPUT_DIR = PROJECT_ROOT / "output" / "results" / "etalon_test"
 
 # 吸收峰区域（排除，不参与拟合）
-EXCLUDE_REGIONS = [[9385.9, 9386.5]]
+EXCLUDE_REGIONS = [[9386.05, 9386.35]]
 
 
 def main():

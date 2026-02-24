@@ -88,6 +88,17 @@ def _sine_component(x: np.ndarray, amplitude: float, frequency: float,
     return amplitude * np.sin(2.0 * np.pi * frequency * x + phase)
 
 
+def _sine_component_am(x: np.ndarray, amp0: float, amp1: float,
+                       frequency: float, phase: float,
+                       x_center: float) -> np.ndarray:
+    """调幅正弦分量: (a0 + a1*(x - x_center)) * sin(2π * f * x + φ)
+
+    振幅随波数线性变化，捕捉标准具振幅的空间不均匀性。
+    """
+    envelope = amp0 + amp1 * (x - x_center)
+    return envelope * np.sin(2.0 * np.pi * frequency * x + phase)
+
+
 def _build_exclude_mask(x: np.ndarray,
                         exclude_regions: list[list[float]] | None) -> np.ndarray:
     """构建排除掩码 (True = 用于拟合)"""
@@ -156,6 +167,9 @@ class EtalonRemover:
         去趋势多项式阶数 (推荐 1~3; 1 通常最优)
     n_iter : int
         交替迭代次数 (推荐 3~5)
+    flatten_baseline : bool
+        若为 True，corrected 中同时扣除基线趋势（保留均值），
+        使输出基线平坦化。默认 True。
     max_iter : int
         lmfit 每次正弦拟合的最大迭代次数
     """
@@ -167,6 +181,7 @@ class EtalonRemover:
         exclude_regions: list[list[float]] | None = None,
         poly_order: int = 1,
         n_iter: int = 5,
+        flatten_baseline: bool = True,
         max_iter: int = 20000,
     ):
         if n_etalons < 1:
@@ -176,6 +191,7 @@ class EtalonRemover:
         self.exclude_regions = exclude_regions
         self.poly_order = poly_order
         self.n_iter = n_iter
+        self.flatten_baseline = flatten_baseline
         self.max_iter = max_iter
 
     def _build_sine_model(
@@ -254,7 +270,7 @@ class EtalonRemover:
         # ── 迭代交替优化 ──
         etalon_on_fit = np.zeros_like(x_fit)  # 当前基线区域上的标准具估计
         last_result = None
-        freq_prev: list[float] | None = None  # 上一轮的频率结果
+        prev_params: Parameters | None = None  # 上一轮拟合参数（热启动）
 
         for iteration in range(self.n_iter):
             # Step A: 多项式去趋势 (在扣除当前标准具估计后的数据上)
@@ -264,19 +280,28 @@ class EtalonRemover:
 
             # Step B: 正弦拟合 (在去趋势残差上)
             residual = y_fit - baseline_fit
-            model, params = self._build_sine_model(x_fit, residual, freq_init=freq_prev)
+
+            if prev_params is None:
+                # 第一轮：自动估计频率
+                model, params = self._build_sine_model(x_fit, residual)
+            else:
+                # 后续轮：用上一轮结果热启动
+                model, params = self._build_sine_model(x_fit, residual)
+                for pname in prev_params:
+                    if pname in params:
+                        params[pname].set(value=prev_params[pname].value)
+
             last_result = model.fit(residual, params, x=x_fit, max_nfev=self.max_iter)
+            prev_params = last_result.params
 
             # 更新标准具估计
             etalon_on_fit = np.zeros_like(x_fit)
-            freq_prev = []
             for i in range(self.n_etalons):
                 pfx = f"e{i}_"
                 amp = last_result.params[f"{pfx}amplitude"].value
                 freq = last_result.params[f"{pfx}frequency"].value
                 phase = last_result.params[f"{pfx}phase"].value
                 etalon_on_fit += _sine_component(x_fit, amp, freq, phase)
-                freq_prev.append(freq)
 
         # ── 最终结果 ──
         # 最终多项式基线（全波段）
@@ -300,6 +325,11 @@ class EtalonRemover:
             })
 
         corrected = y - etalon_full
+
+        # 可选：扣除基线趋势（保留均值），使输出平坦
+        if self.flatten_baseline:
+            baseline_trend = baseline_full - float(np.mean(baseline_full))
+            corrected = corrected - baseline_trend
 
         return EtalonFitResult(
             wavenumber=x,
@@ -379,11 +409,11 @@ def plot_etalon_removal(
     ax.set_title(f"Etalon ({result.n_etalons} sine component)")
     ax.grid(True, alpha=0.3)
 
-    # (1,0) 去除标准具后
+    # (1,0) 去除标准具后 (全波段)
     ax = axes[1, 0]
     ax.plot(wn, result.corrected, ".", ms=2, color="steelblue", alpha=0.5)
     ax.set_ylabel("Corrected signal")
-    ax.set_title("After etalon removal")
+    ax.set_title("After etalon removal (full)")
     ax.grid(True, alpha=0.3)
 
     # (1,1) 拟合区域残差
@@ -413,8 +443,20 @@ def plot_etalon_removal(
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # (2,1) 隐藏
-    axes[2, 1].axis("off")
+    # (2,1) 基线区域 zoom-in
+    ax = axes[2, 1]
+    corr_bl = result.corrected[mask]
+    wn_bl = wn[mask]
+    ax.plot(wn_bl, corr_bl, ".", ms=2, color="steelblue", alpha=0.5)
+    bl_mean = np.mean(corr_bl)
+    bl_std = np.std(corr_bl)
+    ax.axhline(bl_mean, color="orange", lw=1, ls="--", label=f"mean={bl_mean:.3f}")
+    ax.set_ylim(bl_mean - 5 * bl_std, bl_mean + 5 * bl_std)
+    ax.set_xlabel("Wavenumber (cm⁻¹)")
+    ax.set_ylabel("Corrected signal")
+    ax.set_title(f"Baseline zoom-in (σ={bl_std:.4f})")
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
 
     fig.suptitle(title, fontsize=13)
     fig.tight_layout()
