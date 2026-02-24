@@ -173,11 +173,11 @@ def scans_to_dataframe(scans: list[ScanData]) -> pd.DataFrame:
             "index": s.meta.index,
             "wavenumber": s.meta.wavenumber,
             "timestamp": s.meta.timestamp,
-            "tau_mean": np.mean(s.tau),
-            "tau_std": np.std(s.tau, ddof=1),
+            "tau_mean": round(float(np.mean(s.tau)), 5),
+            "tau_std": round(float(np.std(s.tau, ddof=1)), 5),
             "tau_count": len(s.tau),
-            "temperature_mean": np.mean(s.temperature),
-            "pressure_mean": np.mean(s.pressure),
+            "temperature_mean": round(float(np.mean(s.temperature)), 3),
+            "pressure_mean": round(float(np.mean(s.pressure)), 3),
         })
 
     return pd.DataFrame(records)
