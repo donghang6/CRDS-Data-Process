@@ -138,25 +138,26 @@ def _estimate_dominant_frequency(x: np.ndarray, y: np.ndarray,
 # 标准具去除器
 # ==================================================================
 class EtalonRemover:
-    """标准具效应拟合与去除 (两步法)
+    """标准具效应拟合与去除 (迭代交替优化)
 
     策略:
-        Step 1 — 在基线区域拟合低阶多项式，去除缓变趋势
-        Step 2 — 在去趋势后的残差上拟合纯正弦模型，提取标准具参数
-        扣除  — 仅扣除正弦分量，保留原始基线形态和吸收峰
+        1. 多项式去趋势 → 正弦拟合 → 扣除正弦 → 重新拟合多项式 → …
+        2. 迭代收敛后，仅从原始信号中扣除正弦分量
 
     Parameters
     ----------
     n_etalons : int
         标准具正弦分量数目 (通常 1~3)
     freq_hints : list[float] | None
-        频率初始猜测值 (cycles/cm⁻¹)，None 则 FFT 自动估计
+        频率初始猜测值 (cycles/cm⁻¹)，None 则自动估计
     exclude_regions : list[list[float]] | None
         排除的波数区域 (如吸收峰)，格式 [[low1, high1], ...]
     poly_order : int
-        去趋势多项式阶数 (推荐 2~4)
+        去趋势多项式阶数 (推荐 1~3; 1 通常最优)
+    n_iter : int
+        交替迭代次数 (推荐 3~5)
     max_iter : int
-        lmfit 最大迭代次数
+        lmfit 每次正弦拟合的最大迭代次数
     """
 
     def __init__(
@@ -164,8 +165,9 @@ class EtalonRemover:
         n_etalons: int = 1,
         freq_hints: list[float] | None = None,
         exclude_regions: list[list[float]] | None = None,
-        poly_order: int = 3,
-        max_iter: int = 5000,
+        poly_order: int = 1,
+        n_iter: int = 5,
+        max_iter: int = 20000,
     ):
         if n_etalons < 1:
             raise ValueError("n_etalons 必须 >= 1")
@@ -173,27 +175,27 @@ class EtalonRemover:
         self.freq_hints = freq_hints
         self.exclude_regions = exclude_regions
         self.poly_order = poly_order
+        self.n_iter = n_iter
         self.max_iter = max_iter
 
     def _build_sine_model(
-        self, x: np.ndarray, y: np.ndarray
+        self, x: np.ndarray, y: np.ndarray,
+        freq_init: list[float] | None = None,
     ) -> tuple[Model, Parameters]:
-        """构建纯正弦 lmfit 模型 (无多项式)"""
+        """构建纯正弦 lmfit 模型"""
 
-        # 频率初值
-        if self.freq_hints and len(self.freq_hints) >= self.n_etalons:
-            freq_init = self.freq_hints[:self.n_etalons]
-        else:
-            freq_init = _estimate_dominant_frequency(x, y, self.n_etalons)
+        if freq_init is None:
+            if self.freq_hints and len(self.freq_hints) >= self.n_etalons:
+                freq_init = self.freq_hints[:self.n_etalons]
+            else:
+                freq_init = _estimate_dominant_frequency(x, y, self.n_etalons)
 
-        # 正弦分量
         model = Model(_sine_component, prefix="e0_")
         for i in range(1, self.n_etalons):
             model += Model(_sine_component, prefix=f"e{i}_")
 
         params = model.make_params()
 
-        # 用 std 估计振幅 (对正弦信号: amp ≈ sqrt(2) * std)
         amp_est = float(np.std(y) * np.sqrt(2))
         if amp_est < 1e-10:
             amp_est = float((np.max(y) - np.min(y)) / 2.0)
@@ -211,7 +213,7 @@ class EtalonRemover:
         self, wavenumber: np.ndarray, signal: np.ndarray,
         exclude_regions: list[list[float]] | None = None,
     ) -> EtalonFitResult:
-        """两步法拟合并去除标准具效应
+        """迭代交替优化拟合
 
         Parameters
         ----------
@@ -237,7 +239,6 @@ class EtalonRemover:
         if exclude_regions:
             all_exclude.extend(exclude_regions)
 
-        # 构建拟合掩码 (True = 基线区域)
         fit_mask = _build_exclude_mask(x, all_exclude)
         x_fit = x[fit_mask]
         y_fit = y[fit_mask]
@@ -245,37 +246,58 @@ class EtalonRemover:
         if len(x_fit) < 20:
             raise ValueError(f"排除后仅剩 {len(x_fit)} 个拟合点，不足以拟合")
 
-        # 波数中心化，避免多项式拟合数值病态
-        x_center = np.mean(x)
+        # 波数中心化
+        x_center = float(np.mean(x))
         x_c = x - x_center
         x_fit_c = x_fit - x_center
 
-        # ── Step 1: 多项式去趋势 (仅基线区域, 中心化坐标) ──
-        poly_coeffs = np.polyfit(x_fit_c, y_fit, self.poly_order)
-        baseline_fit = np.polyval(poly_coeffs, x_fit_c)  # 基线区域
-        baseline_full = np.polyval(poly_coeffs, x_c)      # 全波段
-        residual_fit = y_fit - baseline_fit                # 去趋势残差
+        # ── 迭代交替优化 ──
+        etalon_on_fit = np.zeros_like(x_fit)  # 当前基线区域上的标准具估计
+        last_result = None
+        freq_prev: list[float] | None = None  # 上一轮的频率结果
 
-        # ── Step 2: 纯正弦拟合 (在去趋势残差上) ──
-        model, params = self._build_sine_model(x_fit, residual_fit)
-        result = model.fit(residual_fit, params, x=x_fit, max_nfev=self.max_iter)
+        for iteration in range(self.n_iter):
+            # Step A: 多项式去趋势 (在扣除当前标准具估计后的数据上)
+            y_for_poly = y_fit - etalon_on_fit
+            poly_coeffs = np.polyfit(x_fit_c, y_for_poly, self.poly_order)
+            baseline_fit = np.polyval(poly_coeffs, x_fit_c)
 
-        # 用拟合参数在全波段计算标准具分量
+            # Step B: 正弦拟合 (在去趋势残差上)
+            residual = y_fit - baseline_fit
+            model, params = self._build_sine_model(x_fit, residual, freq_init=freq_prev)
+            last_result = model.fit(residual, params, x=x_fit, max_nfev=self.max_iter)
+
+            # 更新标准具估计
+            etalon_on_fit = np.zeros_like(x_fit)
+            freq_prev = []
+            for i in range(self.n_etalons):
+                pfx = f"e{i}_"
+                amp = last_result.params[f"{pfx}amplitude"].value
+                freq = last_result.params[f"{pfx}frequency"].value
+                phase = last_result.params[f"{pfx}phase"].value
+                etalon_on_fit += _sine_component(x_fit, amp, freq, phase)
+                freq_prev.append(freq)
+
+        # ── 最终结果 ──
+        # 最终多项式基线（全波段）
+        y_for_poly_final = y_fit - etalon_on_fit
+        poly_coeffs_final = np.polyfit(x_fit_c, y_for_poly_final, self.poly_order)
+        baseline_full = np.polyval(poly_coeffs_final, x_c)
+
+        # 标准具分量（全波段）
         etalon_full = np.zeros_like(x)
         components_info: list[dict] = []
-
         for i in range(self.n_etalons):
             pfx = f"e{i}_"
-            amp = result.params[f"{pfx}amplitude"].value
-            freq = result.params[f"{pfx}frequency"].value
-            phase = result.params[f"{pfx}phase"].value
+            amp = last_result.params[f"{pfx}amplitude"].value
+            freq = last_result.params[f"{pfx}frequency"].value
+            phase = last_result.params[f"{pfx}phase"].value
             etalon_full += _sine_component(x, amp, freq, phase)
             components_info.append({
                 "amplitude": amp,
                 "frequency": freq,
                 "phase": phase,
             })
-
 
         corrected = y - etalon_full
 
@@ -285,7 +307,7 @@ class EtalonRemover:
             etalon=etalon_full,
             baseline=baseline_full,
             corrected=corrected,
-            model_result=result,
+            model_result=last_result,
             n_etalons=self.n_etalons,
             fit_mask=fit_mask,
             components=components_info,

@@ -52,17 +52,16 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # --- 单频标准具 + 多项式基线，排除吸收峰 ---
+    # --- 单频标准具 + 迭代交替优化，排除吸收峰 ---
     print(f"\n{'─' * 50}")
-    print("  模型: a·sin(2πfx + φ) + poly(x, order=3)")
+    print("  模型: a·sin(2πfx + φ), 线性去趋势, 迭代交替优化")
     print(f"  排除吸收峰: {EXCLUDE_REGIONS}")
     print(f"{'─' * 50}")
 
     remover = EtalonRemover(
         n_etalons=1,
-        poly_order=3,
+        poly_order=1,
         exclude_regions=EXCLUDE_REGIONS,
-        max_iter=20000,
     )
     result = remover.fit(wn, tau)
 
