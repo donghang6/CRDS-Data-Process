@@ -205,3 +205,22 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.idea
+
+# ============================================================
+# CRDS Data Process - 项目专用
+# ============================================================
+# 原始数据和中间结果（仅保留 .gitkeep）
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# 输出文件
+output/figures/*
+!output/figures/.gitkeep
+output/results/*
+!output/results/.gitkeep
+
+# Jupyter Notebook 检查点
+.ipynb_checkpoints/
