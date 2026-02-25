@@ -219,6 +219,9 @@ data/raw/*
 data/processed/*
 !data/processed/.gitkeep
 
+# HITRAN 数据库（HAPI 下载的线参数，可通过脚本重新下载）
+data/hitran/
+
 # 输出文件
 output/figures/*
 !output/figures/.gitkeep
@@ -227,3 +230,4 @@ output/results/*
 
 # Jupyter Notebook 检查点
 .ipynb_checkpoints/
+
