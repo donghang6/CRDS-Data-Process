@@ -49,6 +49,7 @@ class EtalonFitResult:
     model_result: ModelResult       # lmfit 拟合结果 (仅基线区域)
     n_etalons: int                  # 标准具分量数
     fit_mask: np.ndarray            # 用于拟合的点 (bool)
+    exclude_regions: list = field(default_factory=list)  # 实际使用的排除区域
     components: list[dict] = field(default_factory=list)
 
     @property
@@ -65,9 +66,14 @@ class EtalonFitResult:
         lines = [
             f"Etalon fit: {self.n_etalons} component(s)",
             f"  拟合点数    = {self.n_fit_points} / {len(self.wavenumber)}",
+        ]
+        if self.exclude_regions:
+            for i, reg in enumerate(self.exclude_regions):
+                lines.append(f"  排除区域 {i}: [{reg[0]:.5f}, {reg[1]:.5f}] cm⁻¹")
+        lines.extend([
             f"  Reduced χ²  = {self.model_result.redchi:.6e}",
             f"  Residual σ  = {self.residual_std:.6e}",
-        ]
+        ])
         for i, comp in enumerate(self.components):
             lines.append(
                 f"  Component {i}: "
@@ -107,6 +113,175 @@ def _build_exclude_mask(x: np.ndarray,
         for low, high in exclude_regions:
             mask &= ~((x >= low) & (x <= high))
     return mask
+
+
+def hitran_detect_absorption(
+    wavenumber: np.ndarray,
+    temperature: float,
+    pressure_torr: float,
+    molecule: int = 7,
+    isotopologue: int = 1,
+    hitran_table: str | None = None,
+    hitran_dir: str | None = None,
+    threshold_ratio: float = 0.01,
+    margin: float = 0.05,
+    step: float = 0.002,
+) -> list[list[float]]:
+    """基于 HITRAN 模拟自动检测吸收峰区域
+
+    使用 HAPI 计算给定温度/压力下的吸收系数谱，
+    在吸收系数 > peak * threshold_ratio 的波数区域标记为吸收峰。
+
+    Parameters
+    ----------
+    wavenumber : np.ndarray
+        实测波数数组 (cm⁻¹)，用于确定模拟范围
+    temperature : float
+        温度 (°C)
+    pressure_torr : float
+        压力 (Torr)
+    molecule : int
+        HITRAN 分子编号 (默认 7 = O₂)
+    isotopologue : int
+        HITRAN 同位素编号 (默认 1 = ¹⁶O₂)
+    hitran_table : str | None
+        HAPI 本地表名。None 则自动搜索或下载
+    hitran_dir : str | None
+        HITRAN 本地数据目录。None 则使用默认路径
+    threshold_ratio : float
+        吸收系数阈值 = peak * threshold_ratio (0~1)
+        较小的值 → 排除区域更大；推荐 0.005~0.05
+    margin : float
+        检测到的区域向两侧扩展的余量 (cm⁻¹)
+    step : float
+        模拟波数步长 (cm⁻¹)
+
+    Returns
+    -------
+    list[list[float]]
+        排除区域列表 [[low1, high1], ...]
+    """
+    import os
+    import sys
+
+    # ── 静默导入 HAPI ──
+    _stdout = sys.stdout
+    sys.stdout = open(os.devnull, "w")
+    try:
+        import hapi
+    except ImportError:
+        sys.stdout.close()
+        sys.stdout = _stdout
+        raise ImportError("需要安装 hitran-api: pip install hitran-api")
+    finally:
+        sys.stdout.close()
+        sys.stdout = _stdout
+
+    # HITRAN 数据目录
+    if hitran_dir is None:
+        # 尝试项目默认路径
+        _candidates = [
+            os.path.join(os.getcwd(), "data", "hitran"),
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "hitran"),
+        ]
+        for c in _candidates:
+            c = os.path.abspath(c)
+            if os.path.isdir(c):
+                hitran_dir = c
+                break
+        if hitran_dir is None:
+            hitran_dir = os.path.join(os.getcwd(), "data", "hitran")
+            os.makedirs(hitran_dir, exist_ok=True)
+
+    # 保存/恢复当前目录 (hapi 会 chdir)
+    original_dir = os.getcwd()
+    os.chdir(hitran_dir)
+
+    try:
+        # 静默初始化 hapi
+        _stdout = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        try:
+            hapi.db_begin(hitran_dir)
+        finally:
+            sys.stdout.close()
+            sys.stdout = _stdout
+
+        # 确定表名
+        if hitran_table is None:
+            # 自动搜索已有表
+            mol_prefix = {7: "O2", 6: "CH4", 2: "CO2", 1: "H2O"}.get(molecule, f"M{molecule}")
+            for tname in hapi.LOCAL_TABLE_CACHE:
+                if tname.startswith(mol_prefix):
+                    hitran_table = tname
+                    break
+
+            if hitran_table is None:
+                # 需要下载
+                hitran_table = f"{mol_prefix}_iso{isotopologue}"
+                wn_min = float(np.min(wavenumber)) - 2.0
+                wn_max = float(np.max(wavenumber)) + 2.0
+                print(f"  [HITRAN] 下载 {mol_prefix} 数据 ({wn_min:.0f}-{wn_max:.0f} cm⁻¹)...")
+                hapi.fetch(
+                    TableName=hitran_table,
+                    M=molecule,
+                    I=isotopologue,
+                    numin=wn_min,
+                    numax=wn_max,
+                )
+
+        # ── 模拟吸收系数 ──
+        wn_min = float(np.min(wavenumber)) - 0.5
+        wn_max = float(np.max(wavenumber)) + 0.5
+
+        T_kelvin = temperature + 273.15
+        p_atm = pressure_torr / 760.0  # Torr → atm
+
+        _stdout = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        try:
+            nu_sim, alpha_sim = hapi.absorptionCoefficient_Voigt(
+                SourceTables=hitran_table,
+                Environment={"T": T_kelvin, "p": p_atm},
+                WavenumberRange=[wn_min, wn_max],
+                WavenumberStep=step,
+                HITRAN_units=False,
+            )
+        finally:
+            sys.stdout.close()
+            sys.stdout = _stdout
+
+        alpha_sim = alpha_sim.flatten()
+
+    finally:
+        os.chdir(original_dir)
+
+    # ── 检测吸收峰区域 ──
+    alpha_peak = float(np.max(alpha_sim))
+    if alpha_peak <= 0:
+        return []
+
+    threshold = alpha_peak * threshold_ratio
+    above = nu_sim[alpha_sim > threshold]
+
+    if len(above) == 0:
+        return []
+
+    # 合并连续区域
+    dx_sim = step * 3
+    regions: list[list[float]] = []
+    region_start = float(above[0])
+    region_end = float(above[0])
+
+    for i in range(1, len(above)):
+        if above[i] - above[i - 1] > dx_sim:
+            regions.append([region_start - margin, region_end + margin])
+            region_start = float(above[i])
+        region_end = float(above[i])
+
+    regions.append([region_start - margin, region_end + margin])
+
+    return regions
 
 
 def _estimate_dominant_frequency(x: np.ndarray, y: np.ndarray,
@@ -161,8 +336,11 @@ class EtalonRemover:
         标准具正弦分量数目 (通常 1~3)
     freq_hints : list[float] | None
         频率初始猜测值 (cycles/cm⁻¹)，None 则自动估计
-    exclude_regions : list[list[float]] | None
-        排除的波数区域 (如吸收峰)，格式 [[low1, high1], ...]
+    exclude_regions : list[list[float]] | str | None
+        排除的波数区域。支持:
+        - list: 手动指定 [[low1, high1], ...]
+        - "hitran": 基于 HITRAN 模拟自动检测吸收峰区域 (推荐)
+        - None: 不排除任何区域
     poly_order : int
         去趋势多项式阶数 (推荐 1~3; 1 通常最优)
     n_iter : int
@@ -170,6 +348,9 @@ class EtalonRemover:
     flatten_baseline : bool
         若为 True，corrected 中同时扣除基线趋势（保留均值），
         使输出基线平坦化。默认 True。
+    hitran_kwargs : dict | None
+        传给 hitran_detect_absorption 的额外参数
+        (molecule, isotopologue, threshold_ratio, margin 等)
     max_iter : int
         lmfit 每次正弦拟合的最大迭代次数
     """
@@ -178,10 +359,11 @@ class EtalonRemover:
         self,
         n_etalons: int = 1,
         freq_hints: list[float] | None = None,
-        exclude_regions: list[list[float]] | None = None,
+        exclude_regions: list[list[float]] | str | None = "hitran",
         poly_order: int = 1,
         n_iter: int = 5,
         flatten_baseline: bool = True,
+        hitran_kwargs: dict | None = None,
         max_iter: int = 20000,
     ):
         if n_etalons < 1:
@@ -192,6 +374,7 @@ class EtalonRemover:
         self.poly_order = poly_order
         self.n_iter = n_iter
         self.flatten_baseline = flatten_baseline
+        self.hitran_kwargs = hitran_kwargs or {}
         self.max_iter = max_iter
 
     def _build_sine_model(
@@ -228,6 +411,8 @@ class EtalonRemover:
     def fit(
         self, wavenumber: np.ndarray, signal: np.ndarray,
         exclude_regions: list[list[float]] | None = None,
+        temperature: float | None = None,
+        pressure_torr: float | None = None,
     ) -> EtalonFitResult:
         """迭代交替优化拟合
 
@@ -239,6 +424,10 @@ class EtalonRemover:
             待处理信号
         exclude_regions : list[list[float]] | None
             临时排除区域，与构造函数中的合并
+        temperature : float | None
+            温度 (°C)，仅 exclude_regions="hitran" 时需要
+        pressure_torr : float | None
+            压力 (Torr)，仅 exclude_regions="hitran" 时需要
 
         Returns
         -------
@@ -250,8 +439,24 @@ class EtalonRemover:
         if len(x) != len(y):
             raise ValueError("wavenumber 和 signal 长度不一致")
 
-        # 合并排除区域
-        all_exclude = list(self.exclude_regions or [])
+        # 解析排除区域
+        if self.exclude_regions == "hitran":
+            if temperature is None or pressure_torr is None:
+                raise ValueError(
+                    "exclude_regions='hitran' 需要提供 temperature (°C) "
+                    "和 pressure_torr (Torr)"
+                )
+            auto_regions = hitran_detect_absorption(
+                x, temperature=temperature, pressure_torr=pressure_torr,
+                **self.hitran_kwargs,
+            )
+        elif isinstance(self.exclude_regions, list):
+            auto_regions = list(self.exclude_regions)
+        else:
+            auto_regions = []
+
+        # 合并临时排除区域
+        all_exclude = auto_regions[:]
         if exclude_regions:
             all_exclude.extend(exclude_regions)
 
@@ -340,6 +545,7 @@ class EtalonRemover:
             model_result=last_result,
             n_etalons=self.n_etalons,
             fit_mask=fit_mask,
+            exclude_regions=all_exclude,
             components=components_info,
         )
 
@@ -348,11 +554,32 @@ class EtalonRemover:
         df: pd.DataFrame,
         wavenumber_col: str = "wavenumber",
         signal_col: str = "alpha",
+        temperature_col: str = "temperature",
+        pressure_col: str = "pressure",
         inplace: bool = False,
     ) -> tuple[pd.DataFrame, EtalonFitResult]:
-        """对 DataFrame 去除标准具效应"""
+        """对 DataFrame 去除标准具效应
+
+        当 exclude_regions="hitran" 时，自动从 DataFrame 中提取
+        温度和压力的平均值用于 HITRAN 模拟。
+        """
         out = df if inplace else df.copy()
-        result = self.fit(out[wavenumber_col].values, out[signal_col].values)
+
+        # 自动提取温度和压力
+        temperature = None
+        pressure_torr = None
+        if self.exclude_regions == "hitran":
+            if temperature_col in df.columns:
+                temperature = float(df[temperature_col].mean())
+            if pressure_col in df.columns:
+                pressure_torr = float(df[pressure_col].mean())
+
+        result = self.fit(
+            out[wavenumber_col].values,
+            out[signal_col].values,
+            temperature=temperature,
+            pressure_torr=pressure_torr,
+        )
         out[f"{signal_col}_etalon"] = result.etalon
         out[f"{signal_col}_no_etalon"] = result.corrected
         return out, result
