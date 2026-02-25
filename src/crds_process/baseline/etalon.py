@@ -695,3 +695,156 @@ def plot_etalon_removal(
     plt.close(fig)
     return fig
 
+
+# ==================================================================
+# 项目级常量
+# ==================================================================
+from pathlib import Path as _Path
+
+_PROJECT_ROOT = _Path(__file__).resolve().parent.parent.parent.parent
+RINGDOWN_ROOT = _PROJECT_ROOT / "output" / "results" / "ringdown"
+ETALON_ROOT = _PROJECT_ROOT / "output" / "results" / "etalon"
+_CSV_NAME = "ringdown_results.csv"
+
+
+# ==================================================================
+# 自动发现 & 批量处理
+# ==================================================================
+def _discover_ringdown_results(
+    ringdown_root: _Path | None = None,
+) -> list[tuple[str, str, _Path]]:
+    """自动发现 ringdown_root/{跃迁波数}/{压力}/ringdown_results.csv"""
+    root = ringdown_root or RINGDOWN_ROOT
+    tasks: list[tuple[str, str, _Path]] = []
+    for transition_dir in sorted(root.iterdir()):
+        if not transition_dir.is_dir() or transition_dir.name.startswith("."):
+            continue
+        for pressure_dir in sorted(transition_dir.iterdir()):
+            if not pressure_dir.is_dir() or pressure_dir.name.startswith("."):
+                continue
+            csv_path = pressure_dir / _CSV_NAME
+            if csv_path.exists():
+                tasks.append((transition_dir.name, pressure_dir.name, csv_path))
+    return tasks
+
+
+def _process_single(
+    csv_path: _Path,
+    output_dir: _Path,
+    label: str = "",
+    hitran_kwargs: dict | None = None,
+) -> bool:
+    """处理单个 ringdown_results.csv 的标准具去除"""
+    df = pd.read_csv(csv_path)
+    wn = df["wavenumber"].values
+    tau = df["tau_mean"].values
+    temperature = float(df["temperature"].mean())
+    pressure = float(df["pressure"].mean())
+
+    print(f"\n  数据: {csv_path}")
+    print(f"    点数: {len(wn)}, 波数: {wn.min():.5f} ~ {wn.max():.5f} cm⁻¹")
+    print(f"    温度: {temperature:.1f} °C, 压力: {pressure:.1f} Torr")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    hkw = hitran_kwargs or {
+        "molecule": 7,
+        "isotopologue": 1,
+        "threshold_ratio": 0.01,
+        "margin": 0.05,
+    }
+    remover = EtalonRemover(
+        n_etalons=1,
+        poly_order=1,
+        exclude_regions="hitran",
+        hitran_kwargs=hkw,
+    )
+
+    try:
+        result = remover.fit(wn, tau, temperature=temperature, pressure_torr=pressure)
+    except Exception as e:
+        print(f"    [ERROR] 拟合失败: {e}")
+        return False
+
+    print(f"    {result.summary()}")
+    print(f"    拟合成功: {result.model_result.success}, "
+          f"迭代: {result.model_result.nfev}")
+
+    title = f"Etalon Removal — {label}" if label else "Etalon Removal"
+    plot_etalon_removal(
+        result,
+        title=title,
+        save_path=str(output_dir / "etalon_removal.png"),
+    )
+
+    df_out = df.copy()
+    df_out["tau_mean_etalon"] = result.etalon
+    df_out["tau_mean_no_etalon"] = result.corrected
+    df_out.to_csv(output_dir / "tau_etalon_corrected.csv", index=False)
+
+    return True
+
+
+def batch_etalon_removal(
+    ringdown_root: _Path | None = None,
+    etalon_root: _Path | None = None,
+    hitran_kwargs: dict | None = None,
+):
+    """批量处理所有自动发现的 ringdown 数据集的标准具去除
+
+    自动扫描 ringdown_root/{跃迁波数}/{压力}/ringdown_results.csv，
+    基于 HITRAN 模拟自动检测吸收峰排除区域，去除标准具效应，
+    结果输出到 etalon_root/{跃迁波数}/{压力}/。
+
+    Parameters
+    ----------
+    ringdown_root : Path, optional
+        ringdown 结果根目录，默认 output/results/ringdown/
+    etalon_root : Path, optional
+        etalon 输出根目录，默认 output/results/etalon/
+    hitran_kwargs : dict, optional
+        传给 hitran_detect_absorption 的参数
+    """
+    r_root = ringdown_root or RINGDOWN_ROOT
+    e_root = etalon_root or ETALON_ROOT
+
+    tasks = _discover_ringdown_results(r_root)
+    if not tasks:
+        print(f"[ERROR] 未在 {r_root} 下找到 {{跃迁波数}}/{{压力}}/{_CSV_NAME}")
+        return
+
+    print(f"{'#' * 60}")
+    print(f"  CRDS 标准具效应批量去除 (HITRAN 自动检测)")
+    print(f"  输入根目录: {r_root}")
+    print(f"  输出根目录: {e_root}")
+    print(f"  发现 {len(tasks)} 个数据集:")
+    for transition, pressure, _ in tasks:
+        print(f"    {transition}/{pressure}/")
+    print(f"{'#' * 60}")
+
+    success = 0
+    for i, (transition, pressure, csv_path) in enumerate(tasks, 1):
+        output_dir = e_root / transition / pressure
+        print(f"\n{'=' * 60}")
+        print(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
+        print(f"{'=' * 60}")
+
+        ok = _process_single(
+            csv_path, output_dir,
+            label=f"{transition} / {pressure}",
+            hitran_kwargs=hitran_kwargs,
+        )
+        if ok:
+            success += 1
+
+    print(f"\n\n{'#' * 60}")
+    print(f"  全部处理完成! {success}/{len(tasks)} 成功")
+    print(f"{'#' * 60}")
+    for transition, pressure, _ in tasks:
+        d = e_root / transition / pressure
+        if d.exists():
+            print(f"\n  {transition}/{pressure}/")
+            for f in sorted(d.glob("*")):
+                print(f"    {f.name:<45s} {f.stat().st_size:>10,} bytes")
+
+

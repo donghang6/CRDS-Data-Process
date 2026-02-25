@@ -5,6 +5,7 @@ from crds_process.baseline.etalon import (
     EtalonFitResult,
     hitran_detect_absorption,
     plot_etalon_removal,
+    batch_etalon_removal,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "EtalonFitResult",
     "hitran_detect_absorption",
     "plot_etalon_removal",
+    "batch_etalon_removal",
 ]
