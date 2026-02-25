@@ -5,7 +5,7 @@
 然后在全波段扣除标准具正弦分量。
 
 用法:
-    python scripts/test_etalon_removal.py
+    python scripts/etalon_removal.py
 """
 
 from __future__ import annotations
