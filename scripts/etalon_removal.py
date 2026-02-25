@@ -12,6 +12,6 @@
 """
 
 from crds_process.baseline.etalon import batch_etalon_removal
-wo
+
 if __name__ == "__main__":
     batch_etalon_removal()
