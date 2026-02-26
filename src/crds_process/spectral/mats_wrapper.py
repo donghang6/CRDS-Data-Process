@@ -749,6 +749,19 @@ class MATSFitter:
             return
 
         wn = summary[wn_col].values
+
+        # 确定实际数据的波数范围 (用 alpha/tau 列的非 NaN 范围)
+        # MATS 的 model 列在 sim_window 外也有值，需要裁剪
+        data_mask = np.ones(len(wn), dtype=bool)
+        if alpha_col:
+            alpha_vals = summary[alpha_col].values
+            data_mask = ~np.isnan(alpha_vals) & (alpha_vals != 0)
+        if data_mask.any():
+            wn_data_min = float(wn[data_mask].min())
+            wn_data_max = float(wn[data_mask].max())
+        else:
+            wn_data_min, wn_data_max = float(wn.min()), float(wn.max())
+
         fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
 
         # Panel 1: Alpha + Model
@@ -756,7 +769,12 @@ class MATSFitter:
         if alpha_col:
             ax.plot(wn, summary[alpha_col], "b.", ms=2, alpha=0.5, label="Data")
         if model_col:
-            ax.plot(wn, summary[model_col], "r-", lw=1, label="MATS Fit")
+            # 只在数据范围内绘制模型线，避免 sim_window 外的斜线
+            model_vals = summary[model_col].values.copy()
+            outside = (wn < wn_data_min) | (wn > wn_data_max)
+            model_vals[outside] = np.nan
+            ax.plot(wn, model_vals, "r-", lw=1, label="MATS Fit")
+        ax.set_xlim(wn_data_min, wn_data_max)
         ax.set_ylabel("α (ppm/cm)")
         ax.set_title(title)
         ax.legend()
@@ -769,7 +787,9 @@ class MATSFitter:
             ax.plot(wn, res, ".", ms=2, color="tomato", alpha=0.5)
             ax.axhline(0, color="gray", lw=0.5, ls="--")
             ax.set_ylabel("Residual (ppm/cm)")
-            ax.set_title(f"Residual (σ={np.std(res):.4e})")
+            # 只用数据范围内的残差计算 σ
+            res_valid = res[~outside] if model_col else res
+            ax.set_title(f"Residual (σ={np.std(res_valid):.4e})")
         ax.grid(True, alpha=0.3)
 
         # Panel 3: Tau
