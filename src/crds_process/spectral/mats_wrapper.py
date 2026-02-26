@@ -218,14 +218,19 @@ class HitranLinelistBuilder:
         margin = 5.0
         df = df[(df["nu"] >= wn_min - margin) & (df["nu"] <= wn_max + margin)]
         df["sw_scale_factor"] = 1.0
+        # 注意: n_gamma0_self 已从 HITRAN 赋值，不在此列表中覆盖为 0
+        # SD_gamma 设置非零初始值 (SDVP 线形需要)
         for col in [
-            "n_delta0_air", "n_gamma0_self", "n_delta0_self", "delta0_self",
-            "SD_gamma_air", "SD_delta_air", "n_gamma2_air", "n_delta2_air",
-            "SD_gamma_self", "SD_delta_self", "n_gamma2_self", "n_delta2_self",
+            "n_delta0_air", "n_delta0_self", "delta0_self",
+            "SD_delta_air", "n_gamma2_air", "n_delta2_air",
+            "SD_delta_self", "n_gamma2_self", "n_delta2_self",
             "nuVC_air", "nuVC_self", "n_nuVC_air", "n_nuVC_self",
             "eta_air", "eta_self", "y_air", "n_y_air", "y_self", "n_y_self",
         ]:
             df[col] = 0.0
+        # SD_gamma 初始猜测 ~0.10 (O₂ A-band 典型值)
+        df["SD_gamma_air"] = 0.10
+        df["SD_gamma_self"] = 0.10
         df = df.reset_index(drop=True)
         if save_path:
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
@@ -257,13 +262,17 @@ class MATSFitResult:
             for _, row in self.param_linelist.iterrows():
                 nu = row.get("nu", 0)
                 sw = row.get("sw", 0)
-                gamma0 = row.get("gamma0_air", 0)
-                delta0 = row.get("delta0_air", 0)
+                gamma0_air = row.get("gamma0_air", 0)
+                gamma0_self = row.get("gamma0_self", 0)
+                delta0_air = row.get("delta0_air", 0)
+                delta0_self = row.get("delta0_self", 0)
+                sd_gamma = row.get("SD_gamma_self", row.get("SD_gamma_air", 0))
                 lines.append(
                     f"  Line: ν={nu:.6f} cm⁻¹, "
                     f"S={sw:.4e}, "
-                    f"γ₀_air={gamma0:.5f}, "
-                    f"δ₀_air={delta0:.6f}"
+                    f"γ₀_self={gamma0_self:.5f}, "
+                    f"γ₀_air={gamma0_air:.5f}, "
+                    f"δ₀_air={delta0_air:.6f}"
                 )
         return "\n".join(lines)
 
@@ -301,7 +310,7 @@ class MATSFitter:
         molecule: int = 7,
         isotopologue: int = 1,
         molefraction: dict | None = None,
-        diluent: str = "air",
+        diluent: str = "self",
         Diluent: dict | None = None,
         lineprofile: str = "SDVP",
         baseline_order: int = 1,
@@ -314,12 +323,15 @@ class MATSFitter:
         self.molefraction = molefraction or {molecule: 1.0}
         self.diluent = diluent
         # 显式设置 Diluent (与参考脚本一致)
-        # 纯 O₂: Diluent={'air': {'composition':1, 'm': 31.9988}}
+        # 纯 O₂: Diluent={'self': {'composition':1, 'm': 31.9988}}
         # O₂+N₂: Diluent={'air': {'composition':1, 'm': 28.014}}
         if Diluent is not None:
             self.Diluent = Diluent
         else:
-            self.Diluent = {diluent: {"composition": 1, "m": 31.9988}}
+            if diluent == "self":
+                self.Diluent = {"self": {"composition": 1, "m": 31.9988}}
+            else:
+                self.Diluent = {diluent: {"composition": 1, "m": 28.964}}
         self.lineprofile = lineprofile
         self.baseline_order = baseline_order
         self.etalons = etalons or {}
@@ -438,14 +450,14 @@ class MATSFitter:
             vary_nu={self.molecule: {self.isotopologue: True}},
             vary_sw={self.molecule: {self.isotopologue: True}},
             vary_gamma0={self.molecule: {self.isotopologue: True}},
-            vary_n_gamma0={self.molecule: {self.isotopologue: True}},
+            vary_n_gamma0={self.molecule: {self.isotopologue: False}},
             vary_delta0={self.molecule: {self.isotopologue: False}},
-            vary_n_delta0={self.molecule: {self.isotopologue: True}},
+            vary_n_delta0={self.molecule: {self.isotopologue: False}},
             vary_aw={self.molecule: {self.isotopologue: True}},
             vary_n_gamma2={self.molecule: {self.isotopologue: False}},
-            vary_as={},
+            vary_as={self.molecule: {self.isotopologue: False}},
             vary_n_delta2={self.molecule: {self.isotopologue: False}},
-            vary_nuVC={self.molecule: {self.isotopologue: True}},
+            vary_nuVC={self.molecule: {self.isotopologue: False}},
             vary_n_nuVC={self.molecule: {self.isotopologue: False}},
             vary_eta={},
             vary_linemixing={self.molecule: {self.isotopologue: False}},
@@ -470,11 +482,12 @@ class MATSFitter:
         )
         params = fit.generate_params()
 
-        # SD_gamma 约束 (参考脚本)
+        # SD_gamma / SD_delta 约束 (参考 Fitting_Protocol_ABand)
         for param in params:
-            if "SD_gamma" in param:
-                if params[param].vary:
-                    params[param].set(value=0.10, min=0.01, max=0.25)
+            if "SD_gamma" in param and params[param].vary:
+                params[param].set(value=0.10, min=0.01, max=0.25)
+            elif "SD_delta" in param and params[param].vary:
+                params[param].set(value=0.05, min=0.0, max=0.25)
 
         result = fit.fit_data(params, wing_cutoff=25)
 
@@ -680,10 +693,10 @@ def batch_mats_fitting(
         传递给 MATSFitter 的参数:
         - molecule: 分子 ID (默认 7 = O₂)
         - molefraction: 摩尔分数 (默认 {7: 1.0})
-        - diluent: 稀释气名 (默认 "air")
-        - Diluent: 显式稀释气字典 (默认 {"air": {"composition":1, "m":31.9988}})
+        - diluent: 稀释气名 (默认 "self")
+        - Diluent: 显式稀释气字典 (默认 {"self": {"composition":1, "m":31.9988}})
         - lineprofile: 线形 (默认 "SDVP")
-        - fit_intensity: 可浮动线强阈值 (默认 1e-24)
+        - fit_intensity: 可浮动线强阈值 (默认 1e-30)
     """
     fitter = MATSFitter(**fitter_kwargs) if fitter_kwargs else None
     MATSBatchProcessor(
