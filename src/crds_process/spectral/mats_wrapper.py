@@ -221,13 +221,18 @@ class HitranLinelistBuilder:
         # 注意: n_gamma0_self 已从 HITRAN 赋值，不在此列表中覆盖为 0
         # SD_gamma 设置非零初始值 (SDVP 线形需要)
         for col in [
-            "n_delta0_air", "n_delta0_self", "delta0_self",
+            "n_delta0_air", "n_delta0_self",
             "SD_delta_air", "n_gamma2_air", "n_delta2_air",
-            "SD_delta_self", "n_gamma2_self", "n_delta2_self",
+            "n_gamma2_self", "n_delta2_self",
             "nuVC_air", "nuVC_self", "n_nuVC_air", "n_nuVC_self",
             "eta_air", "eta_self", "y_air", "n_y_air", "y_self", "n_y_self",
         ]:
             df[col] = 0.0
+        # delta0_self 初始猜测 (O₂ A-band 典型值 ~ -0.005 cm⁻¹/atm)
+        df["delta0_self"] = -0.005
+        # SD_delta 初始猜测
+        df["SD_delta_air"] = 0.05
+        df["SD_delta_self"] = 0.05
         # SD_gamma 初始猜测 ~0.10 (O₂ A-band 典型值)
         df["SD_gamma_air"] = 0.10
         df["SD_gamma_self"] = 0.10
@@ -267,12 +272,16 @@ class MATSFitResult:
                 delta0_air = row.get("delta0_air", 0)
                 delta0_self = row.get("delta0_self", 0)
                 sd_gamma = row.get("SD_gamma_self", row.get("SD_gamma_air", 0))
+                sd_delta = row.get("SD_delta_self", row.get("SD_delta_air", 0))
                 lines.append(
                     f"  Line: ν={nu:.6f} cm⁻¹, "
                     f"S={sw:.4e}, "
                     f"γ₀_self={gamma0_self:.5f}, "
                     f"γ₀_air={gamma0_air:.5f}, "
-                    f"δ₀_air={delta0_air:.6f}"
+                    f"δ₀_self={delta0_self:.6f}, "
+                    f"δ₀_air={delta0_air:.6f}, "
+                    f"SD_γ={sd_gamma:.4f}, "
+                    f"SD_δ={sd_delta:.4f}"
                 )
         return "\n".join(lines)
 
@@ -447,15 +456,15 @@ class MATSFitter:
             linemixing_constrain=True,
         )
         fitparam.generate_fit_param_linelist_from_linelist(
-            vary_nu={self.molecule: {self.isotopologue: True}},
+            vary_nu={self.molecule: {self.isotopologue: False}},
             vary_sw={self.molecule: {self.isotopologue: True}},
             vary_gamma0={self.molecule: {self.isotopologue: True}},
             vary_n_gamma0={self.molecule: {self.isotopologue: False}},
-            vary_delta0={self.molecule: {self.isotopologue: False}},
+            vary_delta0={self.molecule: {self.isotopologue: True}},
             vary_n_delta0={self.molecule: {self.isotopologue: False}},
             vary_aw={self.molecule: {self.isotopologue: True}},
             vary_n_gamma2={self.molecule: {self.isotopologue: False}},
-            vary_as={self.molecule: {self.isotopologue: False}},
+            vary_as={self.molecule: {self.isotopologue: True}},
             vary_n_delta2={self.molecule: {self.isotopologue: False}},
             vary_nuVC={self.molecule: {self.isotopologue: False}},
             vary_n_nuVC={self.molecule: {self.isotopologue: False}},
@@ -467,7 +476,7 @@ class MATSFitter:
             vary_pressure=False,
             vary_temperature=False,
             vary_molefraction={self.molecule: False},
-            vary_xshift=False,
+            vary_xshift=True,
         )
 
         param_file = fitparam.param_linelist_savename
@@ -482,12 +491,14 @@ class MATSFitter:
         )
         params = fit.generate_params()
 
-        # SD_gamma / SD_delta 约束 (参考 Fitting_Protocol_ABand)
+        # SD_gamma / SD_delta / delta0 约束 (参考 Fitting_Protocol_ABand)
         for param in params:
             if "SD_gamma" in param and params[param].vary:
                 params[param].set(value=0.10, min=0.01, max=0.25)
             elif "SD_delta" in param and params[param].vary:
                 params[param].set(value=0.05, min=0.0, max=0.25)
+            elif "delta0" in param and params[param].vary:
+                params[param].set(min=-0.05, max=0.05)
 
         result = fit.fit_data(params, wing_cutoff=25)
 
