@@ -357,7 +357,7 @@ class MATSFitter:
         output_dir: Path | str,
         dataset_name: str = "crds_fit",
     ) -> MATSFitResult:
-        """执行 MATS 拟合"""
+        """执行单光谱 MATS 拟合"""
         MATS = _import_mats()
         from MATS import Spectrum, Dataset, Generate_FitParam_File, Fit_DataSet
 
@@ -398,6 +398,197 @@ class MATSFitter:
                 MATS, spec_name, param_linelist, dataset_name,
                 Spectrum, Dataset, Generate_FitParam_File, Fit_DataSet,
             )
+        finally:
+            os.chdir(saved_dir)
+
+    def fit_multi(
+        self,
+        etalon_csvs: list[Path | str],
+        labels: list[str],
+        output_dir: Path | str,
+        dataset_name: str = "crds_multi",
+    ) -> MATSFitResult:
+        """多光谱联合拟合
+
+        将多个压力下的光谱同时放入一个 Dataset 拟合，
+        线强 (sw)、���宽系数 (gamma0) 等参数在所有光谱间共享约束，
+        而基线和 x_shift 对每条光谱独立。
+
+        Parameters
+        ----------
+        etalon_csvs : list[Path | str]
+            各压力的 etalon corrected CSV 路径列表
+        labels : list[str]
+            对应的标签 (如 ["100Torr", "150Torr", ...])
+        output_dir : Path | str
+            输出目录
+        dataset_name : str
+            数据集名
+
+        Returns
+        -------
+        MATSFitResult
+        """
+        MATS = _import_mats()
+        from MATS import Spectrum, Dataset, Generate_FitParam_File, Fit_DataSet
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 读取所有数据, 获取全局波数范围
+        all_dfs = []
+        wn_global_min, wn_global_max = 1e9, 0
+        for csv_path in etalon_csvs:
+            df = pd.read_csv(csv_path)
+            all_dfs.append(df)
+            wn_global_min = min(wn_global_min, float(df["wavenumber"].min()))
+            wn_global_max = max(wn_global_max, float(df["wavenumber"].max()))
+
+        print(f"  多光谱联合拟合: {len(etalon_csvs)} 条光谱")
+        print(f"  全局波数范围: {wn_global_min:.5f} ~ {wn_global_max:.5f} cm⁻¹")
+        for i, (lbl, df) in enumerate(zip(labels, all_dfs)):
+            print(f"    [{i+1}] {lbl}: {len(df)} 点, "
+                  f"P={df['pressure'].mean():.1f} Torr")
+
+        saved_dir = os.getcwd()
+        os.chdir(str(output_dir))
+        try:
+            # 构建 param_linelist (只需一份, 所有光谱共享)
+            linelist_csv = f"{dataset_name}_linelist.csv"
+            param_linelist = self._linelist_builder.build(
+                wn_global_min, wn_global_max, save_path=linelist_csv,
+            )
+            print(f"  线表: {len(param_linelist)} 条谱线")
+            for _, row in param_linelist.iterrows():
+                if row["sw"] > self.threshold_intensity:
+                    print(f"    ν={row['nu']:.6f}, S={row['sw']:.4e}")
+            if len(param_linelist) == 0:
+                print("  [WARN] 未找到谱线，跳过拟合")
+                return MATSFitResult()
+
+            # 为每个光谱创建 Spectrum 对象
+            spectra = []
+            for i, (lbl, df) in enumerate(zip(labels, all_dfs)):
+                spec_name = f"{dataset_name}_{lbl}_spectrum"
+                self._preparer.prepare(df, spec_name)
+
+                spec_csv = pd.read_csv(spec_name + ".csv")
+                has_stats = self._preparer.MATS_TAU_STATS in spec_csv.columns
+
+                spec = Spectrum(
+                    spec_name,
+                    molefraction=self.molefraction,
+                    natural_abundance=True,
+                    diluent=self.diluent,
+                    Diluent=self.Diluent,
+                    input_freq=False,
+                    input_tau=True,
+                    pressure_column=self._preparer.MATS_PRESSURE,
+                    temperature_column=self._preparer.MATS_TEMPERATURE,
+                    frequency_column=self._preparer.MATS_FREQUENCY,
+                    tau_column=self._preparer.MATS_TAU,
+                    tau_stats_column=(self._preparer.MATS_TAU_STATS
+                                     if has_stats else None),
+                    etalons=self.etalons,
+                    nominal_temperature=296,
+                    baseline_order=self.baseline_order,
+                )
+                spectra.append(spec)
+                print(f"    Spectrum {lbl}: "
+                      f"P={spec.pressure:.4f} atm, T={spec.temperature:.2f} K")
+
+            # 联合 Dataset
+            ds = Dataset(spectra, dataset_name, param_linelist)
+            base_linelist = ds.generate_baseline_paramlist()
+
+            param_save = f"{dataset_name}_Parameter_LineList"
+            base_save = f"{dataset_name}_baseline_paramlist"
+
+            # Generate_FitParam_File — constrain=True 使参数在光谱间约束
+            fitparam = Generate_FitParam_File(
+                ds, param_linelist, base_linelist,
+                lineprofile=self.lineprofile,
+                linemixing=False,
+                threshold_intensity=self.threshold_intensity,
+                fit_intensity=self.fit_intensity,
+                sim_window=5,
+                param_linelist_savename=param_save,
+                base_linelist_savename=base_save,
+                nu_constrain=True, sw_constrain=True,
+                gamma0_constrain=True, delta0_constrain=True,
+                aw_constrain=True, as_constrain=True,
+                nuVC_constrain=True, eta_constrain=True,
+                linemixing_constrain=True,
+            )
+            fitparam.generate_fit_param_linelist_from_linelist(
+                vary_nu={self.molecule: {self.isotopologue: False}},
+                vary_sw={self.molecule: {self.isotopologue: True}},
+                vary_gamma0={self.molecule: {self.isotopologue: True}},
+                vary_n_gamma0={self.molecule: {self.isotopologue: True}},
+                vary_delta0={self.molecule: {self.isotopologue: True}},
+                vary_n_delta0={self.molecule: {self.isotopologue: False}},
+                vary_aw={self.molecule: {self.isotopologue: True}},
+                vary_n_gamma2={self.molecule: {self.isotopologue: False}},
+                vary_as={self.molecule: {self.isotopologue: True}},
+                vary_n_delta2={self.molecule: {self.isotopologue: False}},
+                vary_nuVC={self.molecule: {self.isotopologue: False}},
+                vary_n_nuVC={self.molecule: {self.isotopologue: False}},
+                vary_eta={},
+                vary_linemixing={self.molecule: {self.isotopologue: False}},
+            )
+            fitparam.generate_fit_baseline_linelist(
+                vary_baseline=True,
+                vary_pressure=False,
+                vary_temperature=False,
+                vary_molefraction={self.molecule: False},
+                vary_xshift=True,
+            )
+
+            param_file = fitparam.param_linelist_savename
+            base_file = fitparam.base_linelist_savename
+
+            # 拟合
+            print(f"  开始多光谱联合拟合 ({self.lineprofile} 线形, "
+                  f"{len(spectra)} 光谱)...")
+            fit = Fit_DataSet(
+                ds, base_file, param_file,
+                minimum_parameter_fit_intensity=self.fit_intensity,
+                weight_spectra=False,
+            )
+            params = fit.generate_params()
+
+            for param in params:
+                if "SD_gamma" in param and params[param].vary:
+                    params[param].set(value=0.10, min=0.01, max=0.25)
+                elif "SD_delta" in param and params[param].vary:
+                    params[param].set(value=0.05, min=0.0, max=0.25)
+                elif "delta0" in param and params[param].vary:
+                    params[param].set(min=-0.05, max=0.05)
+
+            result = fit.fit_data(params, wing_cutoff=25)
+
+            # 更新参数 & 生成结果
+            fit.residual_analysis(result, indv_resid_plot=False)
+            fit.update_params(result)
+            summary = ds.generate_summary_file(save_file=True)
+
+            res_col = next((c for c in summary.columns if "Residual" in c), None)
+            residuals = summary[res_col].values if res_col else np.array([])
+            res_std = float(np.std(residuals)) if len(residuals) > 0 else 0.0
+            updated_params = pd.read_csv(param_file + ".csv", index_col=0)
+            updated_baseline = pd.read_csv(base_file + ".csv")
+
+            mats_result = MATSFitResult(
+                fit_result=result,
+                param_linelist=updated_params,
+                baseline_linelist=updated_baseline,
+                summary_df=summary,
+                residual_std=res_std,
+                qf=float(ds.average_QF()) if hasattr(ds, "average_QF") else 0.0,
+            )
+            print(f"  多光谱联合拟合完成!")
+            print(f"  {mats_result.summary()}")
+            return mats_result
         finally:
             os.chdir(saved_dir)
 
