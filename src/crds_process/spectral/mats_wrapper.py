@@ -1,132 +1,694 @@
-"""MATS (Multi-spectrum Analysis Tool for Spectroscopy) 封装
+"""MATS 光谱拟合封装 (Multi-spectrum Analysis Tool for Spectroscopy)
 
-将处理后的吸收光谱数据转换为 MATS 所需格式，
-执行多光谱拟合，提取线强、展宽系数等光谱参数。
+将去除标准具后的衰荡时间数据转换为 MATS 输入格式，
+使用 Voigt / SDVP 线形拟合，提取光谱参数。
 
-References
-----------
-- MATS GitHub: https://github.com/usnistgov/MATS
-- MATS Documentation: https://pages.nist.gov/MATS/
+MATS 工作流:
+    1. 准备 spectrum CSV (MATS 格式)
+    2. 从 HITRAN 构建 param_linelist
+    3. Spectrum → Dataset → Generate_FitParam_File → Fit_DataSet
+    4. 拟合 + 残差分析
+
+核心类:
+    MATSSpectrumPreparer — 数据格式转换
+    HitranLinelistBuilder — HITRAN → MATS 线表
+    MATSFitter           — 拟合控制器
+    MATSBatchProcessor   — 自动发现 & 批量处理
+
+用法:
+    from crds_process.spectral.mats_wrapper import batch_mats_fitting
+    batch_mats_fitting()
 """
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 
 
-@dataclass
-class FitResult:
-    """MATS 拟合结果"""
-    parameters: dict[str, float] = field(default_factory=dict)
-    uncertainties: dict[str, float] = field(default_factory=dict)
-    residuals: np.ndarray | None = None
-    chi_squared: float = 0.0
-    reduced_chi_squared: float = 0.0
-    fitted_spectrum: np.ndarray | None = None
-    raw_result: Any = None  # MATS 原始返回对象
+# ==================================================================
+# 项目级常量
+# ==================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+ETALON_ROOT = PROJECT_ROOT / "output" / "results" / "etalon"
+MATS_ROOT = PROJECT_ROOT / "output" / "results" / "mats"
+HITRAN_DIR = PROJECT_ROOT / "data" / "hitran"
+_ETALON_CSV = "tau_etalon_corrected.csv"
 
 
-def prepare_mats_input(
-    spectrum_df: pd.DataFrame,
-    wavenumber_col: str = "wavenumber",
-    alpha_col: str = "alpha_corrected",
-    alpha_err_col: str = "alpha_err",
-) -> dict:
-    """将 DataFrame 转换为 MATS 所需的输入格式
-
-    Parameters
-    ----------
-    spectrum_df : pd.DataFrame
-        基线扣除后的吸收光谱
-    wavenumber_col : str
-        波数列名
-    alpha_col : str
-        吸收系数列名
-    alpha_err_col : str
-        吸收系数误差列名
-
-    Returns
-    -------
-    dict
-        MATS 格式的输入数据
-    """
-    data = {
-        "wavenumber": spectrum_df[wavenumber_col].values,
-        "alpha": spectrum_df[alpha_col].values,
-    }
-    if alpha_err_col in spectrum_df.columns:
-        data["alpha_err"] = spectrum_df[alpha_err_col].values
-
-    return data
-
-
-def run_mats_fit(
-    spectrum_data: dict,
-    temperature_K: float,
-    pressure_torr: float,
-    species: str = "H2O",
-    isotopologue: int = 1,
-    database: str = "HITRAN",
-    wavenumber_range: Optional[list[float]] = None,
-    fit_parameters: Optional[list[str]] = None,
-    max_iterations: int = 100,
-) -> FitResult:
-    """执行 MATS 光谱拟合
-
-    Parameters
-    ----------
-    spectrum_data : dict
-        由 prepare_mats_input 准备的输入数据
-    temperature_K : float
-        温度 (K)
-    pressure_torr : float
-        压力 (Torr)
-    species : str
-        气体种类
-    isotopologue : int
-        同位素编号
-    database : str
-        数据库名称 ("HITRAN", "HITEMP" 等)
-    wavenumber_range : list[float], optional
-        波数范围 [min, max]
-    fit_parameters : list[str], optional
-        拟合参数列表
-    max_iterations : int
-        最大迭代次数
-
-    Returns
-    -------
-    FitResult
-
-    Notes
-    -----
-    此函数为 MATS 库的封装接口。使用前需安装 MATS:
-        pip install MATS-venv
-    或从 GitHub 安装:
-        pip install git+https://github.com/usnistgov/MATS.git
-    """
+# ==================================================================
+# 静默导入 MATS/HAPI
+# ==================================================================
+def _import_mats():
+    """静默导入 MATS"""
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = open(os.devnull, "w")
+    sys.stderr = open(os.devnull, "w")
     try:
-        from MATS import Spectrum as MATSSpectrum
-        from MATS import Dataset as MATSDataset
-        from MATS import Fit as MATSFit
+        import MATS
+        return MATS
     except ImportError:
         raise ImportError(
-            "MATS 未安装。请使用以下命令安装:\n"
-            "  pip install MATS-venv\n"
-            "或:\n"
-            "  pip install git+https://github.com/usnistgov/MATS.git"
+            "MATS 未安装。请安装: pip install git+https://github.com/usnistgov/MATS.git"
+        )
+    finally:
+        sys.stdout.close()
+        sys.stderr.close()
+        sys.stdout, sys.stderr = old_out, old_err
+
+
+# ==================================================================
+# 数据准备
+# ==================================================================
+class MATSSpectrumPreparer:
+    """将 etalon corrected 数据转换为 MATS 所需的 CSV 格式
+
+    MATS Spectrum 类期望的 CSV 列名:
+        - pressure_column: 压力 (Torr)
+        - temperature_column: 温度 (°C)
+        - frequency_column: 波数 (cm⁻¹)
+        - tau_column: 衰荡时间 (μs)
+        - tau_stats_column: tau 标准差 (可选)
+    """
+
+    MATS_PRESSURE = "Cavity Pressure /Torr"
+    MATS_TEMPERATURE = "Cavity Temperature Side 2 /C"
+    MATS_FREQUENCY = "Total Frequency /MHz"
+    MATS_TAU = "Mean tau/us"
+    MATS_TAU_STATS = "Tau_stats"
+
+    def __init__(
+        self,
+        pressure_col: str = "pressure",
+        temperature_col: str = "temperature",
+        wavenumber_col: str = "wavenumber",
+        tau_col: str = "tau_mean_no_etalon",
+        tau_stats_col: str | None = "tau_std",
+    ):
+        self.pressure_col = pressure_col
+        self.temperature_col = temperature_col
+        self.wavenumber_col = wavenumber_col
+        self.tau_col = tau_col
+        self.tau_stats_col = tau_stats_col
+
+    def prepare(self, df: pd.DataFrame, save_stem: str) -> str:
+        """转换并保存 MATS 格式 CSV
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            etalon corrected 数据
+        save_stem : str
+            不含 .csv 后缀的文件名 (MATS Spectrum 需要此格式)
+
+        Returns
+        -------
+        str
+            不含后缀的路径 (直接传给 MATS Spectrum)
+        """
+        save_stem = str(save_stem)
+        if save_stem.endswith(".csv"):
+            save_stem = save_stem[:-4]
+        csv_path = save_stem + ".csv"
+
+        mats_df = pd.DataFrame()
+        mats_df[self.MATS_PRESSURE] = df[self.pressure_col]
+        mats_df[self.MATS_TEMPERATURE] = df[self.temperature_col]
+        mats_df[self.MATS_FREQUENCY] = df[self.wavenumber_col]
+        mats_df[self.MATS_TAU] = df[self.tau_col]
+        if self.tau_stats_col and self.tau_stats_col in df.columns:
+            mats_df[self.MATS_TAU_STATS] = df[self.tau_stats_col]
+
+        parent = Path(csv_path).parent
+        if str(parent) != ".":
+            parent.mkdir(parents=True, exist_ok=True)
+        mats_df.to_csv(csv_path, index=False)
+        return save_stem
+
+
+# ==================================================================
+# HITRAN → MATS 线表
+# ==================================================================
+class HitranLinelistBuilder:
+    """从 HITRAN 数据构建 MATS param_linelist"""
+
+    _MOL_PREFIX = {1: "H2O", 2: "CO2", 6: "CH4", 7: "O2"}
+
+    def __init__(
+        self,
+        molecule: int = 7,
+        isotopologue: int = 1,
+        hitran_dir: Path | str | None = None,
+        hitran_table: str | None = None,
+    ):
+        self.molecule = molecule
+        self.isotopologue = isotopologue
+        self.hitran_dir = str(hitran_dir or HITRAN_DIR)
+        self.hitran_table = hitran_table
+        self._hapi = None
+
+    @property
+    def mol_prefix(self) -> str:
+        return self._MOL_PREFIX.get(self.molecule, f"M{self.molecule}")
+
+    def _init_hapi(self):
+        if self._hapi is not None:
+            return
+        MATS = _import_mats()
+        self._hapi = MATS.hapi
+        os.makedirs(self.hitran_dir, exist_ok=True)
+        saved = os.getcwd()
+        os.chdir(self.hitran_dir)
+        try:
+            old_out = sys.stdout
+            sys.stdout = open(os.devnull, "w")
+            try:
+                self._hapi.db_begin(self.hitran_dir)
+            finally:
+                sys.stdout.close()
+                sys.stdout = old_out
+        finally:
+            os.chdir(saved)
+
+    def _resolve_table(self, wn_min: float, wn_max: float) -> str:
+        self._init_hapi()
+        hapi = self._hapi
+        if self.hitran_table:
+            return self.hitran_table
+        for tname in hapi.LOCAL_TABLE_CACHE:
+            if tname.startswith(self.mol_prefix):
+                self.hitran_table = tname
+                return tname
+        tname = f"{self.mol_prefix}_iso{self.isotopologue}"
+        saved = os.getcwd()
+        os.chdir(self.hitran_dir)
+        try:
+            print(f"  [HITRAN] 下载 {self.mol_prefix} "
+                  f"({wn_min:.0f}-{wn_max:.0f} cm⁻¹)...")
+            hapi.fetch(TableName=tname, M=self.molecule,
+                       I=self.isotopologue, numin=wn_min, numax=wn_max)
+        finally:
+            os.chdir(saved)
+        self.hitran_table = tname
+        return tname
+
+    def build(self, wn_min: float, wn_max: float,
+              save_path: Path | str | None = None) -> pd.DataFrame:
+        """构建 MATS 格式 param_linelist"""
+        self._init_hapi()
+        table = self._resolve_table(wn_min - 5, wn_max + 5)
+        data = self._hapi.LOCAL_TABLE_CACHE[table]["data"]
+        df = pd.DataFrame({
+            "molec_id": data["molec_id"],
+            "local_iso_id": data["local_iso_id"],
+            "nu": data["nu"],
+            "sw": data["sw"],
+            "gamma0_air": data["gamma_air"],
+            "n_gamma0_air": data["n_air"],
+            "delta0_air": data["delta_air"],
+            "elower": data["elower"],
+            "gamma0_self": data["gamma_self"],
+            "n_gamma0_self": data["n_air"],  # 近似使用 n_air
+        })
+        margin = 5.0
+        df = df[(df["nu"] >= wn_min - margin) & (df["nu"] <= wn_max + margin)]
+        df["sw_scale_factor"] = 1.0
+        for col in [
+            "n_delta0_air", "n_gamma0_self", "n_delta0_self", "delta0_self",
+            "SD_gamma_air", "SD_delta_air", "n_gamma2_air", "n_delta2_air",
+            "SD_gamma_self", "SD_delta_self", "n_gamma2_self", "n_delta2_self",
+            "nuVC_air", "nuVC_self", "n_nuVC_air", "n_nuVC_self",
+            "eta_air", "eta_self", "y_air", "n_y_air", "y_self", "n_y_self",
+        ]:
+            df[col] = 0.0
+        df = df.reset_index(drop=True)
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(str(save_path), index=False)
+        return df
+
+
+# ==================================================================
+# 拟合结果
+# ==================================================================
+@dataclass
+class MATSFitResult:
+    """MATS 拟合结果"""
+    fit_result: object = None
+    param_linelist: pd.DataFrame = field(default_factory=pd.DataFrame)
+    baseline_linelist: pd.DataFrame = field(default_factory=pd.DataFrame)
+    summary_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    residual_std: float = 0.0
+    chi_squared: float = 0.0
+    qf: float = 0.0
+
+    def summary(self) -> str:
+        lines = [
+            f"MATS Fit Result:",
+            f"  Residual σ = {self.residual_std:.6e}",
+            f"  QF         = {self.qf:.4f}",
+        ]
+        if not self.param_linelist.empty:
+            for _, row in self.param_linelist.iterrows():
+                nu = row.get("nu", 0)
+                sw = row.get("sw", 0)
+                gamma0 = row.get("gamma0_air", 0)
+                delta0 = row.get("delta0_air", 0)
+                lines.append(
+                    f"  Line: ν={nu:.6f} cm⁻¹, "
+                    f"S={sw:.4e}, "
+                    f"γ₀_air={gamma0:.5f}, "
+                    f"δ₀_air={delta0:.6f}"
+                )
+        return "\n".join(lines)
+
+
+# ==================================================================
+# MATS 拟合器
+# ==================================================================
+class MATSFitter:
+    """MATS 光谱拟合控制器
+
+    Parameters
+    ----------
+    molecule : int
+        HITRAN 分子编号 (7 = O₂)
+    isotopologue : int
+        同位素编号
+    molefraction : dict
+        摩尔分数 {molec_id: fraction}
+    diluent : str
+        稀释气体
+    lineprofile : str
+        线形 ("VP", "SDVP", "NGP", "SDNGP", "HTP")
+    baseline_order : int
+        基线多项式阶数
+    etalons : dict
+        残余标准具 {order: [amp, period, phase]}
+    fit_intensity : float
+        最低可浮动线强
+    threshold_intensity : float
+        最低模拟线强
+    """
+
+    def __init__(
+        self,
+        molecule: int = 7,
+        isotopologue: int = 1,
+        molefraction: dict | None = None,
+        diluent: str = "air",
+        Diluent: dict | None = None,
+        lineprofile: str = "SDVP",
+        baseline_order: int = 1,
+        etalons: dict | None = None,
+        fit_intensity: float = 1e-30,
+        threshold_intensity: float = 1e-35,
+    ):
+        self.molecule = molecule
+        self.isotopologue = isotopologue
+        self.molefraction = molefraction or {molecule: 1.0}
+        self.diluent = diluent
+        # 显式设置 Diluent (与参考脚本一致)
+        # 纯 O₂: Diluent={'air': {'composition':1, 'm': 31.9988}}
+        # O₂+N₂: Diluent={'air': {'composition':1, 'm': 28.014}}
+        if Diluent is not None:
+            self.Diluent = Diluent
+        else:
+            self.Diluent = {diluent: {"composition": 1, "m": 31.9988}}
+        self.lineprofile = lineprofile
+        self.baseline_order = baseline_order
+        self.etalons = etalons or {}
+        self.fit_intensity = fit_intensity
+        self.threshold_intensity = threshold_intensity
+        self._preparer = MATSSpectrumPreparer()
+        self._linelist_builder = HitranLinelistBuilder(
+            molecule=molecule, isotopologue=isotopologue,
         )
 
-    # TODO: 根据 MATS 实际 API 实现具体拟合逻辑
-    # 以下为拟合框架的骨架代码，需根据 MATS 版本和 API 调整
+    def fit(
+        self,
+        etalon_csv: Path | str,
+        output_dir: Path | str,
+        dataset_name: str = "crds_fit",
+    ) -> MATSFitResult:
+        """执行 MATS 拟合"""
+        MATS = _import_mats()
+        from MATS import Spectrum, Dataset, Generate_FitParam_File, Fit_DataSet
 
-    raise NotImplementedError(
-        "MATS 拟合逻辑需要根据具体的 MATS 版本和数据格式进行实现。"
-        "请参考 MATS 文档: https://pages.nist.gov/MATS/"
-    )
+        etalon_csv = Path(etalon_csv)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Step 1: 读取数据
+        df = pd.read_csv(etalon_csv)
+        wn = df["wavenumber"].values
+        wn_min, wn_max = float(wn.min()), float(wn.max())
+        print(f"  波数范围: {wn_min:.5f} ~ {wn_max:.5f} cm⁻¹, 点数: {len(wn)}")
+
+        # MATS 使用 cwd 相对路径读写文件，切到 output_dir
+        saved_dir = os.getcwd()
+        os.chdir(str(output_dir))
+        try:
+            # Step 2: 准备 MATS 格式 spectrum CSV (相对路径)
+            spec_name = f"{dataset_name}_spectrum"
+            self._preparer.prepare(df, spec_name)
+
+            # Step 3: 构建 param_linelist
+            linelist_csv = f"{dataset_name}_linelist.csv"
+            param_linelist = self._linelist_builder.build(
+                wn_min, wn_max, save_path=linelist_csv,
+            )
+            print(f"  线表: {len(param_linelist)} 条谱线")
+            for _, row in param_linelist.iterrows():
+                if row["sw"] > self.threshold_intensity:
+                    print(f"    ν={row['nu']:.6f}, S={row['sw']:.4e}, "
+                          f"γ₀_air={row['gamma0_air']:.5f}")
+            if len(param_linelist) == 0:
+                print("  [WARN] 未找到谱线，跳过拟合")
+                return MATSFitResult()
+
+            # Step 4~8: MATS 拟合
+            return self._run_mats_fit(
+                MATS, spec_name, param_linelist, dataset_name,
+                Spectrum, Dataset, Generate_FitParam_File, Fit_DataSet,
+            )
+        finally:
+            os.chdir(saved_dir)
+
+    def _run_mats_fit(
+        self, MATS, spec_stem, param_linelist, dataset_name,
+        Spectrum, Dataset, Generate_FitParam_File, Fit_DataSet,
+    ) -> MATSFitResult:
+        """在 output_dir 中执行 MATS 拟合流程 (参考 Fitting_Protocol_ABand)"""
+
+        # 检查 tau_stats 列是否存在
+        spec_csv = pd.read_csv(str(spec_stem) + ".csv")
+        has_stats = self._preparer.MATS_TAU_STATS in spec_csv.columns
+
+        # ---- Step 4: 创建 Spectrum ----
+        # 关键: 显式传入 Diluent 和 diluent
+        spec = Spectrum(
+            str(spec_stem),
+            molefraction=self.molefraction,
+            natural_abundance=True,
+            diluent=self.diluent,
+            Diluent=self.Diluent,
+            input_freq=False,
+            input_tau=True,
+            pressure_column=self._preparer.MATS_PRESSURE,
+            temperature_column=self._preparer.MATS_TEMPERATURE,
+            frequency_column=self._preparer.MATS_FREQUENCY,
+            tau_column=self._preparer.MATS_TAU,
+            tau_stats_column=self._preparer.MATS_TAU_STATS if has_stats else None,
+            etalons=self.etalons,
+            nominal_temperature=296,
+            baseline_order=self.baseline_order,
+        )
+        print(f"  Spectrum: P={spec.pressure:.4f} atm, T={spec.temperature:.2f} K")
+
+        # ---- Step 5: Dataset ----
+        ds = Dataset([spec], dataset_name, param_linelist)
+        base_linelist = ds.generate_baseline_paramlist()
+
+        param_save = f"{dataset_name}_Parameter_LineList"
+        base_save = f"{dataset_name}_baseline_paramlist"
+
+        # ---- Step 6: Generate_FitParam_File ----
+        fitparam = Generate_FitParam_File(
+            ds, param_linelist, base_linelist,
+            lineprofile=self.lineprofile,
+            linemixing=False,
+            threshold_intensity=self.threshold_intensity,
+            fit_intensity=self.fit_intensity,
+            sim_window=5,
+            param_linelist_savename=param_save,
+            base_linelist_savename=base_save,
+            nu_constrain=True, sw_constrain=True,
+            gamma0_constrain=True, delta0_constrain=True,
+            aw_constrain=True, as_constrain=True,
+            nuVC_constrain=True, eta_constrain=True,
+            linemixing_constrain=True,
+        )
+        fitparam.generate_fit_param_linelist_from_linelist(
+            vary_nu={self.molecule: {self.isotopologue: True}},
+            vary_sw={self.molecule: {self.isotopologue: True}},
+            vary_gamma0={self.molecule: {self.isotopologue: True}},
+            vary_n_gamma0={self.molecule: {self.isotopologue: True}},
+            vary_delta0={self.molecule: {self.isotopologue: False}},
+            vary_n_delta0={self.molecule: {self.isotopologue: True}},
+            vary_aw={self.molecule: {self.isotopologue: True}},
+            vary_n_gamma2={self.molecule: {self.isotopologue: False}},
+            vary_as={},
+            vary_n_delta2={self.molecule: {self.isotopologue: False}},
+            vary_nuVC={self.molecule: {self.isotopologue: True}},
+            vary_n_nuVC={self.molecule: {self.isotopologue: False}},
+            vary_eta={},
+            vary_linemixing={self.molecule: {self.isotopologue: False}},
+        )
+        fitparam.generate_fit_baseline_linelist(
+            vary_baseline=True,
+            vary_pressure=False,
+            vary_temperature=False,
+            vary_molefraction={self.molecule: False},
+            vary_xshift=False,
+        )
+
+        param_file = fitparam.param_linelist_savename
+        base_file = fitparam.base_linelist_savename
+
+        # ---- Step 7: 拟合 ----
+        print(f"  开始拟合 ({self.lineprofile} 线形)...")
+        fit = Fit_DataSet(
+            ds, base_file, param_file,
+            minimum_parameter_fit_intensity=self.fit_intensity,
+            weight_spectra=False,
+        )
+        params = fit.generate_params()
+
+        # SD_gamma 约束 (参考脚本)
+        for param in params:
+            if "SD_gamma" in param:
+                if params[param].vary:
+                    params[param].set(value=0.10, min=0.01, max=0.25)
+
+        result = fit.fit_data(params, wing_cutoff=25)
+
+        # ---- Step 8: 更新参数 & 生成结果 ----
+        fit.residual_analysis(result, indv_resid_plot=False)
+        fit.update_params(result)
+        summary = ds.generate_summary_file(save_file=True)
+
+        # MATS summary 列名格式: 'Residuals (ppm/cm)', 'Alpha (ppm/cm)', etc.
+        res_col = next((c for c in summary.columns if "Residual" in c), None)
+        residuals = summary[res_col].values if res_col else np.array([])
+        res_std = float(np.std(residuals)) if len(residuals) > 0 else 0.0
+        updated_params = pd.read_csv(param_file + ".csv", index_col=0)
+        updated_baseline = pd.read_csv(base_file + ".csv")
+
+        mats_result = MATSFitResult(
+            fit_result=result,
+            param_linelist=updated_params,
+            baseline_linelist=updated_baseline,
+            summary_df=summary,
+            residual_std=res_std,
+            qf=float(ds.average_QF()) if hasattr(ds, "average_QF") else 0.0,
+        )
+        print(f"  拟合完成!")
+        print(f"  {mats_result.summary()}")
+        return mats_result
+
+    def plot_result(
+        self, result: MATSFitResult, output_dir: Path | str,
+        title: str = "MATS Fit",
+    ):
+        """绘制拟合结果"""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        output_dir = Path(output_dir)
+        summary = result.summary_df
+        if summary.empty:
+            return
+
+        # MATS summary 列名: 'Wavenumber (cm-1)', 'Alpha (ppm/cm)', 'Model (ppm/cm)', etc.
+        def _find_col(keywords):
+            for c in summary.columns:
+                if all(k.lower() in c.lower() for k in keywords):
+                    return c
+            return None
+
+        wn_col = _find_col(["Wavenumber"])
+        alpha_col = _find_col(["Alpha"])
+        model_col = _find_col(["Model"])
+        res_col = _find_col(["Residual"])
+        tau_col = _find_col(["Tau"])
+
+        if wn_col is None:
+            print(f"  [WARN] 找不到波数列，可用: {list(summary.columns)}")
+            return
+
+        wn = summary[wn_col].values
+        fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+
+        # Panel 1: Alpha + Model
+        ax = axes[0]
+        if alpha_col:
+            ax.plot(wn, summary[alpha_col], "b.", ms=2, alpha=0.5, label="Data")
+        if model_col:
+            ax.plot(wn, summary[model_col], "r-", lw=1, label="MATS Fit")
+        ax.set_ylabel("α (ppm/cm)")
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # Panel 2: Residuals
+        ax = axes[1]
+        if res_col:
+            res = summary[res_col].values
+            ax.plot(wn, res, ".", ms=2, color="tomato", alpha=0.5)
+            ax.axhline(0, color="gray", lw=0.5, ls="--")
+            ax.set_ylabel("Residual (ppm/cm)")
+            ax.set_title(f"Residual (σ={np.std(res):.4e})")
+        ax.grid(True, alpha=0.3)
+
+        # Panel 3: Tau
+        ax = axes[2]
+        if tau_col and "Error" not in tau_col:
+            ax.plot(wn, summary[tau_col], "b.", ms=2, alpha=0.5)
+            ax.set_ylabel("τ (μs)")
+        ax.set_xlabel("Wavenumber (cm⁻¹)")
+        ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        save_path = output_dir / "mats_fit.png"
+        fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
+        print(f"  图表已保存: {save_path}")
+        plt.close(fig)
+
+
+# ==================================================================
+# 批量处理器
+# ==================================================================
+class MATSBatchProcessor:
+    """MATS 光谱拟合批量处理器"""
+
+    def __init__(
+        self,
+        etalon_root: Path | None = None,
+        mats_root: Path | None = None,
+        fitter: MATSFitter | None = None,
+    ):
+        self.etalon_root = etalon_root or ETALON_ROOT
+        self.mats_root = mats_root or MATS_ROOT
+        self.fitter = fitter or MATSFitter()
+
+    def discover(self) -> list[tuple[str, str, Path]]:
+        tasks: list[tuple[str, str, Path]] = []
+        if not self.etalon_root.exists():
+            return tasks
+        for t_dir in sorted(self.etalon_root.iterdir()):
+            if not t_dir.is_dir() or t_dir.name.startswith("."):
+                continue
+            for p_dir in sorted(t_dir.iterdir()):
+                if not p_dir.is_dir() or p_dir.name.startswith("."):
+                    continue
+                csv = p_dir / _ETALON_CSV
+                if csv.exists():
+                    tasks.append((t_dir.name, p_dir.name, csv))
+        return tasks
+
+    def process_one(self, csv_path: Path, output_dir: Path,
+                    label: str = "") -> MATSFitResult | None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            result = self.fitter.fit(
+                csv_path, output_dir,
+                dataset_name=label.replace("/", "_").replace(" ", "") or "crds",
+            )
+            if result.summary_df is not None and not result.summary_df.empty:
+                self.fitter.plot_result(
+                    result, output_dir,
+                    title=f"MATS Fit — {label}" if label else "MATS Fit",
+                )
+            return result
+        except Exception as e:
+            print(f"    [ERROR] 拟合失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def run(self):
+        tasks = self.discover()
+        if not tasks:
+            print(f"[ERROR] 未在 {self.etalon_root} 下找到 "
+                  f"{{跃迁波数}}/{{压力}}/{_ETALON_CSV}")
+            return
+
+        print(f"{'#' * 60}")
+        print(f"  CRDS MATS 光谱拟合")
+        print(f"  输入: {self.etalon_root}")
+        print(f"  输出: {self.mats_root}")
+        print(f"  发现 {len(tasks)} 个数据集:")
+        for t, p, _ in tasks:
+            print(f"    {t}/{p}/")
+        print(f"{'#' * 60}")
+
+        ok = 0
+        for i, (transition, pressure, csv_path) in enumerate(tasks, 1):
+            out_dir = self.mats_root / transition / pressure
+            print(f"\n{'=' * 60}")
+            print(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
+            print(f"{'=' * 60}")
+            if self.process_one(csv_path, out_dir, f"{transition}/{pressure}"):
+                ok += 1
+
+        print(f"\n\n{'#' * 60}")
+        print(f"  全部完成! {ok}/{len(tasks)} 成功")
+        print(f"{'#' * 60}")
+        for t, p, _ in tasks:
+            d = self.mats_root / t / p
+            if d.exists():
+                print(f"\n  {t}/{p}/")
+                for f in sorted(d.glob("*")):
+                    if not f.name.startswith("."):
+                        print(f"    {f.name:<50s} {f.stat().st_size:>10,} bytes")
+
+
+# ==================================================================
+# 便捷函数
+# ==================================================================
+def batch_mats_fitting(
+    etalon_root: Path | None = None,
+    mats_root: Path | None = None,
+    **fitter_kwargs,
+):
+    """批量 MATS 拟合 (便捷入口)
+
+    Parameters
+    ----------
+    etalon_root : Path, optional
+        标准具去除结果目录
+    mats_root : Path, optional
+        MATS 输出目录
+    **fitter_kwargs
+        传递给 MATSFitter 的参数:
+        - molecule: 分子 ID (默认 7 = O₂)
+        - molefraction: 摩尔分数 (默认 {7: 1.0})
+        - diluent: 稀释气名 (默认 "air")
+        - Diluent: 显式稀释气字典 (默认 {"air": {"composition":1, "m":31.9988}})
+        - lineprofile: 线形 (默认 "SDVP")
+        - fit_intensity: 可浮动线强阈值 (默认 1e-24)
+    """
+    fitter = MATSFitter(**fitter_kwargs) if fitter_kwargs else None
+    MATSBatchProcessor(
+        etalon_root=etalon_root,
+        mats_root=mats_root,
+        fitter=fitter,
+    ).run()
 
