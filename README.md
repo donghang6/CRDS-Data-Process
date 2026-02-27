@@ -36,6 +36,8 @@ CRDS-Data-Process/
 ├── data/
 │   ├── raw/                                # 原始数据（不纳入版本控制）
 │   └── hitran/                             # HITRAN 光谱数据库
+├── scripts/
+│   └── download_o2_lines.py                # HITRAN 数据下载脚本
 └── output/
     └── results/                            # 拟合结果
 ```
