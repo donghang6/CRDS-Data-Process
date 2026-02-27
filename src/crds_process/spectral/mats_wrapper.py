@@ -769,6 +769,19 @@ class MATSFitter:
 
         fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
 
+        # 读取各光谱的 x_shift (从 baseline_linelist)
+        x_shifts = {}
+        if result.baseline_linelist is not None and not result.baseline_linelist.empty:
+            bl = result.baseline_linelist
+            if "Spectrum Number" in bl.columns and "x_shift" in bl.columns:
+                for _, row in bl.iterrows():
+                    x_shifts[int(row["Spectrum Number"])] = float(row["x_shift"])
+
+        def _shifted_wn(spec_id, wn_arr):
+            """给波数加上 x_shift 校正"""
+            xs = x_shifts.get(int(spec_id), 0.0)
+            return wn_arr + xs
+
         # ── Panel 1: Alpha + Model ──
         ax = axes[0]
         all_residuals = []
@@ -779,7 +792,7 @@ class MATSFitter:
             colors = plt.cm.tab10(np.linspace(0, 1, len(groups)))
 
             for i, (spec_id, grp) in enumerate(groups):
-                wn = grp[wn_col].values
+                wn = _shifted_wn(spec_id, grp[wn_col].values)
                 color = colors[i]
 
                 # 提取光谱标签
@@ -803,7 +816,7 @@ class MATSFitter:
                     all_residuals.extend(grp[res_col].values)
         else:
             # 单光谱
-            wn = wn_all
+            wn = _shifted_wn(1, wn_all)
             if alpha_col:
                 ax.plot(wn, summary[alpha_col].values, "b.",
                         ms=2, alpha=0.5, label="Data")
@@ -814,7 +827,6 @@ class MATSFitter:
             if res_col:
                 all_residuals = list(summary[res_col].values)
 
-        ax.set_xlim(wn_min_global, wn_max_global)
         ax.set_ylabel("α (ppm/cm)")
         ax.set_title(title)
         ax.legend(fontsize=8, ncol=3, loc="upper right")
@@ -825,10 +837,12 @@ class MATSFitter:
         if res_col:
             if is_multi:
                 for i, (spec_id, grp) in enumerate(groups):
-                    ax.plot(grp[wn_col].values, grp[res_col].values,
+                    wn = _shifted_wn(spec_id, grp[wn_col].values)
+                    ax.plot(wn, grp[res_col].values,
                             ".", ms=2, alpha=0.4, color=colors[i])
             else:
-                ax.plot(wn_all, summary[res_col].values,
+                wn = _shifted_wn(1, wn_all)
+                ax.plot(wn, summary[res_col].values,
                         ".", ms=2, color="tomato", alpha=0.5)
             ax.axhline(0, color="gray", lw=0.5, ls="--")
             ax.set_ylabel("Residual (ppm/cm)")
@@ -841,10 +855,12 @@ class MATSFitter:
         if tau_col and "Error" not in tau_col:
             if is_multi:
                 for i, (spec_id, grp) in enumerate(groups):
-                    ax.plot(grp[wn_col].values, grp[tau_col].values,
+                    wn = _shifted_wn(spec_id, grp[wn_col].values)
+                    ax.plot(wn, grp[tau_col].values,
                             ".", ms=2, alpha=0.5, color=colors[i])
             else:
-                ax.plot(wn_all, summary[tau_col].values, "b.",
+                wn = _shifted_wn(1, wn_all)
+                ax.plot(wn, summary[tau_col].values, "b.",
                         ms=2, alpha=0.5)
             ax.set_ylabel("τ (μs)")
         ax.set_xlabel("Wavenumber (cm⁻¹)")
