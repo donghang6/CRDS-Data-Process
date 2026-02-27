@@ -723,7 +723,11 @@ class MATSFitter:
         self, result: MATSFitResult, output_dir: Path | str,
         title: str = "MATS Fit",
     ):
-        """绘制拟合结果"""
+        """绘制拟合结果
+
+        多光谱联合拟合时，按 Spectrum Number 分组绘制，
+        避免不同光谱的基线值连线导致斜线问题。
+        """
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -733,7 +737,7 @@ class MATSFitter:
         if summary.empty:
             return
 
-        # MATS summary 列名: 'Wavenumber (cm-1)', 'Alpha (ppm/cm)', 'Model (ppm/cm)', etc.
+        # MATS summary 列名查找
         def _find_col(keywords):
             for c in summary.columns:
                 if all(k.lower() in c.lower() for k in keywords):
@@ -745,59 +749,101 @@ class MATSFitter:
         model_col = _find_col(["Model"])
         res_col = _find_col(["Residual"])
         tau_col = _find_col(["Tau"])
+        spec_col = _find_col(["Spectrum", "Number"])
+        name_col = _find_col(["Spectrum", "Name"])
 
         if wn_col is None:
             print(f"  [WARN] 找不到波数列，可用: {list(summary.columns)}")
             return
 
-        wn = summary[wn_col].values
+        # 判断是否为多光谱
+        is_multi = (spec_col is not None
+                    and summary[spec_col].nunique() > 1)
 
-        # 确定实际数据的波数范围 (用 alpha/tau 列的非 NaN 范围)
-        # MATS 的 model 列在 sim_window 外也有值，需要裁剪
-        data_mask = np.ones(len(wn), dtype=bool)
-        if alpha_col:
-            alpha_vals = summary[alpha_col].values
-            data_mask = ~np.isnan(alpha_vals) & (alpha_vals != 0)
-        if data_mask.any():
-            wn_data_min = float(wn[data_mask].min())
-            wn_data_max = float(wn[data_mask].max())
-        else:
-            wn_data_min, wn_data_max = float(wn.min()), float(wn.max())
+        # 全局波数范围
+        wn_all = summary[wn_col].values
+        wn_min_global = float(wn_all.min())
+        wn_max_global = float(wn_all.max())
 
         fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
 
-        # Panel 1: Alpha + Model
+        # ── Panel 1: Alpha + Model ──
         ax = axes[0]
-        if alpha_col:
-            ax.plot(wn, summary[alpha_col], "b.", ms=2, alpha=0.5, label="Data")
-        if model_col:
-            # 只在数据范围内绘制模型线，避免 sim_window 外的斜线
-            model_vals = summary[model_col].values.copy()
-            outside = (wn < wn_data_min) | (wn > wn_data_max)
-            model_vals[outside] = np.nan
-            ax.plot(wn, model_vals, "r-", lw=1, label="MATS Fit")
-        ax.set_xlim(wn_data_min, wn_data_max)
+        all_residuals = []
+
+        if is_multi:
+            # 多光谱: 按 Spectrum Number 分组绘制
+            groups = summary.groupby(spec_col)
+            colors = plt.cm.tab10(np.linspace(0, 1, len(groups)))
+
+            for i, (spec_id, grp) in enumerate(groups):
+                wn = grp[wn_col].values
+                color = colors[i]
+
+                # 提取光谱标签
+                label = f"Spec {spec_id}"
+                if name_col and not grp[name_col].empty:
+                    raw_name = str(grp[name_col].iloc[0])
+                    # 从名称中提取压力标签 (如 "...100Torr_spectrum" → "100Torr")
+                    import re
+                    m = re.search(r'(\d+Torr)', raw_name)
+                    if m:
+                        label = m.group(1)
+
+                if alpha_col:
+                    ax.plot(wn, grp[alpha_col].values, ".",
+                            ms=2, alpha=0.5, color=color, label=label)
+                if model_col:
+                    ax.plot(wn, grp[model_col].values, "-",
+                            lw=1, color=color)
+
+                if res_col:
+                    all_residuals.extend(grp[res_col].values)
+        else:
+            # 单光谱
+            wn = wn_all
+            if alpha_col:
+                ax.plot(wn, summary[alpha_col].values, "b.",
+                        ms=2, alpha=0.5, label="Data")
+            if model_col:
+                ax.plot(wn, summary[model_col].values, "r-",
+                        lw=1, label="MATS Fit")
+
+            if res_col:
+                all_residuals = list(summary[res_col].values)
+
+        ax.set_xlim(wn_min_global, wn_max_global)
         ax.set_ylabel("α (ppm/cm)")
         ax.set_title(title)
-        ax.legend()
+        ax.legend(fontsize=8, ncol=3, loc="upper right")
         ax.grid(True, alpha=0.3)
 
-        # Panel 2: Residuals
+        # ── Panel 2: Residuals ──
         ax = axes[1]
         if res_col:
-            res = summary[res_col].values
-            ax.plot(wn, res, ".", ms=2, color="tomato", alpha=0.5)
+            if is_multi:
+                for i, (spec_id, grp) in enumerate(groups):
+                    ax.plot(grp[wn_col].values, grp[res_col].values,
+                            ".", ms=2, alpha=0.4, color=colors[i])
+            else:
+                ax.plot(wn_all, summary[res_col].values,
+                        ".", ms=2, color="tomato", alpha=0.5)
             ax.axhline(0, color="gray", lw=0.5, ls="--")
             ax.set_ylabel("Residual (ppm/cm)")
-            # 只用数据范围内的残差计算 σ
-            res_valid = res[~outside] if model_col else res
-            ax.set_title(f"Residual (σ={np.std(res_valid):.4e})")
+            res_std = float(np.std(all_residuals)) if all_residuals else 0
+            ax.set_title(f"Residual (σ={res_std:.4e})")
         ax.grid(True, alpha=0.3)
 
-        # Panel 3: Tau
+        # ── Panel 3: Tau ──
         ax = axes[2]
         if tau_col and "Error" not in tau_col:
-            ax.plot(wn, summary[tau_col], "b.", ms=2, alpha=0.5)
+            if is_multi:
+                for i, (spec_id, grp) in enumerate(groups):
+                    ax.plot(grp[wn_col].values, grp[tau_col].values,
+                            ".", ms=2, alpha=0.5, color=colors[i])
+            else:
+                ax.plot(wn_all, summary[tau_col].values, "b.",
+                        ms=2, alpha=0.5)
             ax.set_ylabel("τ (μs)")
         ax.set_xlabel("Wavenumber (cm⁻¹)")
         ax.grid(True, alpha=0.3)
