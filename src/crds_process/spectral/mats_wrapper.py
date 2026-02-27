@@ -838,12 +838,14 @@ class MATSFitter:
             if is_multi:
                 for i, (spec_id, grp) in enumerate(groups):
                     wn = _shifted_wn(spec_id, grp[wn_col].values)
-                    ax.plot(wn, grp[res_col].values,
-                            ".", ms=2, alpha=0.4, color=colors[i])
+                    sort_idx = np.argsort(wn)
+                    ax.plot(wn[sort_idx], grp[res_col].values[sort_idx],
+                            "-", lw=0.8, alpha=0.6, color=colors[i])
             else:
                 wn = _shifted_wn(1, wn_all)
-                ax.plot(wn, summary[res_col].values,
-                        ".", ms=2, color="tomato", alpha=0.5)
+                sort_idx = np.argsort(wn)
+                ax.plot(wn[sort_idx], summary[res_col].values[sort_idx],
+                        "-", lw=0.8, color="tomato", alpha=0.7)
             ax.axhline(0, color="gray", lw=0.5, ls="--")
             ax.set_ylabel("Residual (ppm/cm)")
             res_std = float(np.std(all_residuals)) if all_residuals else 0
