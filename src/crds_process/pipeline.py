@@ -35,7 +35,9 @@ Step 4: 筛选 + 多光谱联合拟合  (剔除线强离群点 → 联合拟合 
 
 from __future__ import annotations
 
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +59,74 @@ _DEFAULT_PATHS = {
     "mats_multi": _PROJECT_ROOT / "output" / "results" / "mats_multi",
     "final": _PROJECT_ROOT / "output" / "results" / "final",
 }
+
+
+# ==================================================================
+# 子进程 worker 函数 (模块级，可被 pickle 序列化)
+# ==================================================================
+def _worker_ringdown(
+    data_dir: Path, output_dir: Path,
+    filter_method: str, sigma: float, min_events: int,
+) -> str:
+    """子进程: 处理单个 (transition/pressure) 的衰荡数据"""
+    from crds_process.preprocessing import RawDataProcessor
+    label = f"{data_dir.parent.name}/{data_dir.name}"
+    try:
+        proc = RawDataProcessor(
+            data_dir=data_dir, output_dir=output_dir,
+            filter_method=filter_method, sigma=sigma,
+            min_events=min_events, verbose=False,
+        )
+        proc.run()
+        return f"  ✓ {label}"
+    except Exception as e:
+        return f"  ✗ {label}: {e}"
+
+
+def _worker_etalon(csv_path: Path, output_dir: Path, label: str) -> str:
+    """子进程: 处理单个 (transition/pressure) 的标准具去除"""
+    import matplotlib
+    matplotlib.use("Agg")
+    from crds_process.baseline.etalon import EtalonRemover
+    try:
+        remover = EtalonRemover()
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        wn = df["wavenumber"].values
+        tau = df["tau_mean"].values
+        temp = float(df["temperature"].mean())
+        pres = float(df["pressure"].mean())
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result = remover.fit(wn, tau, temperature=temp, pressure_torr=pres)
+        title = f"Etalon Removal — {label}"
+        result.plot(title=title, save_path=output_dir / "etalon_removal.png")
+        result.save_csv(df, output_dir / "tau_etalon_corrected.csv")
+        return f"  ✓ {label}  (成功={result.model_result.success})"
+    except Exception as e:
+        return f"  ✗ {label}: {e}"
+
+
+def _worker_mats(
+    csv_path: Path, output_dir: Path, label: str,
+    fitter_kwargs: dict,
+) -> str:
+    """子进程: 处理单个 (transition/pressure) 的 MATS 拟合"""
+    import matplotlib
+    matplotlib.use("Agg")
+    from crds_process.spectral.mats_wrapper import MATSFitter
+    try:
+        fitter = MATSFitter(**fitter_kwargs)
+        dataset_name = label.replace("/", "_").replace(" ", "") or "crds"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result = fitter.fit(csv_path, output_dir, dataset_name=dataset_name)
+        if result.summary_df is not None and not result.summary_df.empty:
+            fitter.plot_result(
+                result, output_dir, title=f"MATS Fit — {label}",
+            )
+        return f"  ✓ {label}"
+    except Exception as e:
+        return f"  ✗ {label}: {e}"
 
 
 class CRDSPipeline:
@@ -113,6 +183,7 @@ class CRDSPipeline:
         baseline_order: int = 1,
         fit_intensity: float = 1e-30,
         threshold_intensity: float = 1e-35,
+        max_workers: int | None = None,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -121,6 +192,9 @@ class CRDSPipeline:
         self.mats_root = Path(mats_root) if mats_root else _DEFAULT_PATHS["mats"]
         self.mats_multi_root = Path(mats_multi_root) if mats_multi_root else _DEFAULT_PATHS["mats_multi"]
         self.final_root = Path(final_root) if final_root else _DEFAULT_PATHS["final"]
+
+        # ── 并行 ──
+        self.max_workers = max_workers or min(os.cpu_count() or 1, 6)
 
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
@@ -154,52 +228,123 @@ class CRDSPipeline:
     # Step 1: 衰荡时间处理
     # ==============================================================
     def step1_ringdown(self) -> None:
-        """Step 1: 原始衰荡数据 → ringdown_results.csv"""
-        from crds_process.preprocessing import batch_preprocess_ringdown
+        """Step 1: 原始衰荡数据 → ringdown_results.csv (多进程并行)"""
+        from crds_process.preprocessing import discover_tasks
 
         logger.info("\n" + "=" * 60)
         logger.info("  Step 1 / 4 — 衰荡时间处理")
         logger.info("=" * 60)
 
-        batch_preprocess_ringdown(
-            raw_root=self.raw_root,
-            result_root=self.ringdown_root,
-        )
+        tasks = discover_tasks(self.raw_root)
+        if not tasks:
+            logger.error(f"  未在 {self.raw_root} 下找到数据")
+            return
+
+        logger.info(f"  发现 {len(tasks)} 个数据集, "
+                     f"使用 {self.max_workers} 进程并行处理")
+
+        futures = []
+        with ProcessPoolExecutor(max_workers=self.max_workers) as pool:
+            for transition, pressure, data_dir in tasks:
+                output_dir = self.ringdown_root / transition / pressure
+                fut = pool.submit(
+                    _worker_ringdown,
+                    data_dir, output_dir,
+                    "sigma_clip", 3.0, 5,
+                )
+                futures.append((transition, pressure, fut))
+
+            for transition, pressure, fut in futures:
+                msg = fut.result()
+                logger.info(msg)
 
     # ==============================================================
     # Step 2: 去除标准具
     # ==============================================================
     def step2_etalon(self) -> None:
-        """Step 2: ringdown_results → tau_etalon_corrected.csv"""
-        from crds_process.baseline.etalon import batch_etalon_removal
+        """Step 2: ringdown_results → tau_etalon_corrected.csv (多进程并行)"""
+        from crds_process.baseline.etalon import EtalonBatchProcessor
 
         logger.info("\n" + "=" * 60)
         logger.info("  Step 2 / 4 — 去除标准具效应")
         logger.info("=" * 60)
 
-        batch_etalon_removal(
+        proc = EtalonBatchProcessor(
             ringdown_root=self.ringdown_root,
             etalon_root=self.etalon_root,
         )
+        tasks = proc.discover()
+        if not tasks:
+            logger.error(f"  未在 {self.ringdown_root} 下找到数据")
+            return
+
+        logger.info(f"  发现 {len(tasks)} 个数据集, "
+                     f"使用 {self.max_workers} 进程并行处理")
+
+        futures = []
+        with ProcessPoolExecutor(max_workers=self.max_workers) as pool:
+            for transition, pressure, csv_path in tasks:
+                output_dir = self.etalon_root / transition / pressure
+                label = f"{transition}/{pressure}"
+                fut = pool.submit(
+                    _worker_etalon, csv_path, output_dir, label,
+                )
+                futures.append((label, fut))
+
+            for label, fut in futures:
+                msg = fut.result()
+                logger.info(msg)
 
     # ==============================================================
     # Step 3: MATS 单光谱拟合 + 汇总
     # ==============================================================
+    def _fitter_kwargs(self) -> dict:
+        """返回 MATSFitter 构造参数 (可序列化, 用于子进程)"""
+        return dict(
+            molecule=self.molecule,
+            isotopologue=self.isotopologue,
+            molefraction=self.molefraction,
+            diluent=self.diluent,
+            lineprofile=self.lineprofile,
+            baseline_order=self.baseline_order,
+            fit_intensity=self.fit_intensity,
+            threshold_intensity=self.threshold_intensity,
+        )
+
     def step3_mats(self) -> None:
-        """Step 3: etalon_corrected → MATS SDVP 拟合 → 线强 & 自展宽"""
+        """Step 3: etalon_corrected → MATS SDVP 拟合 (多进程并行)"""
         from crds_process.spectral.mats_wrapper import MATSBatchProcessor
 
         logger.info("\n" + "=" * 60)
         logger.info(f"  Step 3 / 4 — MATS 光谱拟合 (线形: {self.lineprofile})")
         logger.info("=" * 60)
 
-        fitter = self._create_fitter()
-        processor = MATSBatchProcessor(
+        proc = MATSBatchProcessor(
             etalon_root=self.etalon_root,
             mats_root=self.mats_root,
-            fitter=fitter,
         )
-        processor.run()
+        tasks = proc.discover()
+        if not tasks:
+            logger.error(f"  未在 {self.etalon_root} 下找到数据")
+            return
+
+        logger.info(f"  发现 {len(tasks)} 个数据集, "
+                     f"使用 {self.max_workers} 进程并行处理")
+
+        fitter_kw = self._fitter_kwargs()
+        futures = []
+        with ProcessPoolExecutor(max_workers=self.max_workers) as pool:
+            for transition, pressure, csv_path in tasks:
+                output_dir = self.mats_root / transition / pressure
+                label = f"{transition}/{pressure}"
+                fut = pool.submit(
+                    _worker_mats, csv_path, output_dir, label, fitter_kw,
+                )
+                futures.append((label, fut))
+
+            for label, fut in futures:
+                msg = fut.result()
+                logger.info(msg)
 
         # 汇总: 从 MATS 输出中提取线强 & 自展宽
         self._collect_final_summary()
@@ -293,6 +438,7 @@ class CRDSPipeline:
         logger.info("=" * 60)
         logger.info(f"  线形:     {self.lineprofile}")
         logger.info(f"  线强筛选: {self.sw_sigma}σ (Step 4)")
+        logger.info(f"  并行进程: {self.max_workers}")
         logger.info(f"  原始数据: {self.raw_root}")
         logger.info(f"  日志文件: {log_path}")
         logger.info("=" * 60)
