@@ -509,7 +509,13 @@ class CRDSPipeline:
         return records
 
     def _screen_sw(self, records: list[dict], transition: str) -> pd.DataFrame:
-        """基于 MAD 筛选线强离群点"""
+        """基于 MAD 筛选线强离群点
+
+        双重保护:
+          1. MAD σ 筛选: 偏差 > sw_sigma 倍 MAD 则标记为离群
+          2. 相对偏差保护: 即使 MAD σ 很大，若相对偏差 < 5% 仍保留
+             (MAD 在样本数少时过于敏感)
+        """
         sw_df = pd.DataFrame(records)
         sw_values = sw_df["sw"].values
         median_sw = float(np.median(sw_values))
@@ -520,17 +526,27 @@ class CRDSPipeline:
         sw_df["deviation"] = (
             np.abs(sw_df["sw"] - median_sw) / (mad_sw if mad_sw > 0 else 1)
         )
-        sw_df["keep"] = sw_df["deviation"] <= self.sw_sigma
+        sw_df["rel_deviation"] = (
+            np.abs(sw_df["sw"] - median_sw) / median_sw if median_sw > 0 else 0
+        )
+        # 双重条件: MAD σ ≤ 阈值 OR 相对偏差 < 5%
+        rel_threshold = 0.05  # 5%
+        sw_df["keep"] = (
+            (sw_df["deviation"] <= self.sw_sigma)
+            | (sw_df["rel_deviation"] < rel_threshold)
+        )
 
         # 打印筛选结果
         logger.info(f"\n  [{transition}] 线强筛选 (中位数={median_sw:.4e}, "
               f"MAD={mad_sw:.4e}, 阈值={self.sw_sigma}σ)")
-        logger.info(f"  {'压力':<10s} {'S (cm/molec)':<14s} {'偏差/MAD':<10s} {'状态':<8s}")
-        logger.info(f"  {'─' * 50}")
+        logger.info(f"  {'压力':<10s} {'S (cm/molec)':<14s} {'偏差/MAD':<10s} "
+                     f"{'相对偏差':<10s} {'状态':<8s}")
+        logger.info(f"  {'─' * 60}")
         for _, r in sw_df.iterrows():
             status = "✓ 保留" if r["keep"] else "✗ 剔除"
             logger.info(f"  {r['pressure']:<10s} {r['sw']:.4e}   "
-                  f"{r['deviation']:>6.2f}σ     {status}")
+                  f"{r['deviation']:>6.2f}σ     "
+                  f"{r['rel_deviation']*100:>5.1f}%     {status}")
 
         kept = sw_df[sw_df["keep"]]
         removed = sw_df[~sw_df["keep"]]

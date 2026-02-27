@@ -88,6 +88,59 @@ def _estimate_dominant_frequency(x: np.ndarray, y: np.ndarray,
     return result or [1.0]
 
 
+def _detect_significant_frequencies(
+    x: np.ndarray, y: np.ndarray,
+    max_components: int = 5,
+    snr_threshold: float = 3.0,
+) -> list[tuple[float, float]]:
+    """自动检测显著的标准具频率分量
+
+    使用 Lomb-Scargle 周期图迭代检测：
+      1. 找到最大功率的频率
+      2. 检查该频率的 SNR (peak / median)
+      3. 若 SNR > 阈值，记录该频率并从谱中减去
+      4. 重复直到没有显著分量或达到上限
+
+    Returns
+    -------
+    list[tuple[float, float]]
+        [(freq, power), ...] 按功率降序
+    """
+    from scipy.signal import detrend, lombscargle
+
+    y_work = detrend(y, type="linear").copy()
+    dx_med = float(np.median(np.diff(x)))
+    f_min = 2.0 / (x[-1] - x[0])  # 至少 2 个周期
+    f_max = 0.5 / dx_med
+    test_f = np.linspace(f_min, f_max, 10000)
+
+    detected: list[tuple[float, float]] = []
+    for _ in range(max_components):
+        power = lombscargle(x, y_work, 2.0 * np.pi * test_f, normalize=False)
+        idx_peak = int(np.argmax(power))
+        peak_power = float(power[idx_peak])
+
+        # SNR: 峰值 / 中位数
+        median_power = float(np.median(power))
+        snr = peak_power / median_power if median_power > 0 else 0
+
+        if snr < snr_threshold:
+            break
+
+        freq = float(test_f[idx_peak])
+        detected.append((freq, peak_power))
+
+        # 从信号中减去这个频率分量 (简单正弦拟合)
+        omega = 2.0 * np.pi * freq
+        sin_vals = np.sin(omega * x)
+        cos_vals = np.cos(omega * x)
+        a = 2.0 * np.mean(y_work * sin_vals)
+        b = 2.0 * np.mean(y_work * cos_vals)
+        y_work -= a * sin_vals + b * cos_vals
+
+    return detected
+
+
 def _suppress_stdout(func, *args, **kwargs):
     """静默执行函数 (抑制 stdout 输出)"""
     old = sys.stdout
@@ -436,10 +489,14 @@ class EtalonFitResult:
 class EtalonRemover:
     """标准具效应拟合与去除 (迭代交替优化)
 
+    支持两种模式:
+    1. 固定分量数: n_etalons=N (手动指定)
+    2. 自动检测:   n_etalons="auto" (根据 SNR 自动确定分量数)
+
     Parameters
     ----------
-    n_etalons : int
-        正弦分量数 (通常 1~3)
+    n_etalons : int | str
+        正弦分量数 (1~5) 或 "auto" (自动检测)
     freq_hints : list[float] | None
         频率初始猜测 (cycles/cm⁻¹)
     exclude_regions : list | str | None
@@ -456,11 +513,17 @@ class EtalonRemover:
         自定义检测器，None 则使用默认参数
     max_nfev : int
         lmfit 每次拟合最大函数求值次数
+    auto_max_components : int
+        自动模式最多检测的分量数 (默认 5)
+    auto_snr_threshold : float
+        自动模式 SNR 阈值 (默认 3.0)
+    residual_improvement_threshold : float
+        残差改善比例阈值，低于此值停止添加分量 (默认 0.05 = 5%)
     """
 
     def __init__(
         self,
-        n_etalons: int = 1,
+        n_etalons: int | str = "auto",
         freq_hints: list[float] | None = None,
         exclude_regions: list[list[float]] | str | None = "hitran",
         poly_order: int = 1,
@@ -468,9 +531,12 @@ class EtalonRemover:
         flatten_baseline: bool = True,
         hitran_detector: HitranAbsorptionDetector | None = None,
         max_nfev: int = 20000,
+        auto_max_components: int = 5,
+        auto_snr_threshold: float = 3.0,
+        residual_improvement_threshold: float = 0.05,
     ):
-        if n_etalons < 1:
-            raise ValueError("n_etalons 必须 >= 1")
+        if isinstance(n_etalons, int) and n_etalons < 1:
+            raise ValueError("n_etalons 必须 >= 1 或 'auto'")
         self.n_etalons = n_etalons
         self.freq_hints = freq_hints
         self.exclude_regions = exclude_regions
@@ -479,6 +545,9 @@ class EtalonRemover:
         self.flatten_baseline = flatten_baseline
         self.hitran_detector = hitran_detector or HitranAbsorptionDetector()
         self.max_nfev = max_nfev
+        self.auto_max_components = auto_max_components
+        self.auto_snr_threshold = auto_snr_threshold
+        self.residual_improvement_threshold = residual_improvement_threshold
 
     def _build_model(
         self, x: np.ndarray, y: np.ndarray,
@@ -536,7 +605,15 @@ class EtalonRemover:
         pressure_torr: float | None = None,
         exclude_regions: list[list[float]] | None = None,
     ) -> EtalonFitResult:
-        """迭代交替优化拟合"""
+        """迭代交替优化拟合
+
+        auto 模式流程:
+          1. 去趋势 + 排除吸收区
+          2. 对残差做 Lomb-Scargle 找最强频率
+          3. 拟合 1 个正弦 → 减去 → 检查残差改善
+          4. 对新残差再找频率 → 添加分量 → 联合拟合
+          5. 残差不再改善时停止
+        """
         x = np.asarray(wavenumber, dtype=float)
         y = np.asarray(signal, dtype=float)
         if len(x) != len(y):
@@ -554,35 +631,64 @@ class EtalonRemover:
         x_c = x - x_center
         x_fit_c = x_fit - x_center
 
-        # 迭代交替优化
+        # 确定分量数
+        if self.n_etalons == "auto":
+            return self._fit_auto(
+                x, y, x_fit, y_fit, x_c, x_fit_c, x_center,
+                fit_mask, all_exclude,
+            )
+        else:
+            return self._fit_fixed(
+                x, y, x_fit, y_fit, x_c, x_fit_c, x_center,
+                fit_mask, all_exclude, self.n_etalons,
+            )
+
+    def _fit_fixed(
+        self, x, y, x_fit, y_fit, x_c, x_fit_c, x_center,
+        fit_mask, all_exclude, n_etalons,
+        freq_hints=None,
+    ) -> EtalonFitResult:
+        """固定分量数的迭代交替拟合"""
         etalon_fit = np.zeros_like(x_fit)
         last_result = None
         prev_params: Parameters | None = None
 
-        for _ in range(self.n_iter):
-            poly_c = np.polyfit(x_fit_c, y_fit - etalon_fit, self.poly_order)
-            baseline_fit = np.polyval(poly_c, x_fit_c)
-            residual = y_fit - baseline_fit
+        # 使用提供的频率初始值或自动估计
+        saved_n = self.n_etalons
+        saved_hints = self.freq_hints
+        self.n_etalons = n_etalons
+        if freq_hints:
+            self.freq_hints = freq_hints
 
-            model, params = self._build_model(x_fit, residual)
-            if prev_params is not None:
-                for pn in prev_params:
-                    if pn in params:
-                        params[pn].set(value=prev_params[pn].value)
+        try:
+            for _ in range(self.n_iter):
+                poly_c = np.polyfit(x_fit_c, y_fit - etalon_fit,
+                                    self.poly_order)
+                baseline_fit = np.polyval(poly_c, x_fit_c)
+                residual = y_fit - baseline_fit
 
-            last_result = model.fit(residual, params, x=x_fit,
-                                    max_nfev=self.max_nfev)
-            prev_params = last_result.params
+                model, params = self._build_model(x_fit, residual)
+                if prev_params is not None:
+                    for pn in prev_params:
+                        if pn in params:
+                            params[pn].set(value=prev_params[pn].value)
 
-            etalon_fit = np.zeros_like(x_fit)
-            for i in range(self.n_etalons):
-                pfx = f"e{i}_"
-                etalon_fit += _sine_component(
-                    x_fit,
-                    last_result.params[f"{pfx}amplitude"].value,
-                    last_result.params[f"{pfx}frequency"].value,
-                    last_result.params[f"{pfx}phase"].value,
-                )
+                last_result = model.fit(residual, params, x=x_fit,
+                                        max_nfev=self.max_nfev)
+                prev_params = last_result.params
+
+                etalon_fit = np.zeros_like(x_fit)
+                for i in range(n_etalons):
+                    pfx = f"e{i}_"
+                    etalon_fit += _sine_component(
+                        x_fit,
+                        last_result.params[f"{pfx}amplitude"].value,
+                        last_result.params[f"{pfx}frequency"].value,
+                        last_result.params[f"{pfx}phase"].value,
+                    )
+        finally:
+            self.n_etalons = saved_n
+            self.freq_hints = saved_hints
 
         # 全波段结果
         poly_final = np.polyfit(x_fit_c, y_fit - etalon_fit, self.poly_order)
@@ -590,7 +696,7 @@ class EtalonRemover:
 
         etalon_full = np.zeros_like(x)
         components: list[dict] = []
-        for i in range(self.n_etalons):
+        for i in range(n_etalons):
             pfx = f"e{i}_"
             amp = last_result.params[f"{pfx}amplitude"].value
             freq = last_result.params[f"{pfx}frequency"].value
@@ -606,10 +712,88 @@ class EtalonRemover:
         return EtalonFitResult(
             wavenumber=x, original=y, etalon=etalon_full,
             baseline=baseline_full, corrected=corrected,
-            model_result=last_result, n_etalons=self.n_etalons,
+            model_result=last_result, n_etalons=n_etalons,
             fit_mask=fit_mask, exclude_regions=all_exclude,
             components=components,
         )
+
+    def _fit_auto(
+        self, x, y, x_fit, y_fit, x_c, x_fit_c, x_center,
+        fit_mask, all_exclude,
+    ) -> EtalonFitResult:
+        """自动检测分量数的贪心迭代拟合
+
+        每轮:
+          1. 对当前残差用 Lomb-Scargle 找显著频率
+          2. 用已有频率 + 新频率联合拟合
+          3. 检查残差是否改善 > threshold
+          4. 不改善则回退，返回上轮结果
+        """
+        # 初始: 去趋势得到残差
+        poly_init = np.polyfit(x_fit_c, y_fit, self.poly_order)
+        residual = y_fit - np.polyval(poly_init, x_fit_c)
+        prev_std = float(np.std(residual))
+
+        best_result = None
+        accumulated_freqs: list[float] = []
+
+        for comp_idx in range(self.auto_max_components):
+            # 检测当前残差中最显著的频率
+            detected = _detect_significant_frequencies(
+                x_fit, residual,
+                max_components=1,
+                snr_threshold=self.auto_snr_threshold,
+            )
+            if not detected:
+                logger.info(f"    auto: 第 {comp_idx + 1} 个分量 — "
+                             f"无显著频率, 停止")
+                break
+
+            new_freq = detected[0][0]
+            trial_freqs = accumulated_freqs + [new_freq]
+
+            logger.info(f"    auto: 尝试第 {comp_idx + 1} 个分量, "
+                         f"freq={new_freq:.2f} cycles/cm⁻¹")
+
+            # 联合拟合所有分量
+            trial_result = self._fit_fixed(
+                x, y, x_fit, y_fit, x_c, x_fit_c, x_center,
+                fit_mask, all_exclude, len(trial_freqs),
+                freq_hints=trial_freqs,
+            )
+
+            # 计算改善
+            new_std = trial_result.residual_std
+            improvement = (prev_std - new_std) / prev_std if prev_std > 0 else 0
+
+            logger.info(f"    auto: σ {prev_std:.6f} → {new_std:.6f} "
+                         f"(改善 {improvement * 100:.1f}%)")
+
+            if improvement < self.residual_improvement_threshold and comp_idx > 0:
+                logger.info(f"    auto: 改善 < {self.residual_improvement_threshold * 100:.0f}%, "
+                             f"停止, 使用 {len(accumulated_freqs)} 个分量")
+                break
+
+            # 接受这个分量
+            accumulated_freqs = trial_freqs
+            best_result = trial_result
+            prev_std = new_std
+
+            # 更新残差: 从 corrected 信号中去趋势
+            corrected_fit = trial_result.corrected[fit_mask]
+            poly_new = np.polyfit(x_fit_c, corrected_fit, self.poly_order)
+            residual = corrected_fit - np.polyval(poly_new, x_fit_c)
+
+        if best_result is None:
+            # 没有检测到任何分量，返回仅基线的结果
+            logger.info(f"    auto: 未检测到标准具, 仅去除基线")
+            return self._fit_fixed(
+                x, y, x_fit, y_fit, x_c, x_fit_c, x_center,
+                fit_mask, all_exclude, 1,
+            )
+
+        logger.info(f"    auto: 最终使用 {best_result.n_etalons} 个标准具分量")
+        return best_result
 
     def fit_df(
         self,
