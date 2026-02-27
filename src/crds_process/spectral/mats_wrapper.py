@@ -764,8 +764,6 @@ class MATSFitter:
 
         # 全局波数范围
         wn_all = summary[wn_col].values
-        wn_min_global = float(wn_all.min())
-        wn_max_global = float(wn_all.max())
 
         fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
 
@@ -782,6 +780,53 @@ class MATSFitter:
             xs = x_shifts.get(int(spec_id), 0.0)
             return wn_arr + xs
 
+        # 计算考虑 x_shift 后的公共波数范围
+        # 多轮收缩: 先取各光谱波数范围的交集，再取各光谱在交集内
+        # 实际首末采样点的最严格边界，最后额外收缩半个步长保证完全对齐
+        if is_multi and spec_col is not None:
+            groups_tmp = list(summary.groupby(spec_col))
+            # 第一轮: 粗交集
+            per_spec_min = []
+            per_spec_max = []
+            for sid, grp in groups_tmp:
+                shifted = _shifted_wn(sid, grp[wn_col].values)
+                per_spec_min.append(float(shifted.min()))
+                per_spec_max.append(float(shifted.max()))
+            rough_min = max(per_spec_min)
+            rough_max = min(per_spec_max)
+
+            # 估算平均采样步长
+            all_steps = []
+            for sid, grp in groups_tmp:
+                shifted = np.sort(_shifted_wn(sid, grp[wn_col].values))
+                if len(shifted) > 1:
+                    all_steps.append(float(np.median(np.diff(shifted))))
+            half_step = np.median(all_steps) / 2.0 if all_steps else 0.0
+
+            # 第二轮: 在粗交集内找各光谱实际首末采样点的最严格边界
+            actual_first = []
+            actual_last = []
+            for sid, grp in groups_tmp:
+                shifted = np.sort(_shifted_wn(sid, grp[wn_col].values))
+                inside = shifted[(shifted >= rough_min) & (shifted <= rough_max)]
+                if len(inside) > 0:
+                    actual_first.append(float(inside[0]))
+                    actual_last.append(float(inside[-1]))
+            # 取各光谱首点中最大的、末点中最小的，再收缩半步长
+            wn_common_min = max(actual_first) + half_step if actual_first else rough_min
+            wn_common_max = min(actual_last) - half_step if actual_last else rough_max
+        else:
+            shifted_all = _shifted_wn(1, wn_all)
+            wn_common_min = float(shifted_all.min())
+            wn_common_max = float(shifted_all.max())
+
+        wn_margin = (wn_common_max - wn_common_min) * 0.02
+        axes[-1].set_xlim(wn_common_min - wn_margin, wn_common_max + wn_margin)
+
+        def _clip_mask(wn_arr):
+            """返回严格落在公共波数范围内的布尔掩码"""
+            return (wn_arr >= wn_common_min) & (wn_arr <= wn_common_max)
+
         # ── Panel 1: Alpha + Model ──
         ax = axes[0]
         all_residuals = []
@@ -793,6 +838,8 @@ class MATSFitter:
 
             for i, (spec_id, grp) in enumerate(groups):
                 wn = _shifted_wn(spec_id, grp[wn_col].values)
+                mask = _clip_mask(wn)
+                wn = wn[mask]
                 color = colors[i]
 
                 # 提取光谱标签
@@ -806,26 +853,28 @@ class MATSFitter:
                         label = m.group(1)
 
                 if alpha_col:
-                    ax.plot(wn, grp[alpha_col].values, ".",
+                    ax.plot(wn, grp[alpha_col].values[mask], ".",
                             ms=2, alpha=0.5, color=color, label=label)
                 if model_col:
-                    ax.plot(wn, grp[model_col].values, "-",
+                    ax.plot(wn, grp[model_col].values[mask], "-",
                             lw=1, color=color)
 
                 if res_col:
-                    all_residuals.extend(grp[res_col].values)
+                    all_residuals.extend(grp[res_col].values[mask])
         else:
             # 单光谱
             wn = _shifted_wn(1, wn_all)
+            mask = _clip_mask(wn)
+            wn = wn[mask]
             if alpha_col:
-                ax.plot(wn, summary[alpha_col].values, "b.",
+                ax.plot(wn, summary[alpha_col].values[mask], "b.",
                         ms=2, alpha=0.5, label="Data")
             if model_col:
-                ax.plot(wn, summary[model_col].values, "r-",
+                ax.plot(wn, summary[model_col].values[mask], "r-",
                         lw=1, label="MATS Fit")
 
             if res_col:
-                all_residuals = list(summary[res_col].values)
+                all_residuals = list(summary[res_col].values[mask])
 
         ax.set_ylabel("α (ppm/cm)")
         ax.set_title(title)
@@ -838,13 +887,19 @@ class MATSFitter:
             if is_multi:
                 for i, (spec_id, grp) in enumerate(groups):
                     wn = _shifted_wn(spec_id, grp[wn_col].values)
+                    mask = _clip_mask(wn)
+                    wn = wn[mask]
+                    res_vals = grp[res_col].values[mask]
                     sort_idx = np.argsort(wn)
-                    ax.plot(wn[sort_idx], grp[res_col].values[sort_idx],
+                    ax.plot(wn[sort_idx], res_vals[sort_idx],
                             "-", lw=0.8, alpha=0.6, color=colors[i])
             else:
                 wn = _shifted_wn(1, wn_all)
+                mask = _clip_mask(wn)
+                wn = wn[mask]
+                res_vals = summary[res_col].values[mask]
                 sort_idx = np.argsort(wn)
-                ax.plot(wn[sort_idx], summary[res_col].values[sort_idx],
+                ax.plot(wn[sort_idx], res_vals[sort_idx],
                         "-", lw=0.8, color="tomato", alpha=0.7)
             ax.axhline(0, color="gray", lw=0.5, ls="--")
             ax.set_ylabel("Residual (ppm/cm)")
@@ -858,11 +913,15 @@ class MATSFitter:
             if is_multi:
                 for i, (spec_id, grp) in enumerate(groups):
                     wn = _shifted_wn(spec_id, grp[wn_col].values)
-                    ax.plot(wn, grp[tau_col].values,
+                    mask = _clip_mask(wn)
+                    wn = wn[mask]
+                    ax.plot(wn, grp[tau_col].values[mask],
                             ".", ms=2, alpha=0.5, color=colors[i])
             else:
                 wn = _shifted_wn(1, wn_all)
-                ax.plot(wn, summary[tau_col].values, "b.",
+                mask = _clip_mask(wn)
+                wn = wn[mask]
+                ax.plot(wn, summary[tau_col].values[mask], "b.",
                         ms=2, alpha=0.5)
             ax.set_ylabel("τ (μs)")
         ax.set_xlabel("Wavenumber (cm⁻¹)")
