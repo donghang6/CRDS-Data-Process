@@ -85,7 +85,7 @@ class CRDSPipeline:
     molefraction : dict
         摩尔分数 (默认 {7: 1.0})
     diluent : str
-        稀释气体 (默认 "self")
+        稀释气体 (默认 "O2")
     baseline_order : int
         基线多项式阶数 (默认 1)
     fit_intensity : float
@@ -107,7 +107,7 @@ class CRDSPipeline:
         molecule: int = 7,
         isotopologue: int = 1,
         molefraction: dict | None = None,
-        diluent: str = "self",
+        diluent: str = "O2",
         baseline_order: int = 1,
         fit_intensity: float = 1e-30,
         threshold_intensity: float = 1e-35,
@@ -327,7 +327,7 @@ class CRDSPipeline:
                     "pressure": p_dir.name,
                     "sw": sw_real,
                     "sw_raw": row["sw"],
-                    "gamma0_self": row["gamma0_self"],
+                    "gamma0_O2": row["gamma0_O2"],
                 })
         return records
 
@@ -404,16 +404,16 @@ class CRDSPipeline:
                 "nu_HITRAN": row["nu"],
                 "sw": row["sw"] * scale,
                 "sw_err": row.get("sw_err", 0) * scale,
-                "gamma0_self": row["gamma0_self"],
-                "gamma0_self_err": row.get("gamma0_self_err", 0),
-                "n_gamma0_self": row.get("n_gamma0_self", 0),
-                "n_gamma0_self_err": row.get("n_gamma0_self_err", 0),
-                "SD_gamma_self": row.get("SD_gamma_self", 0),
-                "SD_gamma_self_err": row.get("SD_gamma_self_err", 0),
-                "delta0_self": row.get("delta0_self", 0),
-                "delta0_self_err": row.get("delta0_self_err", 0),
-                "SD_delta_self": row.get("SD_delta_self", 0),
-                "SD_delta_self_err": row.get("SD_delta_self_err", 0),
+                "gamma0_O2": row["gamma0_O2"],
+                "gamma0_O2_err": row.get("gamma0_O2_err", 0),
+                "n_gamma0_O2": row.get("n_gamma0_O2", 0),
+                "n_gamma0_O2_err": row.get("n_gamma0_O2_err", 0),
+                "SD_gamma_O2": row.get("SD_gamma_O2", 0),
+                "SD_gamma_O2_err": row.get("SD_gamma_O2_err", 0),
+                "delta0_O2": row.get("delta0_O2", 0),
+                "delta0_O2_err": row.get("delta0_O2_err", 0),
+                "SD_delta_O2": row.get("SD_delta_O2", 0),
+                "SD_delta_O2_err": row.get("SD_delta_O2_err", 0),
                 "residual_std": result.residual_std,
                 "QF": result.qf,
             })
@@ -433,11 +433,11 @@ class CRDSPipeline:
         for _, r in final_df.iterrows():
             print(f"  ν = {r['nu_HITRAN']:.6f} cm⁻¹")
             print(f"    S          = {r['sw']:.6e} ± {r['sw_err']:.2e} cm⁻¹/(molec·cm⁻²)")
-            print(f"    γ₀_self    = {r['gamma0_self']:.6f} ± {r['gamma0_self_err']:.6f} cm⁻¹/atm")
-            print(f"    n_γ₀_self  = {r['n_gamma0_self']:.4f} ± {r['n_gamma0_self_err']:.4f}")
-            print(f"    SD_γ_self  = {r['SD_gamma_self']:.6f} ± {r['SD_gamma_self_err']:.6f}")
-            print(f"    δ₀_self    = {r['delta0_self']:.6f} ± {r['delta0_self_err']:.6f} cm⁻¹/atm")
-            print(f"    SD_δ_self  = {r['SD_delta_self']:.6f} ± {r['SD_delta_self_err']:.6f}")
+            print(f"    γ₀_O2     = {r['gamma0_O2']:.6f} ± {r['gamma0_O2_err']:.6f} cm⁻¹/atm")
+            print(f"    n_γ₀_O2   = {r['n_gamma0_O2']:.4f} ± {r['n_gamma0_O2_err']:.4f}")
+            print(f"    SD_γ_O2   = {r['SD_gamma_O2']:.6f} ± {r['SD_gamma_O2_err']:.6f}")
+            print(f"    δ₀_O2     = {r['delta0_O2']:.6f} ± {r['delta0_O2_err']:.6f} cm⁻¹/atm")
+            print(f"    SD_δ_O2   = {r['SD_delta_O2']:.6f} ± {r['SD_delta_O2_err']:.6f}")
             print(f"    Res. σ     = {r['residual_std']:.4e}")
             print(f"    QF         = {r['QF']:.1f}")
         print(f"\n  结果已保存: {out_path}")
@@ -483,14 +483,14 @@ class CRDSPipeline:
                         "sw": sw * sw_scale,
                         "sw_raw": sw,
                         "sw_scale_factor": sw_scale,
-                        "gamma0_self": row.get("gamma0_self", 0),
-                        "gamma0_self_err": row.get("gamma0_self_err", 0),
-                        "n_gamma0_self": row.get("n_gamma0_self", 0),
-                        "delta0_self": row.get("delta0_self", 0),
-                        "delta0_self_err": row.get("delta0_self_err", 0),
-                        "SD_gamma_self": row.get("SD_gamma_self", 0),
-                        "SD_gamma_self_err": row.get("SD_gamma_self_err", 0),
-                        "SD_delta_self": row.get("SD_delta_self", 0),
+                        "gamma0_O2": row.get("gamma0_O2", 0),
+                        "gamma0_O2_err": row.get("gamma0_O2_err", 0),
+                        "n_gamma0_O2": row.get("n_gamma0_O2", 0),
+                        "delta0_O2": row.get("delta0_O2", 0),
+                        "delta0_O2_err": row.get("delta0_O2_err", 0),
+                        "SD_gamma_O2": row.get("SD_gamma_O2", 0),
+                        "SD_gamma_O2_err": row.get("SD_gamma_O2_err", 0),
+                        "SD_delta_O2": row.get("SD_delta_O2", 0),
                         "x_shift": x_shift,
                         "residual_std": residual_std,
                         "sw_vary": row.get("sw_vary", False),
@@ -534,23 +534,23 @@ class CRDSPipeline:
         print(f"\n  {'─' * 100}")
         print(f"  {'跃迁':<12s} {'压力':<10s} {'ν (cm⁻¹)':<16s} "
               f"{'S (cm/molec)':<14s} "
-              f"{'γ₀_self (cm⁻¹/atm)':<20s} "
-              f"{'δ₀_self':<12s} "
+              f"{'γ₀_O2 (cm⁻¹/atm)':<20s} "
+              f"{'δ₀_O2':<12s} "
               f"{'SD_γ':<10s} "
               f"{'Res. σ':<12s}")
         print(f"  {'─' * 100}")
 
         for _, row in fitted.iterrows():
-            gamma_str = f"{row['gamma0_self']:.6f}"
-            if row.get('gamma0_self_err', 0) > 0:
-                gamma_str += f" ± {row['gamma0_self_err']:.6f}"
+            gamma_str = f"{row['gamma0_O2']:.6f}"
+            if row.get('gamma0_O2_err', 0) > 0:
+                gamma_str += f" ± {row['gamma0_O2_err']:.6f}"
             print(
                 f"  {row['transition']:<12s} {row['pressure_label']:<10s} "
                 f"{row['nu']:>14.6f}  "
                 f"{row['sw']:>12.4e}  "
                 f"{gamma_str:<20s} "
-                f"{row.get('delta0_self', 0):>10.6f}  "
-                f"{row.get('SD_gamma_self', 0):>8.4f}  "
+                f"{row.get('delta0_O2', 0):>10.6f}  "
+                f"{row.get('SD_gamma_O2', 0):>8.4f}  "
                 f"{row['residual_std']:>10.4e}"
             )
 
@@ -594,14 +594,14 @@ class CRDSPipeline:
                         "nu_HITRAN": row["nu"],
                         "sw": row["sw"] * scale,
                         "sw_err": row.get("sw_err", 0) * scale,
-                        "gamma0_self": row["gamma0_self"],
-                        "gamma0_self_err": row.get("gamma0_self_err", 0),
-                        "SD_gamma_self": row.get("SD_gamma_self", 0),
-                        "SD_gamma_self_err": row.get("SD_gamma_self_err", 0),
-                        "delta0_self": row.get("delta0_self", 0),
-                        "delta0_self_err": row.get("delta0_self_err", 0),
-                        "SD_delta_self": row.get("SD_delta_self", 0),
-                        "SD_delta_self_err": row.get("SD_delta_self_err", 0),
+                        "gamma0_O2": row["gamma0_O2"],
+                        "gamma0_O2_err": row.get("gamma0_O2_err", 0),
+                        "SD_gamma_O2": row.get("SD_gamma_O2", 0),
+                        "SD_gamma_O2_err": row.get("SD_gamma_O2_err", 0),
+                        "delta0_O2": row.get("delta0_O2", 0),
+                        "delta0_O2_err": row.get("delta0_O2_err", 0),
+                        "SD_delta_O2": row.get("SD_delta_O2", 0),
+                        "SD_delta_O2_err": row.get("SD_delta_O2_err", 0),
                         "x_shift": x_shift,
                         "residual_std": residual_std,
                     })

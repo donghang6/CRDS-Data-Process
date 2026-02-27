@@ -212,30 +212,30 @@ class HitranLinelistBuilder:
             "n_gamma0_air": data["n_air"],
             "delta0_air": data["delta_air"],
             "elower": data["elower"],
-            "gamma0_self": data["gamma_self"],
-            "n_gamma0_self": data["n_air"],  # 近似使用 n_air
+            "gamma0_O2": data["gamma_self"],
+            "n_gamma0_O2": data["n_air"],  # 近似使用 n_air
         })
         margin = 5.0
         df = df[(df["nu"] >= wn_min - margin) & (df["nu"] <= wn_max + margin)]
         df["sw_scale_factor"] = 1.0
-        # 注意: n_gamma0_self 已从 HITRAN 赋值，不在此列表中覆盖为 0
+        # 注意: n_gamma0_O2 已从 HITRAN 赋值，不在此列表中覆盖为 0
         # SD_gamma 设置非零初始值 (SDVP 线形需要)
         for col in [
-            "n_delta0_air", "n_delta0_self",
+            "n_delta0_air", "n_delta0_O2",
             "SD_delta_air", "n_gamma2_air", "n_delta2_air",
-            "n_gamma2_self", "n_delta2_self",
-            "nuVC_air", "nuVC_self", "n_nuVC_air", "n_nuVC_self",
-            "eta_air", "eta_self", "y_air", "n_y_air", "y_self", "n_y_self",
+            "n_gamma2_O2", "n_delta2_O2",
+            "nuVC_air", "nuVC_O2", "n_nuVC_air", "n_nuVC_O2",
+            "eta_air", "eta_O2", "y_air", "n_y_air", "y_O2", "n_y_O2",
         ]:
             df[col] = 0.0
-        # delta0_self 初始猜测 (O₂ A-band 典型值 ~ -0.005 cm⁻¹/atm)
-        df["delta0_self"] = -0.005
+        # delta0_O2 初始猜测 (O₂ A-band 典型值 ~ -0.005 cm⁻¹/atm)
+        df["delta0_O2"] = -0.005
         # SD_delta 初始猜测
         df["SD_delta_air"] = 0.05
-        df["SD_delta_self"] = 0.05
+        df["SD_delta_O2"] = 0.05
         # SD_gamma 初始猜测 ~0.10 (O₂ A-band 典型值)
         df["SD_gamma_air"] = 0.10
-        df["SD_gamma_self"] = 0.10
+        df["SD_gamma_O2"] = 0.10
         df = df.reset_index(drop=True)
         if save_path:
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
@@ -268,17 +268,17 @@ class MATSFitResult:
                 nu = row.get("nu", 0)
                 sw = row.get("sw", 0)
                 gamma0_air = row.get("gamma0_air", 0)
-                gamma0_self = row.get("gamma0_self", 0)
+                gamma0_O2 = row.get("gamma0_O2", row.get("gamma0_self", 0))
                 delta0_air = row.get("delta0_air", 0)
-                delta0_self = row.get("delta0_self", 0)
-                sd_gamma = row.get("SD_gamma_self", row.get("SD_gamma_air", 0))
-                sd_delta = row.get("SD_delta_self", row.get("SD_delta_air", 0))
+                delta0_O2 = row.get("delta0_O2", row.get("delta0_self", 0))
+                sd_gamma = row.get("SD_gamma_O2", row.get("SD_gamma_self", row.get("SD_gamma_air", 0)))
+                sd_delta = row.get("SD_delta_O2", row.get("SD_delta_self", row.get("SD_delta_air", 0)))
                 lines.append(
                     f"  Line: ν={nu:.6f} cm⁻¹, "
                     f"S={sw:.4e}, "
-                    f"γ₀_self={gamma0_self:.5f}, "
+                    f"γ₀_O2={gamma0_O2:.5f}, "
                     f"γ₀_air={gamma0_air:.5f}, "
-                    f"δ₀_self={delta0_self:.6f}, "
+                    f"δ₀_O2={delta0_O2:.6f}, "
                     f"δ₀_air={delta0_air:.6f}, "
                     f"SD_γ={sd_gamma:.4f}, "
                     f"SD_δ={sd_delta:.4f}"
@@ -301,7 +301,7 @@ class MATSFitter:
     molefraction : dict
         摩尔分数 {molec_id: fraction}
     diluent : str
-        稀释气体
+        稀释气体 (纯 O₂ 用 "O2"，混合气用 "air")
     lineprofile : str
         线形 ("VP", "SDVP", "NGP", "SDNGP", "HTP")
     baseline_order : int
@@ -319,7 +319,7 @@ class MATSFitter:
         molecule: int = 7,
         isotopologue: int = 1,
         molefraction: dict | None = None,
-        diluent: str = "self",
+        diluent: str = "O2",
         Diluent: dict | None = None,
         lineprofile: str = "SDVP",
         baseline_order: int = 1,
@@ -332,12 +332,14 @@ class MATSFitter:
         self.molefraction = molefraction or {molecule: 1.0}
         self.diluent = diluent
         # 显式设置 Diluent (与参考脚本一致)
-        # 纯 O₂: Diluent={'self': {'composition':1, 'm': 31.9988}}
+        # 纯 O₂: Diluent={'O2': {'composition':1, 'm': 31.9988}}
         # O₂+N₂: Diluent={'air': {'composition':1, 'm': 28.014}}
         if Diluent is not None:
             self.Diluent = Diluent
         else:
-            if diluent == "self":
+            if diluent == "O2":
+                self.Diluent = {"O2": {"composition": 1, "m": 31.9988}}
+            elif diluent == "self":
                 self.Diluent = {"self": {"composition": 1, "m": 31.9988}}
             else:
                 self.Diluent = {diluent: {"composition": 1, "m": 28.964}}
@@ -915,8 +917,8 @@ def batch_mats_fitting(
         传递给 MATSFitter 的参数:
         - molecule: 分子 ID (默认 7 = O₂)
         - molefraction: 摩尔分数 (默认 {7: 1.0})
-        - diluent: 稀释气名 (默认 "self")
-        - Diluent: 显式稀释气字典 (默认 {"self": {"composition":1, "m":31.9988}})
+        - diluent: 稀释气名 (默认 "O2")
+        - Diluent: 显式稀释气字典 (默认 {"O2": {"composition":1, "m":31.9988}})
         - lineprofile: 线形 (默认 "SDVP")
         - fit_intensity: 可浮动线强阈值 (默认 1e-30)
     """
