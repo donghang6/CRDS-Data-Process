@@ -227,6 +227,7 @@ output/figures/*
 !output/figures/.gitkeep
 output/results/*
 !output/results/.gitkeep
+output/logs/
 
 # Jupyter Notebook 检查点
 .ipynb_checkpoints/

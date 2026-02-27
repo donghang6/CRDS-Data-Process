@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from crds_process.io.readers import ScanData, load_scan_directory, scans_to_dataframe
+from crds_process.log import logger
 from crds_process.ringdown.processing import RingdownResult, process_all_scans
 
 
@@ -93,7 +94,7 @@ class RawDataProcessor:
 
     def _log(self, msg: str):
         if self.verbose:
-            print(msg)
+            logger.info(msg)
 
     # ==============================================================
     # Step 1: 读取原始数据
@@ -324,27 +325,27 @@ def batch_preprocess_ringdown(
 
     tasks = discover_tasks(raw)
     if not tasks:
-        print(f"[ERROR] 未在 {raw} 下找到 {{跃迁波数}}/{{压力}}/*.txt 数据")
+        logger.error(f"未在 {raw} 下找到 {{跃迁波数}}/{{压力}}/*.txt 数据")
         return []
 
-    print(f"{'#' * 60}")
-    print(f"  CRDS 原始数据批量预处理")
-    print(f"  数据根目录: {raw}")
-    print(f"  结果根目录: {out}")
-    print(f"  发现 {len(tasks)} 个数据集:")
+    logger.info(f"{'#' * 60}")
+    logger.info(f"  CRDS 原始数据批量预处理")
+    logger.info(f"  数据根目录: {raw}")
+    logger.info(f"  结果根目录: {out}")
+    logger.info(f"  发现 {len(tasks)} 个数据集:")
     for transition, pressure, _ in tasks:
-        print(f"    {transition}/{pressure}/")
-    print(f"{'#' * 60}\n")
+        logger.info(f"    {transition}/{pressure}/")
+    logger.info(f"{'#' * 60}\n")
 
     all_results: list[PreprocessResult] = []
 
     for i, (transition, pressure, data_dir) in enumerate(tasks, 1):
         output_dir = out / transition / pressure
-        print(f"\n{'=' * 60}")
-        print(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
-        print(f"  数据: {data_dir}")
-        print(f"  输出: {output_dir}")
-        print(f"{'=' * 60}")
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
+        logger.info(f"  数据: {data_dir}")
+        logger.info(f"  输出: {output_dir}")
+        logger.info(f"{'=' * 60}")
 
         proc = RawDataProcessor(
             data_dir=data_dir,
@@ -356,18 +357,18 @@ def batch_preprocess_ringdown(
         result = proc.run()
         all_results.append(result)
 
-        print(f"\nRingdown preview (first 5):")
-        print(result.ringdown_df.head().to_string(index=False))
+        logger.info(f"\nRingdown preview (first 5):")
+        logger.info(result.ringdown_df.head().to_string(index=False))
 
     # 汇总
-    print(f"\n\n{'#' * 60}")
-    print("  全部处理完成! 输出文件:")
-    print(f"{'#' * 60}")
+    logger.info(f"\n\n{'#' * 60}")
+    logger.info("  全部处理完成! 输出文件:")
+    logger.info(f"{'#' * 60}")
     for transition, pressure, _ in tasks:
         d = out / transition / pressure
-        print(f"\n  {transition}/{pressure}/")
+        logger.info(f"\n  {transition}/{pressure}/")
         for f in sorted(d.glob("*")):
-            print(f"    {f.name:<40s}  {f.stat().st_size:>8,} bytes")
+            logger.info(f"    {f.name:<40s}  {f.stat().st_size:>8,} bytes")
 
     return all_results
 

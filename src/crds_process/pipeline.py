@@ -41,6 +41,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from crds_process.log import logger, setup_logging
+
 
 # ==================================================================
 # 默认路径 (基于项目根目录)
@@ -155,9 +157,9 @@ class CRDSPipeline:
         """Step 1: 原始衰荡数据 → ringdown_results.csv"""
         from crds_process.preprocessing import batch_preprocess_ringdown
 
-        print("\n" + "=" * 60)
-        print("  Step 1 / 4 — 衰荡时间处理")
-        print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info("  Step 1 / 4 — 衰荡时间处理")
+        logger.info("=" * 60)
 
         batch_preprocess_ringdown(
             raw_root=self.raw_root,
@@ -171,9 +173,9 @@ class CRDSPipeline:
         """Step 2: ringdown_results → tau_etalon_corrected.csv"""
         from crds_process.baseline.etalon import batch_etalon_removal
 
-        print("\n" + "=" * 60)
-        print("  Step 2 / 4 — 去除标准具效应")
-        print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info("  Step 2 / 4 — 去除标准具效应")
+        logger.info("=" * 60)
 
         batch_etalon_removal(
             ringdown_root=self.ringdown_root,
@@ -187,9 +189,9 @@ class CRDSPipeline:
         """Step 3: etalon_corrected → MATS SDVP 拟合 → 线强 & 自展宽"""
         from crds_process.spectral.mats_wrapper import MATSBatchProcessor
 
-        print("\n" + "=" * 60)
-        print(f"  Step 3 / 4 — MATS 光谱拟合 (线形: {self.lineprofile})")
-        print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info(f"  Step 3 / 4 — MATS 光谱拟合 (线形: {self.lineprofile})")
+        logger.info("=" * 60)
 
         fitter = self._create_fitter()
         processor = MATSBatchProcessor(
@@ -210,13 +212,13 @@ class CRDSPipeline:
         用剩余光谱做多光谱联合拟合。
         """
         if not self.mats_root.exists():
-            print(f"  [ERROR] Step 3 结果不存在: {self.mats_root}")
-            print(f"         请先运行 Step 3")
+            logger.error(f"   Step 3 结果不存在: {self.mats_root}")
+            logger.error(f"         请先运行 Step 3")
             return
 
-        print("\n" + "=" * 60)
-        print(f"  Step 4 / 4 — 筛选 + 多光谱联合拟合 (σ={self.sw_sigma})")
-        print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info(f"  Step 4 / 4 — 筛选 + 多光谱联合拟合 (σ={self.sw_sigma})")
+        logger.info("=" * 60)
 
         for t_dir in sorted(self.mats_root.iterdir()):
             if not t_dir.is_dir() or t_dir.name.startswith("."):
@@ -230,24 +232,24 @@ class CRDSPipeline:
         # ---- 1. 收集 Step 3 各压力点的拟合线强 ----
         records = self._collect_sw_records(t_dir)
         if not records:
-            print(f"\n  [{transition}] 未找到 Step 3 拟合结果，跳过")
+            logger.info(f"\n  [{transition}] 未找到 Step 3 拟合结果，跳过")
             return
 
         # ---- 2. MAD 筛选 ----
         sw_df = self._screen_sw(records, transition)
         kept = sw_df[sw_df["keep"]]
         if len(kept) < 2:
-            print(f"  [WARN] 保留点数 < 2，无法联合拟合，跳过")
+            logger.warning(f"   保留点数 < 2，无法联合拟合，跳过")
             return
 
         # ---- 3. 收集保留的 etalon CSV ----
         etalon_csvs, labels = self._collect_etalon_csvs(transition, kept)
         if len(etalon_csvs) < 2:
-            print(f"  [WARN] 有效 etalon CSV < 2，跳过联合拟合")
+            logger.warning(f"   有效 etalon CSV < 2，跳过联合拟合")
             return
 
         # ---- 4. 多光谱联合拟合 ----
-        print(f"\n  开始多光谱联合拟合 ({len(etalon_csvs)} 条光谱)...")
+        logger.info(f"\n  开始多光谱联合拟合 ({len(etalon_csvs)} 条光谱)...")
         fitter = self._create_fitter()
         multi_out = self.mats_multi_root / transition
         multi_out.mkdir(parents=True, exist_ok=True)
@@ -271,28 +273,29 @@ class CRDSPipeline:
             self._save_multi_fit_summary(result, multi_out, transition, labels)
 
         except Exception as e:
-            print(f"  [ERROR] 多光谱联合拟合失败: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"  多光谱联合拟合失败: {e}")
+            logger.exception("  详细错误信息:")
 
     # ==============================================================
     # 完整四步流水线
     # ==============================================================
     def run(self) -> None:
         """执行完整的 CRDS 四步处理流水线"""
+        log_path = setup_logging()
         t0 = time.time()
 
-        print("=" * 60)
-        print("  CRDS 完整处理流水线")
-        print("  Step 1: 衰荡时间处理")
-        print("  Step 2: 去除标准具效应")
-        print("  Step 3: MATS 单光谱拟合 (各压力独立)")
-        print("  Step 4: 筛选 + 多光谱联合拟合 (最终结果)")
-        print("=" * 60)
-        print(f"  线形:     {self.lineprofile}")
-        print(f"  线强筛选: {self.sw_sigma}σ (Step 4)")
-        print(f"  原始数据: {self.raw_root}")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("  CRDS 完整处理流水线")
+        logger.info("  Step 1: 衰荡时间处理")
+        logger.info("  Step 2: 去除标准具效应")
+        logger.info("  Step 3: MATS 单光谱拟合 (各压力独立)")
+        logger.info("  Step 4: 筛选 + 多光谱联合拟合 (最终结果)")
+        logger.info("=" * 60)
+        logger.info(f"  线形:     {self.lineprofile}")
+        logger.info(f"  线强筛选: {self.sw_sigma}σ (Step 4)")
+        logger.info(f"  原始数据: {self.raw_root}")
+        logger.info(f"  日志文件: {log_path}")
+        logger.info("=" * 60)
 
         self.step1_ringdown()
         self.step2_etalon()
@@ -300,9 +303,9 @@ class CRDSPipeline:
         self.step4_multi_fit()
 
         elapsed = time.time() - t0
-        print(f"\n{'#' * 60}")
-        print(f"  全部完成! 耗时 {elapsed:.1f} s")
-        print(f"{'#' * 60}")
+        logger.info(f"\n{'#' * 60}")
+        logger.info(f"  全部完成! 耗时 {elapsed:.1f} s")
+        logger.info(f"{'#' * 60}")
 
     # ==============================================================
     # Step 4 辅助方法
@@ -346,22 +349,22 @@ class CRDSPipeline:
         sw_df["keep"] = sw_df["deviation"] <= self.sw_sigma
 
         # 打印筛选结果
-        print(f"\n  [{transition}] 线强筛选 (中位数={median_sw:.4e}, "
+        logger.info(f"\n  [{transition}] 线强筛选 (中位数={median_sw:.4e}, "
               f"MAD={mad_sw:.4e}, 阈值={self.sw_sigma}σ)")
-        print(f"  {'压力':<10s} {'S (cm/molec)':<14s} {'偏差/MAD':<10s} {'状态':<8s}")
-        print(f"  {'─' * 50}")
+        logger.info(f"  {'压力':<10s} {'S (cm/molec)':<14s} {'偏差/MAD':<10s} {'状态':<8s}")
+        logger.info(f"  {'─' * 50}")
         for _, r in sw_df.iterrows():
             status = "✓ 保留" if r["keep"] else "✗ 剔除"
-            print(f"  {r['pressure']:<10s} {r['sw']:.4e}   "
+            logger.info(f"  {r['pressure']:<10s} {r['sw']:.4e}   "
                   f"{r['deviation']:>6.2f}σ     {status}")
 
         kept = sw_df[sw_df["keep"]]
         removed = sw_df[~sw_df["keep"]]
         if len(removed) > 0:
-            print(f"\n  剔除 {len(removed)} 个离群点: "
+            logger.info(f"\n  剔除 {len(removed)} 个离群点: "
                   f"{', '.join(removed['pressure'].tolist())}")
         else:
-            print(f"\n  无离群点，全部 {len(kept)} 个压力点保留")
+            logger.info(f"\n  无离群点，全部 {len(kept)} 个压力点保留")
 
         return sw_df
 
@@ -377,7 +380,7 @@ class CRDSPipeline:
                 etalon_csvs.append(csv_path)
                 labels.append(r["pressure"])
             else:
-                print(f"  [WARN] 找不到: {csv_path}")
+                logger.warning(f"   找不到: {csv_path}")
         return etalon_csvs, labels
 
     # ==============================================================
@@ -426,22 +429,22 @@ class CRDSPipeline:
         final_dir.mkdir(parents=True, exist_ok=True)
         final_df.to_csv(final_dir / "multi_fit_result.csv", index=False)
 
-        print(f"\n  {'#' * 60}")
-        print(f"  多光谱联合拟合最终结果 ({transition})")
-        print(f"  光谱数: {len(labels)}, 压力: {', '.join(labels)}")
-        print(f"  {'#' * 60}")
+        logger.info(f"\n  {'#' * 60}")
+        logger.info(f"  多光谱联合拟合最终结果 ({transition})")
+        logger.info(f"  光谱数: {len(labels)}, 压力: {', '.join(labels)}")
+        logger.info(f"  {'#' * 60}")
         for _, r in final_df.iterrows():
-            print(f"  ν = {r['nu_HITRAN']:.6f} cm⁻¹")
-            print(f"    S          = {r['sw']:.6e} ± {r['sw_err']:.2e} cm⁻¹/(molec·cm⁻²)")
-            print(f"    γ₀_O2     = {r['gamma0_O2']:.6f} ± {r['gamma0_O2_err']:.6f} cm⁻¹/atm")
-            print(f"    n_γ₀_O2   = {r['n_gamma0_O2']:.4f} ± {r['n_gamma0_O2_err']:.4f}")
-            print(f"    SD_γ_O2   = {r['SD_gamma_O2']:.6f} ± {r['SD_gamma_O2_err']:.6f}")
-            print(f"    δ₀_O2     = {r['delta0_O2']:.6f} ± {r['delta0_O2_err']:.6f} cm⁻¹/atm")
-            print(f"    SD_δ_O2   = {r['SD_delta_O2']:.6f} ± {r['SD_delta_O2_err']:.6f}")
-            print(f"    Res. σ     = {r['residual_std']:.4e}")
-            print(f"    QF         = {r['QF']:.1f}")
-        print(f"\n  结果已保存: {out_path}")
-        print(f"  汇总目录:   {final_dir / 'multi_fit_result.csv'}")
+            logger.info(f"  ν = {r['nu_HITRAN']:.6f} cm⁻¹")
+            logger.info(f"    S          = {r['sw']:.6e} ± {r['sw_err']:.2e} cm⁻¹/(molec·cm⁻²)")
+            logger.info(f"    γ₀_O2     = {r['gamma0_O2']:.6f} ± {r['gamma0_O2_err']:.6f} cm⁻¹/atm")
+            logger.info(f"    n_γ₀_O2   = {r['n_gamma0_O2']:.4f} ± {r['n_gamma0_O2_err']:.4f}")
+            logger.info(f"    SD_γ_O2   = {r['SD_gamma_O2']:.6f} ± {r['SD_gamma_O2_err']:.6f}")
+            logger.info(f"    δ₀_O2     = {r['delta0_O2']:.6f} ± {r['delta0_O2_err']:.6f} cm⁻¹/atm")
+            logger.info(f"    SD_δ_O2   = {r['SD_delta_O2']:.6f} ± {r['SD_delta_O2_err']:.6f}")
+            logger.info(f"    Res. σ     = {r['residual_std']:.4e}")
+            logger.info(f"    QF         = {r['QF']:.1f}")
+        logger.info(f"\n  结果已保存: {out_path}")
+        logger.info(f"  汇总目录:   {final_dir / 'multi_fit_result.csv'}")
 
     def _collect_final_summary(self) -> None:
         """从 MATS 单光谱拟合结果中提取关键参数并保存汇总表"""
@@ -497,7 +500,7 @@ class CRDSPipeline:
                     })
 
         if not all_rows:
-            print("\n  [WARN] 未找到任何有效拟合结果，跳过汇总")
+            logger.warning("\n  未找到任何有效拟合结果，跳过汇总")
             return
 
         df = pd.DataFrame(all_rows)
@@ -518,33 +521,33 @@ class CRDSPipeline:
 
     def _print_summary_table(self, df: pd.DataFrame, summary_path: Path) -> None:
         """打印单光谱拟合汇总表"""
-        print(f"\n{'#' * 60}")
-        print(f"  单光谱拟合结果汇总 (SDVP 线形)")
-        print(f"{'#' * 60}")
+        logger.info(f"\n{'#' * 60}")
+        logger.info(f"  单光谱拟合结果汇总 (SDVP 线形)")
+        logger.info(f"{'#' * 60}")
 
         x_shifts = df[["transition", "pressure_label", "x_shift"]].drop_duplicates()
         for _, xs in x_shifts.iterrows():
-            print(f"\n  [{xs['transition']}/{xs['pressure_label']}] "
+            logger.info(f"\n  [{xs['transition']}/{xs['pressure_label']}] "
                   f"x_shift = {xs['x_shift']:.6f} cm⁻¹ (波数计系统偏差)")
 
         fitted = df[df["sw_vary"] == True]
         if fitted.empty:
             fitted = df
 
-        print(f"\n  {'─' * 100}")
-        print(f"  {'跃迁':<12s} {'压力':<10s} {'ν (cm⁻¹)':<16s} "
+        logger.info(f"\n  {'─' * 100}")
+        logger.info(f"  {'跃迁':<12s} {'压力':<10s} {'ν (cm⁻¹)':<16s} "
               f"{'S (cm/molec)':<14s} "
               f"{'γ₀_O2 (cm⁻¹/atm)':<20s} "
               f"{'δ₀_O2':<12s} "
               f"{'SD_γ':<10s} "
               f"{'Res. σ':<12s}")
-        print(f"  {'─' * 100}")
+        logger.info(f"  {'─' * 100}")
 
         for _, row in fitted.iterrows():
             gamma_str = f"{row['gamma0_O2']:.6f}"
             if row.get('gamma0_O2_err', 0) > 0:
                 gamma_str += f" ± {row['gamma0_O2_err']:.6f}"
-            print(
+            logger.info(
                 f"  {row['transition']:<12s} {row['pressure_label']:<10s} "
                 f"{row['nu']:>14.6f}  "
                 f"{row['sw']:>12.4e}  "
@@ -554,9 +557,9 @@ class CRDSPipeline:
                 f"{row['residual_std']:>10.4e}"
             )
 
-        print(f"  {'─' * 100}")
-        print(f"\n  汇总表: {summary_path}")
-        print(f"  详细目录: {self.final_root}")
+        logger.info(f"  {'─' * 100}")
+        logger.info(f"\n  汇总表: {summary_path}")
+        logger.info(f"  详细目录: {self.final_root}")
 
     def _generate_fit_statistics(self) -> None:
         """从 MATS 拟合结果中提取被拟合目标线的完整参数，生成统计 CSV
@@ -618,7 +621,7 @@ class CRDSPipeline:
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / "fit_summary_statistics.csv"
             stat_df.to_csv(out_path, index=False)
-            print(f"\n  统计表: {out_path}")
+            logger.info(f"\n  统计表: {out_path}")
 
     # ==============================================================
     # 通用 I/O 辅助方法

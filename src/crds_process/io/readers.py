@@ -23,6 +23,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from crds_process.log import logger
+
 
 # ============================================================
 # 数据结构
@@ -145,7 +147,7 @@ def load_scan_directory(directory: str | Path) -> list[ScanData]:
         try:
             scans.append(read_ringdown_file(f))
         except (ValueError, Exception) as e:
-            print(f"[WARNING] 跳过文件 {f.name}: {e}")
+            logger.warning(f"跳过文件 {f.name}: {e}")
 
     # 按波数排序
     scans.sort(key=lambda s: s.meta.wavenumber)

@@ -30,6 +30,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from crds_process.log import logger
+
 
 # ==================================================================
 # 项目级常量
@@ -188,7 +190,7 @@ class HitranLinelistBuilder:
         saved = os.getcwd()
         os.chdir(self.hitran_dir)
         try:
-            print(f"  [HITRAN] 下载 {self.mol_prefix} "
+            logger.info(f"  [HITRAN] 下载 {self.mol_prefix} "
                   f"({wn_min:.0f}-{wn_max:.0f} cm⁻¹)...")
             hapi.fetch(TableName=tname, M=self.molecule,
                        I=self.isotopologue, numin=wn_min, numax=wn_max)
@@ -371,7 +373,7 @@ class MATSFitter:
         df = pd.read_csv(etalon_csv)
         wn = df["wavenumber"].values
         wn_min, wn_max = float(wn.min()), float(wn.max())
-        print(f"  波数范围: {wn_min:.5f} ~ {wn_max:.5f} cm⁻¹, 点数: {len(wn)}")
+        logger.info(f"  波数范围: {wn_min:.5f} ~ {wn_max:.5f} cm⁻¹, 点数: {len(wn)}")
 
         # MATS 使用 cwd 相对路径读写文件，切到 output_dir
         saved_dir = os.getcwd()
@@ -386,13 +388,13 @@ class MATSFitter:
             param_linelist = self._linelist_builder.build(
                 wn_min, wn_max, save_path=linelist_csv,
             )
-            print(f"  线表: {len(param_linelist)} 条谱线")
+            logger.info(f"  线表: {len(param_linelist)} 条谱线")
             for _, row in param_linelist.iterrows():
                 if row["sw"] > self.threshold_intensity:
-                    print(f"    ν={row['nu']:.6f}, S={row['sw']:.4e}, "
+                    logger.info(f"    ν={row['nu']:.6f}, S={row['sw']:.4e}, "
                           f"γ₀_air={row['gamma0_air']:.5f}")
             if len(param_linelist) == 0:
-                print("  [WARN] 未找到谱线，跳过拟合")
+                logger.warning("  未找到谱线，跳过拟合")
                 return MATSFitResult()
 
             # Step 4~8: MATS 拟合
@@ -446,10 +448,10 @@ class MATSFitter:
             wn_global_min = min(wn_global_min, float(df["wavenumber"].min()))
             wn_global_max = max(wn_global_max, float(df["wavenumber"].max()))
 
-        print(f"  多光谱联合拟合: {len(etalon_csvs)} 条光谱")
-        print(f"  全局波数范围: {wn_global_min:.5f} ~ {wn_global_max:.5f} cm⁻¹")
+        logger.info(f"  多光谱联合拟合: {len(etalon_csvs)} 条光谱")
+        logger.info(f"  全局波数范围: {wn_global_min:.5f} ~ {wn_global_max:.5f} cm⁻¹")
         for i, (lbl, df) in enumerate(zip(labels, all_dfs)):
-            print(f"    [{i+1}] {lbl}: {len(df)} 点, "
+            logger.info(f"    [{i+1}] {lbl}: {len(df)} 点, "
                   f"P={df['pressure'].mean():.1f} Torr")
 
         saved_dir = os.getcwd()
@@ -460,12 +462,12 @@ class MATSFitter:
             param_linelist = self._linelist_builder.build(
                 wn_global_min, wn_global_max, save_path=linelist_csv,
             )
-            print(f"  线表: {len(param_linelist)} 条谱线")
+            logger.info(f"  线表: {len(param_linelist)} 条谱线")
             for _, row in param_linelist.iterrows():
                 if row["sw"] > self.threshold_intensity:
-                    print(f"    ν={row['nu']:.6f}, S={row['sw']:.4e}")
+                    logger.info(f"    ν={row['nu']:.6f}, S={row['sw']:.4e}")
             if len(param_linelist) == 0:
-                print("  [WARN] 未找到谱线，跳过拟合")
+                logger.warning("  未找到谱线，跳过拟合")
                 return MATSFitResult()
 
             # 为每个光谱创建 Spectrum 对象
@@ -496,7 +498,7 @@ class MATSFitter:
                     baseline_order=self.baseline_order,
                 )
                 spectra.append(spec)
-                print(f"    Spectrum {lbl}: "
+                logger.info(f"    Spectrum {lbl}: "
                       f"P={spec.pressure:.4f} atm, T={spec.temperature:.2f} K")
 
             # 联合 Dataset
@@ -550,7 +552,7 @@ class MATSFitter:
             base_file = fitparam.base_linelist_savename
 
             # 拟合
-            print(f"  开始多光谱联合拟合 ({self.lineprofile} 线形, "
+            logger.info(f"  开始多光谱联合拟合 ({self.lineprofile} 线形, "
                   f"{len(spectra)} 光谱)...")
             fit = Fit_DataSet(
                 ds, base_file, param_file,
@@ -588,8 +590,8 @@ class MATSFitter:
                 residual_std=res_std,
                 qf=float(ds.average_QF()) if hasattr(ds, "average_QF") else 0.0,
             )
-            print(f"  多光谱联合拟合完成!")
-            print(f"  {mats_result.summary()}")
+            logger.info(f"  多光谱联合拟合完成!")
+            logger.info(f"  {mats_result.summary()}")
             return mats_result
         finally:
             os.chdir(saved_dir)
@@ -623,7 +625,7 @@ class MATSFitter:
             nominal_temperature=296,
             baseline_order=self.baseline_order,
         )
-        print(f"  Spectrum: P={spec.pressure:.4f} atm, T={spec.temperature:.2f} K")
+        logger.info(f"  Spectrum: P={spec.pressure:.4f} atm, T={spec.temperature:.2f} K")
 
         # ---- Step 5: Dataset ----
         ds = Dataset([spec], dataset_name, param_linelist)
@@ -676,7 +678,7 @@ class MATSFitter:
         base_file = fitparam.base_linelist_savename
 
         # ---- Step 7: 拟合 ----
-        print(f"  开始拟合 ({self.lineprofile} 线形)...")
+        logger.info(f"  开始拟合 ({self.lineprofile} 线形)...")
         fit = Fit_DataSet(
             ds, base_file, param_file,
             minimum_parameter_fit_intensity=self.fit_intensity,
@@ -715,8 +717,8 @@ class MATSFitter:
             residual_std=res_std,
             qf=float(ds.average_QF()) if hasattr(ds, "average_QF") else 0.0,
         )
-        print(f"  拟合完成!")
-        print(f"  {mats_result.summary()}")
+        logger.info(f"  拟合完成!")
+        logger.info(f"  {mats_result.summary()}")
         return mats_result
 
     def plot_result(
@@ -753,7 +755,7 @@ class MATSFitter:
         name_col = _find_col(["Spectrum", "Name"])
 
         if wn_col is None:
-            print(f"  [WARN] 找不到波数列，可用: {list(summary.columns)}")
+            logger.warning(f"  找不到波数列，可用: {list(summary.columns)}")
             return
 
         # 判断是否为多光谱
@@ -851,7 +853,7 @@ class MATSFitter:
         fig.tight_layout()
         save_path = output_dir / "mats_fit.png"
         fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
-        print(f"  图表已保存: {save_path}")
+        logger.info(f"  图表已保存: {save_path}")
         plt.close(fig)
 
 
@@ -901,46 +903,45 @@ class MATSBatchProcessor:
                 )
             return result
         except Exception as e:
-            print(f"    [ERROR] 拟合失败: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"    拟合失败: {e}")
+            logger.exception("    详细错误信息:")
             return None
 
     def run(self):
         tasks = self.discover()
         if not tasks:
-            print(f"[ERROR] 未在 {self.etalon_root} 下找到 "
+            logger.error(f"未在 {self.etalon_root} 下找到 "
                   f"{{跃迁波数}}/{{压力}}/{_ETALON_CSV}")
             return
 
-        print(f"{'#' * 60}")
-        print(f"  CRDS MATS 光谱拟合")
-        print(f"  输入: {self.etalon_root}")
-        print(f"  输出: {self.mats_root}")
-        print(f"  发现 {len(tasks)} 个数据集:")
+        logger.info(f"{'#' * 60}")
+        logger.info(f"  CRDS MATS 光谱拟合")
+        logger.info(f"  输入: {self.etalon_root}")
+        logger.info(f"  输出: {self.mats_root}")
+        logger.info(f"  发现 {len(tasks)} 个数据集:")
         for t, p, _ in tasks:
-            print(f"    {t}/{p}/")
-        print(f"{'#' * 60}")
+            logger.info(f"    {t}/{p}/")
+        logger.info(f"{'#' * 60}")
 
         ok = 0
         for i, (transition, pressure, csv_path) in enumerate(tasks, 1):
             out_dir = self.mats_root / transition / pressure
-            print(f"\n{'=' * 60}")
-            print(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
-            print(f"{'=' * 60}")
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
+            logger.info(f"{'=' * 60}")
             if self.process_one(csv_path, out_dir, f"{transition}/{pressure}"):
                 ok += 1
 
-        print(f"\n\n{'#' * 60}")
-        print(f"  全部完成! {ok}/{len(tasks)} 成功")
-        print(f"{'#' * 60}")
+        logger.info(f"\n\n{'#' * 60}")
+        logger.info(f"  全部完成! {ok}/{len(tasks)} 成功")
+        logger.info(f"{'#' * 60}")
         for t, p, _ in tasks:
             d = self.mats_root / t / p
             if d.exists():
-                print(f"\n  {t}/{p}/")
+                logger.info(f"\n  {t}/{p}/")
                 for f in sorted(d.glob("*")):
                     if not f.name.startswith("."):
-                        print(f"    {f.name:<50s} {f.stat().st_size:>10,} bytes")
+                        logger.info(f"    {f.name:<50s} {f.stat().st_size:>10,} bytes")
 
 
 # ==================================================================

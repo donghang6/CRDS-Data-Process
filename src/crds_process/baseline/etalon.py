@@ -33,6 +33,8 @@ import pandas as pd
 from lmfit import Model, Parameters
 from lmfit.model import ModelResult
 
+from crds_process.log import logger
+
 
 # ==================================================================
 # 项目级常量
@@ -192,7 +194,7 @@ class HitranAbsorptionDetector:
         saved_dir = os.getcwd()
         os.chdir(self.hitran_dir)
         try:
-            print(f"  [HITRAN] 下载 {self.mol_prefix} "
+            logger.info(f"  [HITRAN] 下载 {self.mol_prefix} "
                   f"({wn_min:.0f}-{wn_max:.0f} cm⁻¹)...")
             hapi.fetch(TableName=tname, M=self.molecule,
                        I=self.isotopologue, numin=wn_min, numax=wn_max)
@@ -410,7 +412,7 @@ class EtalonFitResult:
         fig.tight_layout()
         if save_path:
             fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
-            print(f"  图表已保存: {save_path}")
+            logger.info(f"  图表已保存: {save_path}")
         plt.close(fig)
         return fig
 
@@ -693,10 +695,10 @@ class EtalonBatchProcessor:
         temp = float(df["temperature"].mean())
         pres = float(df["pressure"].mean())
 
-        print(f"\n  数据: {csv_path}")
-        print(f"    点数: {len(wn)}, 波数: {wn.min():.5f} ~ "
+        logger.info(f"\n  数据: {csv_path}")
+        logger.info(f"    点数: {len(wn)}, 波数: {wn.min():.5f} ~ "
               f"{wn.max():.5f} cm⁻¹")
-        print(f"    温度: {temp:.1f} °C, 压力: {pres:.1f} Torr")
+        logger.info(f"    温度: {temp:.1f} °C, 压力: {pres:.1f} Torr")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -704,11 +706,11 @@ class EtalonBatchProcessor:
                 wn, tau, temperature=temp, pressure_torr=pres
             )
         except Exception as e:
-            print(f"    [ERROR] 拟合失败: {e}")
+            logger.error(f"    拟合失败: {e}")
             return False
 
-        print(f"    {result.summary()}")
-        print(f"    拟合成功: {result.model_result.success}, "
+        logger.info(f"    {result.summary()}")
+        logger.info(f"    拟合成功: {result.model_result.success}, "
               f"迭代: {result.model_result.nfev}")
 
         title = f"Etalon Removal — {label}" if label else "Etalon Removal"
@@ -720,38 +722,38 @@ class EtalonBatchProcessor:
         """执行批量处理"""
         tasks = self.discover()
         if not tasks:
-            print(f"[ERROR] 未在 {self.ringdown_root} 下找到 "
+            logger.error(f"未在 {self.ringdown_root} 下找到 "
                   f"{{跃迁波数}}/{{压力}}/{_CSV_NAME}")
             return
 
-        print(f"{'#' * 60}")
-        print(f"  CRDS 标准具效应批量去除 (HITRAN 自动检测)")
-        print(f"  输入: {self.ringdown_root}")
-        print(f"  输出: {self.etalon_root}")
-        print(f"  发现 {len(tasks)} 个数据集:")
+        logger.info(f"{'#' * 60}")
+        logger.info(f"  CRDS 标准具效应批量去除 (HITRAN 自动检测)")
+        logger.info(f"  输入: {self.ringdown_root}")
+        logger.info(f"  输出: {self.etalon_root}")
+        logger.info(f"  发现 {len(tasks)} 个数据集:")
         for t, p, _ in tasks:
-            print(f"    {t}/{p}/")
-        print(f"{'#' * 60}")
+            logger.info(f"    {t}/{p}/")
+        logger.info(f"{'#' * 60}")
 
         ok = 0
         for i, (transition, pressure, csv_path) in enumerate(tasks, 1):
             out_dir = self.etalon_root / transition / pressure
-            print(f"\n{'=' * 60}")
-            print(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
-            print(f"{'=' * 60}")
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
+            logger.info(f"{'=' * 60}")
             if self.process_one(csv_path, out_dir,
                                 label=f"{transition} / {pressure}"):
                 ok += 1
 
-        print(f"\n\n{'#' * 60}")
-        print(f"  全部完成! {ok}/{len(tasks)} 成功")
-        print(f"{'#' * 60}")
+        logger.info(f"\n\n{'#' * 60}")
+        logger.info(f"  全部完成! {ok}/{len(tasks)} 成功")
+        logger.info(f"{'#' * 60}")
         for t, p, _ in tasks:
             d = self.etalon_root / t / p
             if d.exists():
-                print(f"\n  {t}/{p}/")
+                logger.info(f"\n  {t}/{p}/")
                 for f in sorted(d.glob("*")):
-                    print(f"    {f.name:<45s} "
+                    logger.info(f"    {f.name:<45s} "
                           f"{f.stat().st_size:>10,} bytes")
 
 

@@ -5,6 +5,8 @@
 
 __version__ = "0.1.0"
 
+from crds_process.log import logger, setup_logging
+
 
 def __getattr__(name: str):
     """延迟导入 pipeline 类和函数，避免循环导入"""
