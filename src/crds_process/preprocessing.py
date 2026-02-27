@@ -260,7 +260,7 @@ class RawDataProcessor:
 # 项目级常量
 # ==================================================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-RAW_ROOT = PROJECT_ROOT / "data" / "raw"
+RAW_ROOT = PROJECT_ROOT / "data" / "raw" / "O2"
 RESULT_ROOT = PROJECT_ROOT / "output" / "results" / "ringdown"
 
 

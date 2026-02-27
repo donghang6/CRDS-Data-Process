@@ -52,7 +52,7 @@ from crds_process.log import logger, setup_logging
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 _DEFAULT_PATHS = {
-    "raw": _PROJECT_ROOT / "data" / "raw",
+    "raw": _PROJECT_ROOT / "data" / "raw" / "O2",
     "ringdown": _PROJECT_ROOT / "output" / "results" / "ringdown",
     "etalon": _PROJECT_ROOT / "output" / "results" / "etalon",
     "mats": _PROJECT_ROOT / "output" / "results" / "mats",
