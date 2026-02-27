@@ -4,7 +4,8 @@
     python main.py
 """
 
-from crds_process.pipeline import run_pipeline
+from crds_process.pipeline import CRDSPipeline
 
 if __name__ == "__main__":
-    run_pipeline()
+    pipeline = CRDSPipeline()
+    pipeline.run()
