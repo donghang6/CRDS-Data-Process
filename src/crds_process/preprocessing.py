@@ -260,37 +260,56 @@ class RawDataProcessor:
 # 项目级常量
 # ==================================================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-RAW_ROOT = PROJECT_ROOT / "data" / "raw" / "O2"
+RAW_ROOT = PROJECT_ROOT / "data" / "raw"
 RESULT_ROOT = PROJECT_ROOT / "output" / "results" / "ringdown"
 
 
 # ==================================================================
 # 自动发现 & 批量处理
 # ==================================================================
-def discover_tasks(raw_root: Path | None = None) -> list[tuple[str, str, Path]]:
-    """自动发现 raw_root/{跃迁波数}/{压力}/ 下的数据集
+def discover_tasks(
+    raw_root: Path | None = None,
+    gas_types: list[str] | None = None,
+) -> list[tuple[str, str, str, Path]]:
+    """自动发现 raw_root/{气体类型}/{跃迁波数}/{压力}/ 下的数据集
 
     Parameters
     ----------
     raw_root : Path, optional
-        原始数据根目录，默认为 RAW_ROOT
+        原始数据根目录，默认为 data/raw
+    gas_types : list[str], optional
+        要处理的气体类型 (如 ["O2", "O2_N2"])，
+        默认自动发现所有子目录
 
     Returns
     -------
-    list[tuple[str, str, Path]]
-        [(跃迁波数, 压力, 数据目录), ...]
+    list[tuple[str, str, str, Path]]
+        [(气体类型, 跃迁波数, 压力目录名, 数据目录), ...]
     """
     root = raw_root or RAW_ROOT
-    tasks: list[tuple[str, str, Path]] = []
-    for transition_dir in sorted(root.iterdir()):
-        if not transition_dir.is_dir() or transition_dir.name.startswith("."):
-            continue
-        for pressure_dir in sorted(transition_dir.iterdir()):
-            if not pressure_dir.is_dir() or pressure_dir.name.startswith("."):
+    tasks: list[tuple[str, str, str, Path]] = []
+
+    # 枚举气体类型子目录
+    if gas_types:
+        gas_dirs = [root / g for g in gas_types if (root / g).is_dir()]
+    else:
+        gas_dirs = sorted(
+            d for d in root.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+
+    for gas_dir in gas_dirs:
+        gas_type = gas_dir.name
+        for transition_dir in sorted(gas_dir.iterdir()):
+            if not transition_dir.is_dir() or transition_dir.name.startswith("."):
                 continue
-            if not list(pressure_dir.glob("*.txt")):
-                continue
-            tasks.append((transition_dir.name, pressure_dir.name, pressure_dir))
+            for pressure_dir in sorted(transition_dir.iterdir()):
+                if not pressure_dir.is_dir() or pressure_dir.name.startswith("."):
+                    continue
+                if not list(pressure_dir.glob("*.txt")):
+                    continue
+                tasks.append((gas_type, transition_dir.name,
+                              pressure_dir.name, pressure_dir))
     return tasks
 
 
@@ -325,7 +344,7 @@ def batch_preprocess_ringdown(
 
     tasks = discover_tasks(raw)
     if not tasks:
-        logger.error(f"未在 {raw} 下找到 {{跃迁波数}}/{{压力}}/*.txt 数据")
+        logger.error(f"未在 {raw} 下找到 {{气体}}/{{跃迁波数}}/{{压力}}/*.txt 数据")
         return []
 
     logger.info(f"{'#' * 60}")
@@ -333,16 +352,16 @@ def batch_preprocess_ringdown(
     logger.info(f"  数据根目录: {raw}")
     logger.info(f"  结果根目录: {out}")
     logger.info(f"  发现 {len(tasks)} 个数据集:")
-    for transition, pressure, _ in tasks:
-        logger.info(f"    {transition}/{pressure}/")
+    for gas_type, transition, pressure, _ in tasks:
+        logger.info(f"    {gas_type}/{transition}/{pressure}/")
     logger.info(f"{'#' * 60}\n")
 
     all_results: list[PreprocessResult] = []
 
-    for i, (transition, pressure, data_dir) in enumerate(tasks, 1):
-        output_dir = out / transition / pressure
+    for i, (gas_type, transition, pressure, data_dir) in enumerate(tasks, 1):
+        output_dir = out / gas_type / transition / pressure
         logger.info(f"\n{'=' * 60}")
-        logger.info(f"  [{i}/{len(tasks)}] {transition} / {pressure}")
+        logger.info(f"  [{i}/{len(tasks)}] {gas_type}/{transition}/{pressure}")
         logger.info(f"  数据: {data_dir}")
         logger.info(f"  输出: {output_dir}")
         logger.info(f"{'=' * 60}")
@@ -364,9 +383,9 @@ def batch_preprocess_ringdown(
     logger.info(f"\n\n{'#' * 60}")
     logger.info("  全部处理完成! 输出文件:")
     logger.info(f"{'#' * 60}")
-    for transition, pressure, _ in tasks:
-        d = out / transition / pressure
-        logger.info(f"\n  {transition}/{pressure}/")
+    for gas_type, transition, pressure, _ in tasks:
+        d = out / gas_type / transition / pressure
+        logger.info(f"\n  {gas_type}/{transition}/{pressure}/")
         for f in sorted(d.glob("*")):
             logger.info(f"    {f.name:<40s}  {f.stat().st_size:>8,} bytes")
 

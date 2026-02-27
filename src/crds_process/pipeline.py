@@ -52,7 +52,7 @@ from crds_process.log import logger, setup_logging
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 _DEFAULT_PATHS = {
-    "raw": _PROJECT_ROOT / "data" / "raw" / "O2",
+    "raw": _PROJECT_ROOT / "data" / "raw",
     "ringdown": _PROJECT_ROOT / "output" / "results" / "ringdown",
     "etalon": _PROJECT_ROOT / "output" / "results" / "etalon",
     "mats": _PROJECT_ROOT / "output" / "results" / "mats",
@@ -207,22 +207,6 @@ class CRDSPipeline:
         self.fit_intensity = fit_intensity
         self.threshold_intensity = threshold_intensity
 
-    # ==============================================================
-    # 创建 MATSFitter 实例 (内部复用)
-    # ==============================================================
-    def _create_fitter(self):
-        """创建 MATSFitter 实例"""
-        from crds_process.spectral.mats_wrapper import MATSFitter
-        return MATSFitter(
-            molecule=self.molecule,
-            isotopologue=self.isotopologue,
-            molefraction=self.molefraction,
-            diluent=self.diluent,
-            lineprofile=self.lineprofile,
-            baseline_order=self.baseline_order,
-            fit_intensity=self.fit_intensity,
-            threshold_intensity=self.threshold_intensity,
-        )
 
     # ==============================================================
     # Step 1: 衰荡时间处理
@@ -245,16 +229,16 @@ class CRDSPipeline:
 
         futures = []
         with ProcessPoolExecutor(max_workers=self.max_workers) as pool:
-            for transition, pressure, data_dir in tasks:
-                output_dir = self.ringdown_root / transition / pressure
+            for gas_type, transition, pressure, data_dir in tasks:
+                output_dir = self.ringdown_root / gas_type / transition / pressure
                 fut = pool.submit(
                     _worker_ringdown,
                     data_dir, output_dir,
                     "sigma_clip", 3.0, 5,
                 )
-                futures.append((transition, pressure, fut))
+                futures.append((f"{gas_type}/{transition}/{pressure}", fut))
 
-            for transition, pressure, fut in futures:
+            for label, fut in futures:
                 msg = fut.result()
                 logger.info(msg)
 
@@ -269,23 +253,31 @@ class CRDSPipeline:
         logger.info("  Step 2 / 4 — 去除标准具效应")
         logger.info("=" * 60)
 
-        proc = EtalonBatchProcessor(
-            ringdown_root=self.ringdown_root,
-            etalon_root=self.etalon_root,
-        )
-        tasks = proc.discover()
-        if not tasks:
+        # 遍历所有气体类型子目录
+        all_tasks = []
+        for gas_dir in sorted(self.ringdown_root.iterdir()):
+            if not gas_dir.is_dir() or gas_dir.name.startswith("."):
+                continue
+            gas_type = gas_dir.name
+            proc = EtalonBatchProcessor(
+                ringdown_root=gas_dir,
+                etalon_root=self.etalon_root / gas_type,
+            )
+            for t, p, csv in proc.discover():
+                all_tasks.append((gas_type, t, p, csv))
+
+        if not all_tasks:
             logger.error(f"  未在 {self.ringdown_root} 下找到数据")
             return
 
-        logger.info(f"  发现 {len(tasks)} 个数据集, "
+        logger.info(f"  发现 {len(all_tasks)} 个数据集, "
                      f"使用 {self.max_workers} 进程并行处理")
 
         futures = []
         with ProcessPoolExecutor(max_workers=self.max_workers) as pool:
-            for transition, pressure, csv_path in tasks:
-                output_dir = self.etalon_root / transition / pressure
-                label = f"{transition}/{pressure}"
+            for gas_type, transition, pressure, csv_path in all_tasks:
+                output_dir = self.etalon_root / gas_type / transition / pressure
+                label = f"{gas_type}/{transition}/{pressure}"
                 fut = pool.submit(
                     _worker_etalon, csv_path, output_dir, label,
                 )
@@ -298,45 +290,61 @@ class CRDSPipeline:
     # ==============================================================
     # Step 3: MATS 单光谱拟合 + 汇总
     # ==============================================================
-    def _fitter_kwargs(self) -> dict:
-        """返回 MATSFitter 构造参数 (可序列化, 用于子进程)"""
+    def _base_fitter_kwargs(self) -> dict:
+        """返回 MATSFitter 构造基础参数 (不含气体类型相关参数)"""
         return dict(
             molecule=self.molecule,
             isotopologue=self.isotopologue,
-            molefraction=self.molefraction,
-            diluent=self.diluent,
             lineprofile=self.lineprofile,
             baseline_order=self.baseline_order,
             fit_intensity=self.fit_intensity,
             threshold_intensity=self.threshold_intensity,
         )
 
+    def _fitter_kwargs_for_gas(self, gas_type: str,
+                               pressure_label: str = "") -> dict:
+        """根据气体类型构建完整的 MATSFitter 参数"""
+        from crds_process.gas_config import parse_gas_dir
+        kw = self._base_fitter_kwargs()
+        gc = parse_gas_dir(pressure_label, gas_type)
+        kw.update(gc.to_fitter_kwargs())
+        return kw
+
     def step3_mats(self) -> None:
-        """Step 3: etalon_corrected → MATS SDVP 拟合 (多进程并行)"""
+        """Step 3: etalon_corrected → MATS 拟合 (多进程并行, 支持多气体类型)"""
         from crds_process.spectral.mats_wrapper import MATSBatchProcessor
 
         logger.info("\n" + "=" * 60)
         logger.info(f"  Step 3 / 4 — MATS 光谱拟合 (线形: {self.lineprofile})")
         logger.info("=" * 60)
 
-        proc = MATSBatchProcessor(
-            etalon_root=self.etalon_root,
-            mats_root=self.mats_root,
-        )
-        tasks = proc.discover()
-        if not tasks:
+        # 遍历所有气体类型子目录
+        all_tasks = []
+        for gas_dir in sorted(self.etalon_root.iterdir()):
+            if not gas_dir.is_dir() or gas_dir.name.startswith("."):
+                continue
+            gas_type = gas_dir.name
+            proc = MATSBatchProcessor(
+                etalon_root=gas_dir,
+                mats_root=self.mats_root / gas_type,
+            )
+            for t, p, csv in proc.discover():
+                all_tasks.append((gas_type, t, p, csv))
+
+        if not all_tasks:
             logger.error(f"  未在 {self.etalon_root} 下找到数据")
             return
 
-        logger.info(f"  发现 {len(tasks)} 个数据集, "
+        logger.info(f"  发现 {len(all_tasks)} 个数据集, "
                      f"使用 {self.max_workers} 进程并行处理")
 
-        fitter_kw = self._fitter_kwargs()
         futures = []
         with ProcessPoolExecutor(max_workers=self.max_workers) as pool:
-            for transition, pressure, csv_path in tasks:
-                output_dir = self.mats_root / transition / pressure
-                label = f"{transition}/{pressure}"
+            for gas_type, transition, pressure, csv_path in all_tasks:
+                output_dir = self.mats_root / gas_type / transition / pressure
+                label = f"{gas_type}/{transition}/{pressure}"
+                # 每个任务根据气体类型构建独立的 fitter 参数
+                fitter_kw = self._fitter_kwargs_for_gas(gas_type, pressure)
                 fut = pool.submit(
                     _worker_mats, csv_path, output_dir, label, fitter_kw,
                 )
@@ -346,7 +354,7 @@ class CRDSPipeline:
                 msg = fut.result()
                 logger.info(msg)
 
-        # 汇总: 从 MATS 输出中提取线强 & 自展宽
+        # 汇总
         self._collect_final_summary()
 
     # ==============================================================
@@ -354,7 +362,7 @@ class CRDSPipeline:
     # ==============================================================
     def step4_multi_fit(self) -> None:
         """Step 4: 根据 Step 3 单光谱结果筛除线强离群点，
-        用剩余光谱做多光谱联合拟合。
+        用剩余光谱做多光谱联合拟合 (按气体类型分别处理)。
         """
         if not self.mats_root.exists():
             logger.error(f"   Step 3 结果不存在: {self.mats_root}")
@@ -365,38 +373,54 @@ class CRDSPipeline:
         logger.info(f"  Step 4 / 4 — 筛选 + 多光谱联合拟合 (σ={self.sw_sigma})")
         logger.info("=" * 60)
 
-        for t_dir in sorted(self.mats_root.iterdir()):
-            if not t_dir.is_dir() or t_dir.name.startswith("."):
+        for gas_dir in sorted(self.mats_root.iterdir()):
+            if not gas_dir.is_dir() or gas_dir.name.startswith("."):
                 continue
-            self._process_transition_multi_fit(t_dir.name)
+            gas_type = gas_dir.name
+            for t_dir in sorted(gas_dir.iterdir()):
+                if not t_dir.is_dir() or t_dir.name.startswith("."):
+                    continue
+                self._process_transition_multi_fit(
+                    gas_type, t_dir.name)
 
-    def _process_transition_multi_fit(self, transition: str) -> None:
-        """对单个跃迁执行线强筛选 + 多光谱联合拟合"""
-        t_dir = self.mats_root / transition
+    def _process_transition_multi_fit(self, gas_type: str,
+                                      transition: str) -> None:
+        """对单个 (气体类型, 跃迁) 执行线强筛选 + 多光谱联合拟合"""
+        t_dir = self.mats_root / gas_type / transition
+        tag = f"{gas_type}/{transition}"
 
         # ---- 1. 收集 Step 3 各压力点的拟合线强 ----
-        records = self._collect_sw_records(t_dir)
+        diluent_col = "gamma0_O2" if gas_type == "O2" else "gamma0_air"
+        records = self._collect_sw_records(t_dir, diluent_col)
         if not records:
-            logger.info(f"\n  [{transition}] 未找到 Step 3 拟合结果，跳过")
+            logger.info(f"\n  [{tag}] 未找到 Step 3 拟合结果，跳过")
             return
 
         # ---- 2. MAD 筛选 ----
-        sw_df = self._screen_sw(records, transition)
+        sw_df = self._screen_sw(records, tag)
         kept = sw_df[sw_df["keep"]]
         if len(kept) < 2:
             logger.warning(f"   保留点数 < 2，无法联合拟合，跳过")
             return
 
         # ---- 3. 收集保留的 etalon CSV ----
-        etalon_csvs, labels = self._collect_etalon_csvs(transition, kept)
+        etalon_csvs, labels = self._collect_etalon_csvs(
+            gas_type, transition, kept)
         if len(etalon_csvs) < 2:
             logger.warning(f"   有效 etalon CSV < 2，跳过联合拟合")
             return
 
         # ---- 4. 多光谱联合拟合 ----
         logger.info(f"\n  开始多光谱联合拟合 ({len(etalon_csvs)} 条光谱)...")
-        fitter = self._create_fitter()
-        multi_out = self.mats_multi_root / transition
+        # 使用第一个压力目录的名称确定气体参数
+        first_pressure = kept.iloc[0]["pressure"]
+        fitter_kw = self._fitter_kwargs_for_gas(gas_type, first_pressure)
+        base_kw = self._base_fitter_kwargs()
+        base_kw.update(fitter_kw)
+        from crds_process.spectral.mats_wrapper import MATSFitter
+        fitter = MATSFitter(**base_kw)
+
+        multi_out = self.mats_multi_root / gas_type / transition
         multi_out.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -410,12 +434,13 @@ class CRDSPipeline:
                     and not result.summary_df.empty):
                 fitter.plot_result(
                     result, multi_out,
-                    title=f"Multi-spectrum Fit — {transition} "
+                    title=f"Multi-spectrum Fit — {tag} "
                           f"({len(etalon_csvs)} spectra)",
                 )
 
             sw_df.to_csv(multi_out / "sw_screening.csv", index=False)
-            self._save_multi_fit_summary(result, multi_out, transition, labels)
+            self._save_multi_fit_summary(
+                result, multi_out, gas_type, transition, labels)
 
         except Exception as e:
             logger.error(f"  多光谱联合拟合失败: {e}")
@@ -457,7 +482,8 @@ class CRDSPipeline:
     # Step 4 辅助方法
     # ==============================================================
     @staticmethod
-    def _collect_sw_records(t_dir: Path) -> list[dict]:
+    def _collect_sw_records(t_dir: Path,
+                            gamma_col: str = "gamma0_O2") -> list[dict]:
         """收集某个跃迁下各压力点的拟合线强"""
         records: list[dict] = []
         for p_dir in sorted(t_dir.iterdir()):
@@ -472,12 +498,14 @@ class CRDSPipeline:
                 continue
             for _, row in fitted.iterrows():
                 sw_real = row["sw"] * row.get("sw_scale_factor", 1.0)
-                records.append({
+                rec = {
                     "pressure": p_dir.name,
                     "sw": sw_real,
                     "sw_raw": row["sw"],
-                    "gamma0_O2": row["gamma0_O2"],
-                })
+                }
+                # 自适应列名: gamma0_O2 或 gamma0_air
+                rec["gamma0"] = row.get(gamma_col, 0)
+                records.append(rec)
         return records
 
     def _screen_sw(self, records: list[dict], transition: str) -> pd.DataFrame:
@@ -514,14 +542,14 @@ class CRDSPipeline:
 
         return sw_df
 
-    def _collect_etalon_csvs(self, transition: str,
+    def _collect_etalon_csvs(self, gas_type: str, transition: str,
                              kept: pd.DataFrame) -> tuple[list[Path], list[str]]:
         """收集保留压力点的 etalon CSV 路径"""
         etalon_csvs: list[Path] = []
         labels: list[str] = []
         for _, r in kept.iterrows():
-            csv_path = (self.etalon_root / transition / r["pressure"]
-                        / "tau_etalon_corrected.csv")
+            csv_path = (self.etalon_root / gas_type / transition
+                        / r["pressure"] / "tau_etalon_corrected.csv")
             if csv_path.exists():
                 etalon_csvs.append(csv_path)
                 labels.append(r["pressure"])
@@ -533,7 +561,8 @@ class CRDSPipeline:
     # 结果汇总方法
     # ==============================================================
     def _save_multi_fit_summary(self, result, output_dir: Path,
-                                transition: str, labels: list[str]) -> None:
+                                gas_type: str, transition: str,
+                                labels: list[str]) -> None:
         """保存多光谱联合拟合的最终统计 CSV"""
         if result is None or result.param_linelist.empty:
             return
@@ -543,50 +572,61 @@ class CRDSPipeline:
         if fitted.empty:
             return
 
+        # 根据气体类型决定展宽/位移列名
+        d = "O2" if gas_type == "O2" else "air"
+
         rows: list[dict] = []
         for _, row in fitted.iterrows():
             scale = row.get("sw_scale_factor", 1.0)
-            rows.append({
+            rec = {
+                "gas_type": gas_type,
                 "transition": transition,
                 "n_spectra": len(labels),
                 "pressures": "+".join(labels),
                 "nu_HITRAN": row["nu"],
                 "sw": row["sw"] * scale,
                 "sw_err": row.get("sw_err", 0) * scale,
-                "gamma0_O2": row["gamma0_O2"],
-                "gamma0_O2_err": row.get("gamma0_O2_err", 0),
-                "n_gamma0_O2": row.get("n_gamma0_O2", 0),
-                "n_gamma0_O2_err": row.get("n_gamma0_O2_err", 0),
-                "SD_gamma_O2": row.get("SD_gamma_O2", 0),
-                "SD_gamma_O2_err": row.get("SD_gamma_O2_err", 0),
-                "delta0_O2": row.get("delta0_O2", 0),
-                "delta0_O2_err": row.get("delta0_O2_err", 0),
-                "SD_delta_O2": row.get("SD_delta_O2", 0),
-                "SD_delta_O2_err": row.get("SD_delta_O2_err", 0),
+                f"gamma0_{d}": row.get(f"gamma0_{d}", 0),
+                f"gamma0_{d}_err": row.get(f"gamma0_{d}_err", 0),
+                f"n_gamma0_{d}": row.get(f"n_gamma0_{d}", 0),
+                f"n_gamma0_{d}_err": row.get(f"n_gamma0_{d}_err", 0),
+                f"SD_gamma_{d}": row.get(f"SD_gamma_{d}", 0),
+                f"SD_gamma_{d}_err": row.get(f"SD_gamma_{d}_err", 0),
+                f"delta0_{d}": row.get(f"delta0_{d}", 0),
+                f"delta0_{d}_err": row.get(f"delta0_{d}_err", 0),
+                f"SD_delta_{d}": row.get(f"SD_delta_{d}", 0),
+                f"SD_delta_{d}_err": row.get(f"SD_delta_{d}_err", 0),
                 "residual_std": result.residual_std,
                 "QF": result.qf,
-            })
+            }
+            rows.append(rec)
 
         final_df = pd.DataFrame(rows)
         out_path = output_dir / "multi_fit_result.csv"
         final_df.to_csv(out_path, index=False)
 
-        final_dir = self.final_root / transition
+        final_dir = self.final_root / gas_type / transition
         final_dir.mkdir(parents=True, exist_ok=True)
         final_df.to_csv(final_dir / "multi_fit_result.csv", index=False)
 
+        tag = f"{gas_type}/{transition}"
         logger.info(f"\n  {'#' * 60}")
-        logger.info(f"  多光谱联合拟合最终结果 ({transition})")
+        logger.info(f"  多光谱联合拟合最终结果 ({tag})")
         logger.info(f"  光谱数: {len(labels)}, 压力: {', '.join(labels)}")
         logger.info(f"  {'#' * 60}")
         for _, r in final_df.iterrows():
             logger.info(f"  ν = {r['nu_HITRAN']:.6f} cm⁻¹")
-            logger.info(f"    S          = {r['sw']:.6e} ± {r['sw_err']:.2e} cm⁻¹/(molec·cm⁻²)")
-            logger.info(f"    γ₀_O2     = {r['gamma0_O2']:.6f} ± {r['gamma0_O2_err']:.6f} cm⁻¹/atm")
-            logger.info(f"    n_γ₀_O2   = {r['n_gamma0_O2']:.4f} ± {r['n_gamma0_O2_err']:.4f}")
-            logger.info(f"    SD_γ_O2   = {r['SD_gamma_O2']:.6f} ± {r['SD_gamma_O2_err']:.6f}")
-            logger.info(f"    δ₀_O2     = {r['delta0_O2']:.6f} ± {r['delta0_O2_err']:.6f} cm⁻¹/atm")
-            logger.info(f"    SD_δ_O2   = {r['SD_delta_O2']:.6f} ± {r['SD_delta_O2_err']:.6f}")
+            logger.info(f"    S          = {r['sw']:.6e} ± {r['sw_err']:.2e}")
+            logger.info(f"    γ₀_{d}     = {r[f'gamma0_{d}']:.6f}"
+                         f" ± {r[f'gamma0_{d}_err']:.6f} cm⁻¹/atm")
+            logger.info(f"    n_γ₀_{d}   = {r[f'n_gamma0_{d}']:.4f}"
+                         f" ± {r[f'n_gamma0_{d}_err']:.4f}")
+            logger.info(f"    SD_γ_{d}   = {r[f'SD_gamma_{d}']:.6f}"
+                         f" ± {r[f'SD_gamma_{d}_err']:.6f}")
+            logger.info(f"    δ₀_{d}     = {r[f'delta0_{d}']:.6f}"
+                         f" ± {r[f'delta0_{d}_err']:.6f} cm⁻¹/atm")
+            logger.info(f"    SD_δ_{d}   = {r[f'SD_delta_{d}']:.6f}"
+                         f" ± {r[f'SD_delta_{d}_err']:.6f}")
             logger.info(f"    Res. σ     = {r['residual_std']:.4e}")
             logger.info(f"    QF         = {r['QF']:.1f}")
         logger.info(f"\n  结果已保存: {out_path}")
@@ -601,49 +641,56 @@ class CRDSPipeline:
         if not self.mats_root.exists():
             return
 
-        for t_dir in sorted(self.mats_root.iterdir()):
-            if not t_dir.is_dir() or t_dir.name.startswith("."):
+        for gas_dir in sorted(self.mats_root.iterdir()):
+            if not gas_dir.is_dir() or gas_dir.name.startswith("."):
                 continue
-            transition = t_dir.name
-            for p_dir in sorted(t_dir.iterdir()):
-                if not p_dir.is_dir() or p_dir.name.startswith("."):
+            gas_type = gas_dir.name
+            d = "O2" if gas_type == "O2" else "air"
+
+            for t_dir in sorted(gas_dir.iterdir()):
+                if not t_dir.is_dir() or t_dir.name.startswith("."):
                     continue
-                pressure_label = p_dir.name
-
-                param_files = list(p_dir.glob("*Parameter_LineList*.csv"))
-                if not param_files:
-                    continue
-
-                param_df = pd.read_csv(param_files[0], index_col=0)
-
-                x_shift = self._read_x_shift(p_dir)
-                residual_std = self._read_residual_std(p_dir)
-
-                for _, row in param_df.iterrows():
-                    nu = row.get("nu", 0)
-                    sw = row.get("sw", 0)
-                    sw_scale = row.get("sw_scale_factor", 1.0)
-                    if sw * sw_scale < 1e-35:
+                transition = t_dir.name
+                for p_dir in sorted(t_dir.iterdir()):
+                    if not p_dir.is_dir() or p_dir.name.startswith("."):
                         continue
-                    all_rows.append({
-                        "transition": transition,
-                        "pressure_label": pressure_label,
-                        "nu": nu,
-                        "sw": sw * sw_scale,
-                        "sw_raw": sw,
-                        "sw_scale_factor": sw_scale,
-                        "gamma0_O2": row.get("gamma0_O2", 0),
-                        "gamma0_O2_err": row.get("gamma0_O2_err", 0),
-                        "n_gamma0_O2": row.get("n_gamma0_O2", 0),
-                        "delta0_O2": row.get("delta0_O2", 0),
-                        "delta0_O2_err": row.get("delta0_O2_err", 0),
-                        "SD_gamma_O2": row.get("SD_gamma_O2", 0),
-                        "SD_gamma_O2_err": row.get("SD_gamma_O2_err", 0),
-                        "SD_delta_O2": row.get("SD_delta_O2", 0),
-                        "x_shift": x_shift,
-                        "residual_std": residual_std,
-                        "sw_vary": row.get("sw_vary", False),
-                    })
+                    pressure_label = p_dir.name
+
+                    param_files = list(p_dir.glob("*Parameter_LineList*.csv"))
+                    if not param_files:
+                        continue
+
+                    param_df = pd.read_csv(param_files[0], index_col=0)
+
+                    x_shift = self._read_x_shift(p_dir)
+                    residual_std = self._read_residual_std(p_dir)
+
+                    for _, row in param_df.iterrows():
+                        nu = row.get("nu", 0)
+                        sw = row.get("sw", 0)
+                        sw_scale = row.get("sw_scale_factor", 1.0)
+                        if sw * sw_scale < 1e-35:
+                            continue
+                        all_rows.append({
+                            "gas_type": gas_type,
+                            "transition": transition,
+                            "pressure_label": pressure_label,
+                            "nu": nu,
+                            "sw": sw * sw_scale,
+                            "sw_raw": sw,
+                            "sw_scale_factor": sw_scale,
+                            f"gamma0_{d}": row.get(f"gamma0_{d}", 0),
+                            f"gamma0_{d}_err": row.get(f"gamma0_{d}_err", 0),
+                            f"n_gamma0_{d}": row.get(f"n_gamma0_{d}", 0),
+                            f"delta0_{d}": row.get(f"delta0_{d}", 0),
+                            f"delta0_{d}_err": row.get(f"delta0_{d}_err", 0),
+                            f"SD_gamma_{d}": row.get(f"SD_gamma_{d}", 0),
+                            f"SD_gamma_{d}_err": row.get(f"SD_gamma_{d}_err", 0),
+                            f"SD_delta_{d}": row.get(f"SD_delta_{d}", 0),
+                            "x_shift": x_shift,
+                            "residual_std": residual_std,
+                            "sw_vary": row.get("sw_vary", False),
+                        })
 
         if not all_rows:
             logger.warning("\n  未找到任何有效拟合结果，跳过汇总")
@@ -651,14 +698,14 @@ class CRDSPipeline:
 
         df = pd.DataFrame(all_rows)
         if "nu" in df.columns:
-            df = df.sort_values("nu").reset_index(drop=True)
+            df = df.sort_values(["gas_type", "nu"]).reset_index(drop=True)
 
         summary_path = self.final_root / "spectral_parameters_summary.csv"
         df.to_csv(summary_path, index=False)
 
-        for transition in df["transition"].unique():
-            sub = df[df["transition"] == transition]
-            trans_dir = self.final_root / str(transition)
+        for (gas_type, transition), sub in df.groupby(
+                ["gas_type", "transition"]):
+            trans_dir = self.final_root / str(gas_type) / str(transition)
             trans_dir.mkdir(parents=True, exist_ok=True)
             sub.to_csv(trans_dir / "fitted_parameters.csv", index=False)
 
@@ -668,106 +715,118 @@ class CRDSPipeline:
     def _print_summary_table(self, df: pd.DataFrame, summary_path: Path) -> None:
         """打印单光谱拟合汇总表"""
         logger.info(f"\n{'#' * 60}")
-        logger.info(f"  单光谱拟合结果汇总 (SDVP 线形)")
+        logger.info(f"  单光谱拟合结果汇总 ({self.lineprofile} 线形)")
         logger.info(f"{'#' * 60}")
 
-        x_shifts = df[["transition", "pressure_label", "x_shift"]].drop_duplicates()
+        x_cols = ["gas_type", "transition", "pressure_label", "x_shift"]
+        x_cols = [c for c in x_cols if c in df.columns]
+        x_shifts = df[x_cols].drop_duplicates()
         for _, xs in x_shifts.iterrows():
-            logger.info(f"\n  [{xs['transition']}/{xs['pressure_label']}] "
-                  f"x_shift = {xs['x_shift']:.6f} cm⁻¹ (波数计系统偏差)")
+            prefix = f"{xs.get('gas_type', '')}/" if "gas_type" in xs else ""
+            logger.info(f"\n  [{prefix}{xs['transition']}/{xs['pressure_label']}] "
+                  f"x_shift = {xs['x_shift']:.6f} cm⁻¹")
 
-        fitted = df[df["sw_vary"] == True]
+        fitted = df[df["sw_vary"] == True] if "sw_vary" in df.columns else df
         if fitted.empty:
             fitted = df
 
-        logger.info(f"\n  {'─' * 100}")
-        logger.info(f"  {'跃迁':<12s} {'压力':<10s} {'ν (cm⁻¹)':<16s} "
+        # 找到展宽列名
+        gamma_col = next((c for c in df.columns if c.startswith("gamma0_")
+                          and not c.endswith("_err")), "gamma0")
+
+        logger.info(f"\n  {'─' * 110}")
+        logger.info(f"  {'气体':<6s} {'跃迁':<12s} {'压力':<28s} {'ν (cm⁻¹)':<14s} "
               f"{'S (cm/molec)':<14s} "
-              f"{'γ₀_O2 (cm⁻¹/atm)':<20s} "
-              f"{'δ₀_O2':<12s} "
-              f"{'SD_γ':<10s} "
+              f"{gamma_col:<18s} "
               f"{'Res. σ':<12s}")
-        logger.info(f"  {'─' * 100}")
+        logger.info(f"  {'─' * 110}")
 
         for _, row in fitted.iterrows():
-            gamma_str = f"{row['gamma0_O2']:.6f}"
-            if row.get('gamma0_O2_err', 0) > 0:
-                gamma_str += f" ± {row['gamma0_O2_err']:.6f}"
+            gas = str(row.get("gas_type", ""))
+            gamma_val = row.get(gamma_col, 0)
+            gamma_err = row.get(f"{gamma_col}_err", 0)
+            gamma_str = f"{gamma_val:.6f}"
+            if gamma_err > 0:
+                gamma_str += f" ± {gamma_err:.6f}"
             logger.info(
-                f"  {row['transition']:<12s} {row['pressure_label']:<10s} "
-                f"{row['nu']:>14.6f}  "
+                f"  {gas:<6s} {row['transition']:<12s} "
+                f"{str(row['pressure_label']):<28s} "
+                f"{row['nu']:>12.6f}  "
                 f"{row['sw']:>12.4e}  "
-                f"{gamma_str:<20s} "
-                f"{row.get('delta0_O2', 0):>10.6f}  "
-                f"{row.get('SD_gamma_O2', 0):>8.4f}  "
+                f"{gamma_str:<18s} "
                 f"{row['residual_std']:>10.4e}"
             )
 
-        logger.info(f"  {'─' * 100}")
+        logger.info(f"  {'─' * 110}")
         logger.info(f"\n  汇总表: {summary_path}")
         logger.info(f"  详细目录: {self.final_root}")
 
     def _generate_fit_statistics(self) -> None:
-        """从 MATS 拟合结果中提取被拟合目标线的完整参数，生成统计 CSV
-
-        只保留 sw_vary=True 的谱线，按压力排序。
-        输出: output/results/final/{跃迁}/fit_summary_statistics.csv
-        """
+        """从 MATS 拟合结果中提取被拟合目标线的完整参数，生成统计 CSV"""
         if not self.mats_root.exists():
             return
 
-        for t_dir in sorted(self.mats_root.iterdir()):
-            if not t_dir.is_dir() or t_dir.name.startswith("."):
+        for gas_dir in sorted(self.mats_root.iterdir()):
+            if not gas_dir.is_dir() or gas_dir.name.startswith("."):
                 continue
-            transition = t_dir.name
-            rows: list[dict] = []
+            gas_type = gas_dir.name
+            d = "O2" if gas_type == "O2" else "air"
 
-            for p_dir in sorted(t_dir.iterdir()):
-                if not p_dir.is_dir() or p_dir.name.startswith("."):
+            for t_dir in sorted(gas_dir.iterdir()):
+                if not t_dir.is_dir() or t_dir.name.startswith("."):
                     continue
-                pressure_label = p_dir.name
+                transition = t_dir.name
+                rows: list[dict] = []
 
-                param_files = list(p_dir.glob("*Parameter_LineList*.csv"))
-                if not param_files:
+                for p_dir in sorted(t_dir.iterdir()):
+                    if not p_dir.is_dir() or p_dir.name.startswith("."):
+                        continue
+                    pressure_label = p_dir.name
+
+                    param_files = list(p_dir.glob("*Parameter_LineList*.csv"))
+                    if not param_files:
+                        continue
+                    param_df = pd.read_csv(param_files[0], index_col=0)
+
+                    x_shift = self._read_x_shift(p_dir)
+                    residual_std = self._read_residual_std(p_dir)
+
+                    fitted = param_df[param_df["sw_vary"] == True]
+                    for _, row in fitted.iterrows():
+                        scale = row.get("sw_scale_factor", 1.0)
+                        rows.append({
+                            "pressure": pressure_label,
+                            "nu_HITRAN": row["nu"],
+                            "sw": row["sw"] * scale,
+                            "sw_err": row.get("sw_err", 0) * scale,
+                            f"gamma0_{d}": row.get(f"gamma0_{d}", 0),
+                            f"gamma0_{d}_err": row.get(f"gamma0_{d}_err", 0),
+                            f"SD_gamma_{d}": row.get(f"SD_gamma_{d}", 0),
+                            f"SD_gamma_{d}_err": row.get(f"SD_gamma_{d}_err", 0),
+                            f"delta0_{d}": row.get(f"delta0_{d}", 0),
+                            f"delta0_{d}_err": row.get(f"delta0_{d}_err", 0),
+                            f"SD_delta_{d}": row.get(f"SD_delta_{d}", 0),
+                            f"SD_delta_{d}_err": row.get(f"SD_delta_{d}_err", 0),
+                            "x_shift": x_shift,
+                            "residual_std": residual_std,
+                        })
+
+                if not rows:
                     continue
-                param_df = pd.read_csv(param_files[0], index_col=0)
 
-                x_shift = self._read_x_shift(p_dir)
-                residual_std = self._read_residual_std(p_dir)
+                stat_df = pd.DataFrame(rows)
+                # 尝试从压力标签中提取数字排序
+                nums = stat_df["pressure"].str.extract(r"(\d+)")
+                if not nums.empty and nums[0].notna().any():
+                    stat_df["_p"] = nums[0].astype(float)
+                    stat_df = (stat_df.sort_values("_p")
+                               .drop(columns="_p").reset_index(drop=True))
 
-                fitted = param_df[param_df["sw_vary"] == True]
-                for _, row in fitted.iterrows():
-                    scale = row.get("sw_scale_factor", 1.0)
-                    rows.append({
-                        "pressure": pressure_label,
-                        "nu_HITRAN": row["nu"],
-                        "sw": row["sw"] * scale,
-                        "sw_err": row.get("sw_err", 0) * scale,
-                        "gamma0_O2": row["gamma0_O2"],
-                        "gamma0_O2_err": row.get("gamma0_O2_err", 0),
-                        "SD_gamma_O2": row.get("SD_gamma_O2", 0),
-                        "SD_gamma_O2_err": row.get("SD_gamma_O2_err", 0),
-                        "delta0_O2": row.get("delta0_O2", 0),
-                        "delta0_O2_err": row.get("delta0_O2_err", 0),
-                        "SD_delta_O2": row.get("SD_delta_O2", 0),
-                        "SD_delta_O2_err": row.get("SD_delta_O2_err", 0),
-                        "x_shift": x_shift,
-                        "residual_std": residual_std,
-                    })
-
-            if not rows:
-                continue
-
-            stat_df = pd.DataFrame(rows)
-            stat_df["_p"] = stat_df["pressure"].str.extract(r"(\d+)").astype(float)
-            stat_df = (stat_df.sort_values("_p")
-                       .drop(columns="_p").reset_index(drop=True))
-
-            out_dir = self.final_root / transition
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / "fit_summary_statistics.csv"
-            stat_df.to_csv(out_path, index=False)
-            logger.info(f"\n  统计表: {out_path}")
+                out_dir = self.final_root / gas_type / transition
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / "fit_summary_statistics.csv"
+                stat_df.to_csv(out_path, index=False)
+                logger.info(f"\n  统计表: {out_path}")
 
     # ==============================================================
     # 通用 I/O 辅助方法
