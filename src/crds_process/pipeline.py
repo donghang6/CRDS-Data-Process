@@ -439,6 +439,7 @@ class CRDSPipeline:
         tag = f"{gas_type}/{transition}"
 
         # ---- 1. 收集 Step 3 各压力点的拟合线强 ----
+        # Step 3 单光谱用 air 近似, Step 4 多光谱用双稀释气
         diluent_col = "gamma0_O2" if gas_type == "O2" else "gamma0_air"
         records = self._collect_sw_records(t_dir, diluent_col)
         if not records:
@@ -466,6 +467,35 @@ class CRDSPipeline:
         fitter_kw = self._fitter_kwargs_for_gas(gas_type, first_pressure)
         base_kw = self._base_fitter_kwargs()
         base_kw.update(fitter_kw)
+
+        # O₂+N₂ 双稀释气: 每条光谱的 Diluent/molefraction 不同
+        per_spectrum_diluent = None
+        per_spectrum_molefraction = None
+        fixed_params = None
+        if gas_type == "O2_N2":
+            from crds_process.gas_config import parse_gas_dir
+            per_spectrum_diluent = []
+            per_spectrum_molefraction = []
+            for _, r in kept.iterrows():
+                gc = parse_gas_dir(r["pressure"], gas_type)
+                per_spectrum_diluent.append(gc.Diluent_dual)
+                per_spectrum_molefraction.append(gc.molefraction)
+                logger.info(f"    {r['pressure']}: O₂={gc.o2_fraction:.3f}, "
+                          f"N₂={gc.n2_fraction:.3f}")
+            # Diluent 基础设置: 使用双稀释气模式
+            # (第一个光谱的 Diluent_dual 用于 linelist 列名识别)
+            base_kw["Diluent"] = per_spectrum_diluent[0]
+
+            # 从纯 O₂ 多光谱联合拟合结果中读取 γ₀_O₂, 固定在 N₂ 展宽拟合中
+            fixed_params = self._load_o2_fixed_params(transition)
+            if fixed_params:
+                logger.info(f"\n  从纯 O₂ 联合拟合结果中约束参数:")
+                for k, v in fixed_params.items():
+                    logger.info(f"    {k} = {v:.6f} (固定)")
+            else:
+                logger.warning(f"  ⚠ 未找到纯 O₂ 联合拟合结果, "
+                             f"γ₀_O₂ 和 γ₀_N₂ 将同时浮动拟合")
+
         from crds_process.spectral.mats_wrapper import MATSFitter
         fitter = MATSFitter(**base_kw)
 
@@ -478,6 +508,9 @@ class CRDSPipeline:
                 labels=labels,
                 output_dir=multi_out,
                 dataset_name=f"{transition}_multi",
+                per_spectrum_diluent=per_spectrum_diluent,
+                per_spectrum_molefraction=per_spectrum_molefraction,
+                fixed_params=fixed_params,
             )
             if (result and result.summary_df is not None
                     and not result.summary_df.empty):
@@ -530,6 +563,78 @@ class CRDSPipeline:
     # ==============================================================
     # Step 4 辅助方法
     # ==============================================================
+    def _load_o2_fixed_params(self, transition: str) -> dict | None:
+        """从纯 O₂ 多光谱联合拟合结果中读取 γ₀_O₂ 等参数
+
+        用于 O₂+N₂ 双稀释气拟合时固定 O₂ 自展宽系数，
+        只让 N₂ 外展宽系数 (γ₀_N₂) 自由浮动。
+
+        只固定拟合可靠的参数 (相对误差 < 50%)，
+        误差过大的参数不固定，让其在 O₂+N₂ 拟合中重新确定。
+
+        Parameters
+        ----------
+        transition : str
+            跃迁波数 (如 "9386.2076")
+
+        Returns
+        -------
+        dict | None
+            {"gamma0_O2": value, ...} 若未找到纯 O₂ 结果则返回 None
+        """
+        o2_result_path = (self.mats_multi_root / "O2" / transition
+                          / "multi_fit_result.csv")
+        if not o2_result_path.exists():
+            # 回退: 尝试 final 目录
+            o2_result_path = (self.final_root / "O2" / transition
+                              / "multi_fit_result.csv")
+        if not o2_result_path.exists():
+            return None
+
+        try:
+            o2_df = pd.read_csv(o2_result_path)
+            if o2_df.empty:
+                return None
+
+            row = o2_df.iloc[0]
+            fixed = {}
+
+            def _is_reliable(col: str) -> bool:
+                """判断参数拟合是否可靠 (相对误差 < 50%)"""
+                val = row.get(col, 0)
+                err = row.get(f"{col}_err", 0)
+                if val == 0 or abs(val) < 1e-10:
+                    return False
+                if err == 0:
+                    return True  # 无误差信息, 信任该值
+                return abs(err / val) < 0.5
+
+            # γ₀_O₂ — 核心参数 (最重要, 必须可靠)
+            if "gamma0_O2" in row and row["gamma0_O2"] > 0 and _is_reliable("gamma0_O2"):
+                fixed["gamma0_O2"] = float(row["gamma0_O2"])
+
+            # n_γ₀_O₂ — 温度依赖指数
+            if "n_gamma0_O2" in row and row["n_gamma0_O2"] > 0:
+                fixed["n_gamma0_O2"] = float(row["n_gamma0_O2"])
+
+            # SD_γ_O₂ — 速度依赖展宽
+            if "SD_gamma_O2" in row and row["SD_gamma_O2"] > 0 and _is_reliable("SD_gamma_O2"):
+                fixed["SD_gamma_O2"] = float(row["SD_gamma_O2"])
+
+            # δ₀_O₂ — 压力位移 (仅在可靠时固定)
+            if "delta0_O2" in row and _is_reliable("delta0_O2"):
+                fixed["delta0_O2"] = float(row["delta0_O2"])
+
+            # SD_δ_O₂ — 速度依赖位移 (仅在可靠时固定)
+            if "SD_delta_O2" in row and _is_reliable("SD_delta_O2"):
+                fixed["SD_delta_O2"] = float(row["SD_delta_O2"])
+
+            return fixed if fixed else None
+
+        except Exception as e:
+            logger.warning(f"  读取纯 O₂ 结果失败: {e}")
+            return None
+
     @staticmethod
     def _collect_sw_records(t_dir: Path,
                             gamma_col: str = "gamma0_O2") -> list[dict]:
@@ -638,7 +743,10 @@ class CRDSPipeline:
             return
 
         # 根据气体类型决定展宽/位移列名
-        d = "O2" if gas_type == "O2" else "air"
+        is_dual = gas_type == "O2_N2"
+        # O₂+N₂ 双稀释气: 输出 O2 和 N2 两套参数
+        # 纯 O₂: 只输出 O2 一套参数
+        diluents_to_output = ["O2", "N2"] if is_dual else ["O2"]
 
         rows: list[dict] = []
         for _, row in fitted.iterrows():
@@ -651,19 +759,20 @@ class CRDSPipeline:
                 "nu_HITRAN": row["nu"],
                 "sw": row["sw"] * scale,
                 "sw_err": row.get("sw_err", 0) * scale,
-                f"gamma0_{d}": row.get(f"gamma0_{d}", 0),
-                f"gamma0_{d}_err": row.get(f"gamma0_{d}_err", 0),
-                f"n_gamma0_{d}": row.get(f"n_gamma0_{d}", 0),
-                f"n_gamma0_{d}_err": row.get(f"n_gamma0_{d}_err", 0),
-                f"SD_gamma_{d}": row.get(f"SD_gamma_{d}", 0),
-                f"SD_gamma_{d}_err": row.get(f"SD_gamma_{d}_err", 0),
-                f"delta0_{d}": row.get(f"delta0_{d}", 0),
-                f"delta0_{d}_err": row.get(f"delta0_{d}_err", 0),
-                f"SD_delta_{d}": row.get(f"SD_delta_{d}", 0),
-                f"SD_delta_{d}_err": row.get(f"SD_delta_{d}_err", 0),
                 "residual_std": result.residual_std,
                 "QF": result.qf,
             }
+            for dil in diluents_to_output:
+                rec[f"gamma0_{dil}"] = row.get(f"gamma0_{dil}", 0)
+                rec[f"gamma0_{dil}_err"] = row.get(f"gamma0_{dil}_err", 0)
+                rec[f"n_gamma0_{dil}"] = row.get(f"n_gamma0_{dil}", 0)
+                rec[f"n_gamma0_{dil}_err"] = row.get(f"n_gamma0_{dil}_err", 0)
+                rec[f"SD_gamma_{dil}"] = row.get(f"SD_gamma_{dil}", 0)
+                rec[f"SD_gamma_{dil}_err"] = row.get(f"SD_gamma_{dil}_err", 0)
+                rec[f"delta0_{dil}"] = row.get(f"delta0_{dil}", 0)
+                rec[f"delta0_{dil}_err"] = row.get(f"delta0_{dil}_err", 0)
+                rec[f"SD_delta_{dil}"] = row.get(f"SD_delta_{dil}", 0)
+                rec[f"SD_delta_{dil}_err"] = row.get(f"SD_delta_{dil}_err", 0)
             rows.append(rec)
 
         final_df = pd.DataFrame(rows)
@@ -682,16 +791,15 @@ class CRDSPipeline:
         for _, r in final_df.iterrows():
             logger.info(f"  ν = {r['nu_HITRAN']:.6f} cm⁻¹")
             logger.info(f"    S          = {r['sw']:.6e} ± {r['sw_err']:.2e}")
-            logger.info(f"    γ₀_{d}     = {r[f'gamma0_{d}']:.6f}"
-                         f" ± {r[f'gamma0_{d}_err']:.6f} cm⁻¹/atm")
-            logger.info(f"    n_γ₀_{d}   = {r[f'n_gamma0_{d}']:.4f}"
-                         f" ± {r[f'n_gamma0_{d}_err']:.4f}")
-            logger.info(f"    SD_γ_{d}   = {r[f'SD_gamma_{d}']:.6f}"
-                         f" ± {r[f'SD_gamma_{d}_err']:.6f}")
-            logger.info(f"    δ₀_{d}     = {r[f'delta0_{d}']:.6f}"
-                         f" ± {r[f'delta0_{d}_err']:.6f} cm⁻¹/atm")
-            logger.info(f"    SD_δ_{d}   = {r[f'SD_delta_{d}']:.6f}"
-                         f" ± {r[f'SD_delta_{d}_err']:.6f}")
+            for dil in diluents_to_output:
+                logger.info(f"    γ₀_{dil:<3s}  = {r[f'gamma0_{dil}']:.6f}"
+                             f" ± {r[f'gamma0_{dil}_err']:.6f} cm⁻¹/atm")
+                logger.info(f"    n_γ₀_{dil:<3s}= {r[f'n_gamma0_{dil}']:.4f}"
+                             f" ± {r[f'n_gamma0_{dil}_err']:.4f}")
+                logger.info(f"    SD_γ_{dil:<3s} = {r[f'SD_gamma_{dil}']:.6f}"
+                             f" ± {r[f'SD_gamma_{dil}_err']:.6f}")
+                logger.info(f"    δ₀_{dil:<3s}  = {r[f'delta0_{dil}']:.6f}"
+                             f" ± {r[f'delta0_{dil}_err']:.6f} cm⁻¹/atm")
             logger.info(f"    Res. σ     = {r['residual_std']:.4e}")
             logger.info(f"    QF         = {r['QF']:.1f}")
         logger.info(f"\n  结果已保存: {out_path}")
@@ -710,7 +818,8 @@ class CRDSPipeline:
             if not gas_dir.is_dir() or gas_dir.name.startswith("."):
                 continue
             gas_type = gas_dir.name
-            d = "O2" if gas_type == "O2" else "air"
+            # Step 3 单光谱: O₂ 用 "O2", O₂+N₂ 用 "air" 近似
+            diluents = ["O2"] if gas_type == "O2" else ["air"]
 
             for t_dir in sorted(gas_dir.iterdir()):
                 if not t_dir.is_dir() or t_dir.name.startswith("."):
@@ -736,7 +845,7 @@ class CRDSPipeline:
                         sw_scale = row.get("sw_scale_factor", 1.0)
                         if sw * sw_scale < 1e-35:
                             continue
-                        all_rows.append({
+                        rec = {
                             "gas_type": gas_type,
                             "transition": transition,
                             "pressure_label": pressure_label,
@@ -744,18 +853,20 @@ class CRDSPipeline:
                             "sw": sw * sw_scale,
                             "sw_raw": sw,
                             "sw_scale_factor": sw_scale,
-                            f"gamma0_{d}": row.get(f"gamma0_{d}", 0),
-                            f"gamma0_{d}_err": row.get(f"gamma0_{d}_err", 0),
-                            f"n_gamma0_{d}": row.get(f"n_gamma0_{d}", 0),
-                            f"delta0_{d}": row.get(f"delta0_{d}", 0),
-                            f"delta0_{d}_err": row.get(f"delta0_{d}_err", 0),
-                            f"SD_gamma_{d}": row.get(f"SD_gamma_{d}", 0),
-                            f"SD_gamma_{d}_err": row.get(f"SD_gamma_{d}_err", 0),
-                            f"SD_delta_{d}": row.get(f"SD_delta_{d}", 0),
                             "x_shift": x_shift,
                             "residual_std": residual_std,
                             "sw_vary": row.get("sw_vary", False),
-                        })
+                        }
+                        for dil in diluents:
+                            rec[f"gamma0_{dil}"] = row.get(f"gamma0_{dil}", 0)
+                            rec[f"gamma0_{dil}_err"] = row.get(f"gamma0_{dil}_err", 0)
+                            rec[f"n_gamma0_{dil}"] = row.get(f"n_gamma0_{dil}", 0)
+                            rec[f"delta0_{dil}"] = row.get(f"delta0_{dil}", 0)
+                            rec[f"delta0_{dil}_err"] = row.get(f"delta0_{dil}_err", 0)
+                            rec[f"SD_gamma_{dil}"] = row.get(f"SD_gamma_{dil}", 0)
+                            rec[f"SD_gamma_{dil}_err"] = row.get(f"SD_gamma_{dil}_err", 0)
+                            rec[f"SD_delta_{dil}"] = row.get(f"SD_delta_{dil}", 0)
+                        all_rows.append(rec)
 
         if not all_rows:
             logger.warning("\n  未找到任何有效拟合结果，跳过汇总")
@@ -835,7 +946,8 @@ class CRDSPipeline:
             if not gas_dir.is_dir() or gas_dir.name.startswith("."):
                 continue
             gas_type = gas_dir.name
-            d = "O2" if gas_type == "O2" else "air"
+            # Step 3 单光谱: O₂ 用 "O2", O₂+N₂ 用 "air" 近似
+            diluents = ["O2"] if gas_type == "O2" else ["air"]
 
             for t_dir in sorted(gas_dir.iterdir()):
                 if not t_dir.is_dir() or t_dir.name.startswith("."):
@@ -859,22 +971,24 @@ class CRDSPipeline:
                     fitted = param_df[param_df["sw_vary"] == True]
                     for _, row in fitted.iterrows():
                         scale = row.get("sw_scale_factor", 1.0)
-                        rows.append({
+                        rec = {
                             "pressure": pressure_label,
                             "nu_HITRAN": row["nu"],
                             "sw": row["sw"] * scale,
                             "sw_err": row.get("sw_err", 0) * scale,
-                            f"gamma0_{d}": row.get(f"gamma0_{d}", 0),
-                            f"gamma0_{d}_err": row.get(f"gamma0_{d}_err", 0),
-                            f"SD_gamma_{d}": row.get(f"SD_gamma_{d}", 0),
-                            f"SD_gamma_{d}_err": row.get(f"SD_gamma_{d}_err", 0),
-                            f"delta0_{d}": row.get(f"delta0_{d}", 0),
-                            f"delta0_{d}_err": row.get(f"delta0_{d}_err", 0),
-                            f"SD_delta_{d}": row.get(f"SD_delta_{d}", 0),
-                            f"SD_delta_{d}_err": row.get(f"SD_delta_{d}_err", 0),
                             "x_shift": x_shift,
                             "residual_std": residual_std,
-                        })
+                        }
+                        for dil in diluents:
+                            rec[f"gamma0_{dil}"] = row.get(f"gamma0_{dil}", 0)
+                            rec[f"gamma0_{dil}_err"] = row.get(f"gamma0_{dil}_err", 0)
+                            rec[f"SD_gamma_{dil}"] = row.get(f"SD_gamma_{dil}", 0)
+                            rec[f"SD_gamma_{dil}_err"] = row.get(f"SD_gamma_{dil}_err", 0)
+                            rec[f"delta0_{dil}"] = row.get(f"delta0_{dil}", 0)
+                            rec[f"delta0_{dil}_err"] = row.get(f"delta0_{dil}_err", 0)
+                            rec[f"SD_delta_{dil}"] = row.get(f"SD_delta_{dil}", 0)
+                            rec[f"SD_delta_{dil}_err"] = row.get(f"SD_delta_{dil}_err", 0)
+                        rows.append(rec)
 
                 if not rows:
                     continue

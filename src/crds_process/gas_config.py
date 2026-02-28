@@ -44,8 +44,19 @@ class GasConfig:
             self.o2_fraction = self.o2_pressure / self.total_pressure
 
     @property
+    def n2_fraction(self) -> float:
+        """N₂ 摩尔分数 (0~1)"""
+        if self.total_pressure > 0:
+            return self.n2_pressure / self.total_pressure
+        return 0.0
+
+    @property
     def diluent(self) -> str:
-        """MATS diluent 参数"""
+        """MATS diluent 参数
+
+        纯 O₂ → "O2"
+        O₂+N₂ 混合 → "air" (仅用于 MATS Spectrum 参数, 实际展宽由 Diluent 控制)
+        """
         return "O2" if self.gas_type == "O2" else "air"
 
     @property
@@ -55,12 +66,33 @@ class GasConfig:
 
     @property
     def Diluent(self) -> dict:
-        """MATS Diluent 参数"""
+        """MATS Diluent 参数 (单光谱拟合用)
+
+        纯 O₂:  单一稀释气 O₂
+        O₂+N₂: 用 air 近似 (单光谱无法分离 γ₀_O₂ 和 γ₀_N₂)
+        """
         if self.gas_type == "O2":
             return {"O2": {"composition": 1, "m": 31.9988}}
         else:
-            # O₂ + N₂ 混合: 用 air 近似稀释气
             return {"air": {"composition": 1, "m": 28.964}}
+
+    @property
+    def Diluent_dual(self) -> dict:
+        """MATS Diluent 参数 (多光谱联合拟合用, 双稀释气)
+
+        纯 O₂:  单一稀释气 O₂
+        O₂+N₂: 双稀释气, 按摩尔分数加权, 分别拟合 γ₀_O₂ 和 γ₀_N₂
+        """
+        if self.gas_type == "O2":
+            return {"O2": {"composition": 1, "m": 31.9988}}
+        else:
+            # O₂ + N₂ 混合: 双 diluent 分别对应 γ₀_O₂ 和 γ₀_N₂
+            o2_frac = self.o2_fraction
+            n2_frac = self.n2_fraction
+            return {
+                "O2": {"composition": o2_frac, "m": 31.9988},
+                "N2": {"composition": n2_frac, "m": 28.014},
+            }
 
     @property
     def label(self) -> str:
@@ -76,6 +108,7 @@ class GasConfig:
             diluent=self.diluent,
             molefraction=self.molefraction,
             Diluent=self.Diluent,
+            gas_type=self.gas_type,
         )
 
 

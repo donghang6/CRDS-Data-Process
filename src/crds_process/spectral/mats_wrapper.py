@@ -216,6 +216,9 @@ class HitranLinelistBuilder:
             "elower": data["elower"],
             "gamma0_O2": data["gamma_self"],
             "n_gamma0_O2": data["n_air"],  # 近似使用 n_air
+            # N₂ 展宽: 用 air 值作为初始猜测 (空气中 N₂ 占 ~78%)
+            "gamma0_N2": data["gamma_air"],
+            "n_gamma0_N2": data["n_air"],
         })
         margin = 5.0
         df = df[(df["nu"] >= wn_min - margin) & (df["nu"] <= wn_max + margin)]
@@ -223,21 +226,29 @@ class HitranLinelistBuilder:
         # 注意: n_gamma0_O2 已从 HITRAN 赋值，不在此列表中覆盖为 0
         # SD_gamma 设置非零初始值 (SDVP 线形需要)
         for col in [
-            "n_delta0_air", "n_delta0_O2",
+            "n_delta0_air", "n_delta0_O2", "n_delta0_N2",
             "SD_delta_air", "n_gamma2_air", "n_delta2_air",
             "n_gamma2_O2", "n_delta2_O2",
-            "nuVC_air", "nuVC_O2", "n_nuVC_air", "n_nuVC_O2",
-            "eta_air", "eta_O2", "y_air", "n_y_air", "y_O2", "n_y_O2",
+            "n_gamma2_N2", "n_delta2_N2",
+            "nuVC_air", "nuVC_O2", "nuVC_N2",
+            "n_nuVC_air", "n_nuVC_O2", "n_nuVC_N2",
+            "eta_air", "eta_O2", "eta_N2",
+            "y_air", "n_y_air", "y_O2", "n_y_O2",
+            "y_N2", "n_y_N2",
         ]:
             df[col] = 0.0
         # delta0_O2 初始猜测 (O₂ A-band 典型值 ~ -0.005 cm⁻¹/atm)
         df["delta0_O2"] = -0.005
+        # delta0_N2 初始猜测 (用已筛选的 air 值近似)
+        df["delta0_N2"] = df["delta0_air"].values
         # SD_delta 初始猜测
         df["SD_delta_air"] = 0.05
         df["SD_delta_O2"] = 0.05
+        df["SD_delta_N2"] = 0.05
         # SD_gamma 初始猜测 ~0.10 (O₂ A-band 典型值)
         df["SD_gamma_air"] = 0.10
         df["SD_gamma_O2"] = 0.10
+        df["SD_gamma_N2"] = 0.10
         df = df.reset_index(drop=True)
         if save_path:
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
@@ -271,20 +282,31 @@ class MATSFitResult:
                 sw = row.get("sw", 0)
                 gamma0_air = row.get("gamma0_air", 0)
                 gamma0_O2 = row.get("gamma0_O2", row.get("gamma0_self", 0))
+                gamma0_N2 = row.get("gamma0_N2", 0)
                 delta0_air = row.get("delta0_air", 0)
                 delta0_O2 = row.get("delta0_O2", row.get("delta0_self", 0))
+                delta0_N2 = row.get("delta0_N2", 0)
                 sd_gamma = row.get("SD_gamma_O2", row.get("SD_gamma_self", row.get("SD_gamma_air", 0)))
                 sd_delta = row.get("SD_delta_O2", row.get("SD_delta_self", row.get("SD_delta_air", 0)))
-                lines.append(
+                line_str = (
                     f"  Line: ν={nu:.6f} cm⁻¹, "
                     f"S={sw:.4e}, "
                     f"γ₀_O2={gamma0_O2:.5f}, "
                     f"γ₀_air={gamma0_air:.5f}, "
+                )
+                if gamma0_N2 != 0:
+                    line_str += f"γ₀_N2={gamma0_N2:.5f}, "
+                line_str += (
                     f"δ₀_O2={delta0_O2:.6f}, "
                     f"δ₀_air={delta0_air:.6f}, "
+                )
+                if delta0_N2 != 0:
+                    line_str += f"δ₀_N2={delta0_N2:.6f}, "
+                line_str += (
                     f"SD_γ={sd_gamma:.4f}, "
                     f"SD_δ={sd_delta:.4f}"
                 )
+                lines.append(line_str)
         return "\n".join(lines)
 
 
@@ -328,14 +350,17 @@ class MATSFitter:
         etalons: dict | None = None,
         fit_intensity: float = 1e-30,
         threshold_intensity: float = 1e-35,
+        gas_type: str = "O2",
     ):
         self.molecule = molecule
         self.isotopologue = isotopologue
         self.molefraction = molefraction or {molecule: 1.0}
         self.diluent = diluent
+        self.gas_type = gas_type
         # 显式设置 Diluent (与参考脚本一致)
         # 纯 O₂: Diluent={'O2': {'composition':1, 'm': 31.9988}}
-        # O₂+N₂: Diluent={'air': {'composition':1, 'm': 28.014}}
+        # O₂+N₂: Diluent={'O2': {'composition': x_O2, 'm': 31.9988},
+        #                  'N2': {'composition': x_N2, 'm': 28.014}}
         if Diluent is not None:
             self.Diluent = Diluent
         else:
@@ -411,11 +436,14 @@ class MATSFitter:
         labels: list[str],
         output_dir: Path | str,
         dataset_name: str = "crds_multi",
+        per_spectrum_diluent: list[dict] | None = None,
+        per_spectrum_molefraction: list[dict] | None = None,
+        fixed_params: dict | None = None,
     ) -> MATSFitResult:
         """多光谱联合拟合
 
         将多个压力下的光谱同时放入一个 Dataset 拟合，
-        线强 (sw)、���宽系数 (gamma0) 等参数在所有光谱间共享约束，
+        线强 (sw)、展宽系数 (gamma0) 等参数在所有光谱间共享约束，
         而基线和 x_shift 对每条光谱独立。
 
         Parameters
@@ -428,6 +456,13 @@ class MATSFitter:
             输出目录
         dataset_name : str
             数据集名
+        per_spectrum_diluent : list[dict], optional
+            每条光谱的 Diluent 字典 (O₂+N₂ 混合气时，各光谱 O₂/N₂ 比例不同)
+        per_spectrum_molefraction : list[dict], optional
+            每条光谱的 molefraction (O₂+N₂ 混合气时，O₂ 摩尔分数不同)
+        fixed_params : dict, optional
+            需要固定的线表参数 (如 {"gamma0_O2": 0.0508})。
+            这些参数会写入 param_linelist 初始值，并在拟合中设为不浮动。
 
         Returns
         -------
@@ -462,6 +497,15 @@ class MATSFitter:
             param_linelist = self._linelist_builder.build(
                 wn_global_min, wn_global_max, save_path=linelist_csv,
             )
+
+            # 应用固定参数值 (如纯 O₂ 结果中的 γ₀_O₂)
+            if fixed_params:
+                for col, val in fixed_params.items():
+                    if col in param_linelist.columns:
+                        param_linelist[col] = val
+                        logger.info(f"  固定参数: {col} = {val:.6f}")
+                # 重新保存更新后的 linelist
+                param_linelist.to_csv(linelist_csv, index=False)
             logger.info(f"  线表: {len(param_linelist)} 条谱线")
             for _, row in param_linelist.iterrows():
                 if row["sw"] > self.threshold_intensity:
@@ -479,12 +523,21 @@ class MATSFitter:
                 spec_csv = pd.read_csv(spec_name + ".csv")
                 has_stats = self._preparer.MATS_TAU_STATS in spec_csv.columns
 
+                # 支持每条光谱独立的 Diluent/molefraction (O₂+N₂ 双稀释气拟合)
+                spec_diluent = self.diluent
+                spec_molefraction = self.molefraction
+                spec_Diluent = self.Diluent
+                if per_spectrum_diluent and len(per_spectrum_diluent) > i:
+                    spec_Diluent = per_spectrum_diluent[i]
+                if per_spectrum_molefraction and len(per_spectrum_molefraction) > i:
+                    spec_molefraction = per_spectrum_molefraction[i]
+
                 spec = Spectrum(
                     spec_name,
-                    molefraction=self.molefraction,
+                    molefraction=spec_molefraction,
                     natural_abundance=True,
-                    diluent=self.diluent,
-                    Diluent=self.Diluent,
+                    diluent=spec_diluent,
+                    Diluent=spec_Diluent,
                     input_freq=False,
                     input_tau=True,
                     pressure_column=self._preparer.MATS_PRESSURE,
@@ -560,6 +613,16 @@ class MATSFitter:
                 weight_spectra=False,
             )
             params = fit.generate_params()
+
+            # 固定来自外部约束的参数 (如纯 O₂ 结果中的 γ₀_O₂)
+            if fixed_params:
+                for param_name in params:
+                    for fix_key, fix_val in fixed_params.items():
+                        # MATS 参数名格式: gamma0_O2_7_1_..., delta0_O2_7_1_...
+                        # 匹配: 参数名以 fix_key 开头且后面跟 _数字
+                        if param_name.startswith(fix_key + "_"):
+                            params[param_name].set(value=fix_val, vary=False)
+                            logger.info(f"    固定: {param_name} = {fix_val:.6f}")
 
             for param in params:
                 if not params[param].vary:
