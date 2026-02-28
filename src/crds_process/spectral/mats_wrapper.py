@@ -562,12 +562,18 @@ class MATSFitter:
             params = fit.generate_params()
 
             for param in params:
-                if "SD_gamma" in param and params[param].vary:
+                if not params[param].vary:
+                    continue
+                if "SD_gamma" in param:
                     params[param].set(value=0.10, min=0.01, max=0.25)
-                elif "SD_delta" in param and params[param].vary:
+                elif "SD_delta" in param:
                     params[param].set(value=0.05, min=0.0, max=0.25)
-                elif "delta0" in param and params[param].vary:
+                elif "delta0" in param:
                     params[param].set(min=-0.05, max=0.05)
+                elif "gamma0" in param and "n_gamma0" not in param:
+                    params[param].set(min=0.005, max=0.15)
+                elif param.startswith("sw_") or "_sw_" in param:
+                    params[param].set(min=1.0)
 
             result = fit.fit_data(params, wing_cutoff=25)
 
@@ -686,14 +692,29 @@ class MATSFitter:
         )
         params = fit.generate_params()
 
-        # SD_gamma / SD_delta / delta0 约束 (参考 Fitting_Protocol_ABand)
+        # 参数约束 (参考 Fitting_Protocol_ABand)
         for param in params:
-            if "SD_gamma" in param and params[param].vary:
+            if not params[param].vary:
+                continue
+            if "SD_gamma" in param:
                 params[param].set(value=0.10, min=0.01, max=0.25)
-            elif "SD_delta" in param and params[param].vary:
+            elif "SD_delta" in param:
                 params[param].set(value=0.05, min=0.0, max=0.25)
-            elif "delta0" in param and params[param].vary:
+            elif "delta0" in param:
                 params[param].set(min=-0.05, max=0.05)
+            elif "gamma0" in param and "n_gamma0" not in param:
+                # 展宽系数必须为正值
+                params[param].set(min=0.005, max=0.15)
+            elif param.startswith("sw_") or "_sw_" in param:
+                # 线强不能变为零/负值 (sw 已被 scale_factor 放大为 ~300)
+                params[param].set(min=1.0)
+
+        # 调试: 打印浮动参数及约束
+        for param in params:
+            if params[param].vary:
+                p = params[param]
+                logger.info(f"    Param: {param} = {p.value:.6g}  "
+                            f"[{p.min}, {p.max}]")
 
         result = fit.fit_data(params, wing_cutoff=25)
 

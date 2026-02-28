@@ -624,6 +624,7 @@ class EtalonRemover:
         )
         fit_mask = _build_exclude_mask(x, all_exclude)
         x_fit, y_fit = x[fit_mask], y[fit_mask]
+
         if len(x_fit) < 20:
             raise ValueError(f"排除后仅剩 {len(x_fit)} 个点，不足以拟合")
 

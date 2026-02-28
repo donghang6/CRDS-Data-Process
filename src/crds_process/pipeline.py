@@ -83,13 +83,19 @@ def _worker_ringdown(
         return f"  ✗ {label}: {e}"
 
 
-def _worker_etalon(csv_path: Path, output_dir: Path, label: str) -> str:
-    """子进程: 处理单个 (transition/pressure) 的标准具去除"""
+def _worker_etalon(csv_path: Path, output_dir: Path, label: str,
+                   gas_type: str = "O2") -> str:
+    """子进程: 处理单个 (transition/pressure) 的标准具去除
+
+    O2_N2 混合气体总压较高 (400~650 Torr)，HITRAN 模拟的吸收线翼区
+    延展更远，默认 1% 阈值会导致排除区域过大。因此对 O2_N2 使用：
+      - 更高的排除阈值 (根据压力自适应)
+      - 排除区域最大宽度限制 (0.4 cm⁻¹)
+    """
     import matplotlib
     matplotlib.use("Agg")
-    from crds_process.baseline.etalon import EtalonRemover
+    from crds_process.baseline.etalon import EtalonRemover, HitranAbsorptionDetector
     try:
-        remover = EtalonRemover()
         import pandas as pd
         df = pd.read_csv(csv_path)
         wn = df["wavenumber"].values
@@ -97,8 +103,51 @@ def _worker_etalon(csv_path: Path, output_dir: Path, label: str) -> str:
         temp = float(df["temperature"].mean())
         pres = float(df["pressure"].mean())
 
+        if gas_type == "O2_N2":
+            # O2_N2: 根据总压自适应提高排除阈值
+            # P ≤ 200 Torr: 基础 0.01; P > 200: 每增 100 Torr 翻倍, 上限 0.20
+            if pres <= 200:
+                ratio = 0.01
+            else:
+                excess = (pres - 200) / 100.0
+                ratio = min(0.01 * (2.0 ** excess), 0.20)
+            detector = HitranAbsorptionDetector(
+                threshold_ratio=ratio, margin=0.03,
+            )
+            remover = EtalonRemover(
+                hitran_detector=detector,
+                auto_snr_threshold=2.0,             # 更敏感地检测弱标准具分量
+                residual_improvement_threshold=0.02, # 2% 改善即接受新分量
+                n_iter=7,                            # 更多迭代次数提高精度
+            )
+        else:
+            remover = EtalonRemover()
+
         output_dir.mkdir(parents=True, exist_ok=True)
         result = remover.fit(wn, tau, temperature=temp, pressure_torr=pres)
+
+        # O2_N2: 检查排除区域并收缩过宽的区域后重新拟合
+        if gas_type == "O2_N2" and result.exclude_regions:
+            max_width = 0.4
+            need_refit = False
+            trimmed = []
+            for lo, hi in result.exclude_regions:
+                w = hi - lo
+                if w > max_width:
+                    center = (lo + hi) / 2.0
+                    lo = center - max_width / 2.0
+                    hi = center + max_width / 2.0
+                    need_refit = True
+                trimmed.append([lo, hi])
+            if need_refit:
+                remover_trim = EtalonRemover(
+                    exclude_regions=trimmed,
+                    auto_snr_threshold=2.0,
+                    residual_improvement_threshold=0.02,
+                    n_iter=7,
+                )
+                result = remover_trim.fit(wn, tau)
+
         title = f"Etalon Removal — {label}"
         result.plot(title=title, save_path=output_dir / "etalon_removal.png")
         result.save_csv(df, output_dir / "tau_etalon_corrected.csv")
@@ -279,7 +328,7 @@ class CRDSPipeline:
                 output_dir = self.etalon_root / gas_type / transition / pressure
                 label = f"{gas_type}/{transition}/{pressure}"
                 fut = pool.submit(
-                    _worker_etalon, csv_path, output_dir, label,
+                    _worker_etalon, csv_path, output_dir, label, gas_type,
                 )
                 futures.append((label, fut))
 
