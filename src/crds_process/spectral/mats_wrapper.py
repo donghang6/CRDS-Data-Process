@@ -1174,7 +1174,9 @@ class MATSFitter:
         fig.tight_layout()
         save_path = output_dir / "mats_fit.png"
         fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
-        logger.info(f"  图表已保存: {save_path}")
+        save_path_pdf = output_dir / "mats_fit.pdf"
+        fig.savefig(str(save_path_pdf), bbox_inches="tight")
+        logger.info(f"  图表已保存: {save_path}, {save_path_pdf}")
         plt.close(fig)
 
 
