@@ -38,8 +38,10 @@ Step 5: 线性回归提取 N₂ 展宽  (O₂+N₂ 单光谱 + 纯 O₂ 联合�
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -619,11 +621,135 @@ class CRDSPipeline:
         self.step3_mats()
         self.step4_multi_fit()
         self.step5_linear_regression()
+        self._build_master_table()
 
         elapsed = time.time() - t0
         logger.info(f"\n{'#' * 60}")
         logger.info(f"  全部完成! 耗时 {elapsed:.1f} s")
         logger.info(f"{'#' * 60}")
+
+    # ==============================================================
+    # 汇总表: 将所有拟合参数合并为一张主表
+    # ==============================================================
+    _MASTER_TABLE_NAME = "spectral_parameters.csv"
+
+    def _build_master_table(self) -> None:
+        """将 O₂ 多光谱联合拟合和 N₂ 线性回归的所有参数
+        合并为一张主表，以跃迁波数为第一列。
+
+        若表格已存在，先备份为 spectral_parameters_YYYYMMDD_HHMMSS.csv，
+        再写入新表。
+        """
+        logger.info("\n" + "=" * 60)
+        logger.info("  汇总: 构建参数主表")
+        logger.info("=" * 60)
+
+        rows: list[dict] = []
+
+        # 收集所有跃迁 (从 final/O2 和 final/O2_N2 中发现)
+        transitions: set[str] = set()
+        for sub in ["O2", "O2_N2"]:
+            d = self.final_root / sub
+            if d.exists():
+                for t_dir in d.iterdir():
+                    if t_dir.is_dir() and not t_dir.name.startswith("."):
+                        transitions.add(t_dir.name)
+
+        for transition in sorted(transitions):
+            rec: dict = {"nu": transition}
+
+            # ── O₂ 多光谱联合拟合 ──
+            o2_csv = self.final_root / "O2" / transition / "multi_fit_result.csv"
+            if o2_csv.exists():
+                try:
+                    o2_df = pd.read_csv(o2_csv)
+                    if not o2_df.empty:
+                        row = o2_df.iloc[0]
+                        rec["n_spectra_O2"] = int(row.get("n_spectra", 0))
+                        rec["QF_O2"] = row.get("QF", 0)
+                        rec["residual_std_O2"] = row.get("residual_std", 0)
+                        # 核心参数
+                        for param in ["sw", "gamma0_O2", "n_gamma0_O2",
+                                      "SD_gamma_O2", "delta0_O2", "SD_delta_O2"]:
+                            rec[param] = row.get(param, "")
+                            rec[f"{param}_err"] = row.get(f"{param}_err", "")
+                except Exception as e:
+                    logger.warning(f"  [{transition}] 读取 O₂ 结果失败: {e}")
+
+            # ── N₂ 线性回归 ──
+            n2_csv = (self.final_root / "O2_N2" / transition
+                      / "linear_regression_n2.csv")
+            if n2_csv.exists():
+                try:
+                    n2_df = pd.read_csv(n2_csv)
+                    for _, lr_row in n2_df.iterrows():
+                        param_base = lr_row["parameter"]  # gamma0, SD_gamma, ...
+                        col_n2 = f"{param_base}_N2"
+                        rec[col_n2] = lr_row["value_N2"]
+                        rec[f"{col_n2}_err"] = lr_row["uncertainty_N2"]
+                        rec[f"{col_n2}_R2"] = lr_row["R_squared"]
+                        rec[f"{col_n2}_npts"] = int(lr_row["n_points"])
+                except Exception as e:
+                    logger.warning(f"  [{transition}] 读取 N₂ 结果失败: {e}")
+
+            rows.append(rec)
+
+        if not rows:
+            logger.warning("  未找到任何拟合结果，跳过主表构建")
+            return
+
+        master_df = pd.DataFrame(rows)
+
+        # 列排序: nu → O₂ 参数 → N₂ 参数 → 辅助信息
+        desired_order = ["nu"]
+        # O₂ 参数 (值 + 误差 交替)
+        o2_params = ["sw", "gamma0_O2", "n_gamma0_O2",
+                     "SD_gamma_O2", "delta0_O2", "SD_delta_O2"]
+        for p in o2_params:
+            desired_order.append(p)
+            desired_order.append(f"{p}_err")
+        # N₂ 参数
+        n2_params = ["gamma0_N2", "SD_gamma_N2", "delta0_N2", "SD_delta_N2"]
+        for p in n2_params:
+            desired_order.append(p)
+            desired_order.append(f"{p}_err")
+            desired_order.append(f"{p}_R2")
+            desired_order.append(f"{p}_npts")
+        # 辅助列
+        desired_order.extend(["n_spectra_O2", "QF_O2", "residual_std_O2"])
+
+        # 只保留实际存在的列，按 desired_order 排序，其余追加在末尾
+        existing = list(master_df.columns)
+        ordered = [c for c in desired_order if c in existing]
+        remaining = [c for c in existing if c not in ordered]
+        master_df = master_df[ordered + remaining]
+
+        # ── 保存 (备份旧表) ──
+        out_path = self.final_root / self._MASTER_TABLE_NAME
+        if out_path.exists():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup = out_path.with_name(
+                f"{out_path.stem}_{ts}{out_path.suffix}")
+            shutil.copy2(out_path, backup)
+            logger.info(f"  已备份旧表: {backup.name}")
+
+        self.final_root.mkdir(parents=True, exist_ok=True)
+        master_df.to_csv(out_path, index=False)
+        logger.info(f"  参数主表已保存: {out_path}")
+
+        # 打印表格
+        logger.info(f"\n  {'─' * 80}")
+        logger.info(f"  参数主表 ({len(master_df)} 个跃迁)")
+        logger.info(f"  {'─' * 80}")
+        for _, row in master_df.iterrows():
+            logger.info(f"\n  ν = {row['nu']} cm⁻¹")
+            for col in master_df.columns:
+                if col == "nu":
+                    continue
+                val = row[col]
+                if pd.notna(val) and val != "":
+                    logger.info(f"    {col:<25s} = {val}")
+        logger.info(f"  {'─' * 80}")
 
     # ==============================================================
     # Step 4 辅助方法
@@ -646,13 +772,8 @@ class CRDSPipeline:
                 continue
             for _, row in fitted.iterrows():
                 sw_real = row["sw"] * row.get("sw_scale_factor", 1.0)
-                rec = {
-                    "pressure": p_dir.name,
-                    "sw": sw_real,
-                    "sw_raw": row["sw"],
-                }
+                rec = {"pressure": p_dir.name, "sw": sw_real, "sw_raw": row["sw"], "gamma0": row.get(gamma_col, 0)}
                 # 自适应列名: gamma0_O2 或 gamma0_air
-                rec["gamma0"] = row.get(gamma_col, 0)
                 records.append(rec)
         return records
 

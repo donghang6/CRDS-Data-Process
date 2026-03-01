@@ -1061,6 +1061,7 @@ class MATSFitter:
 
         # ── Panel 2: Baseline-subtracted (α − Background) ──
         ax = axes[1]
+        bsub_records: list[dict] = []   # 收集 baseline-subtracted 数据
         if bg_col and alpha_col:
             if is_multi:
                 for i, (spec_id, grp) in enumerate(groups):
@@ -1070,25 +1071,59 @@ class MATSFitter:
                     color = colors[i]
                     alpha_sub = grp[alpha_col].values[mask] - grp[bg_col].values[mask]
                     ax.plot(wn, alpha_sub, ".", ms=2, alpha=0.5, color=color)
+                    model_sub = None
                     if model_col:
                         model_sub = grp[model_col].values[mask] - grp[bg_col].values[mask]
                         ax.plot(wn, model_sub, "-", lw=1, color=color)
+                    # 提取压力标签
+                    import re
+                    plabel = f"Spec{spec_id}"
+                    if name_col and not grp[name_col].empty:
+                        m = re.search(r'(\d+Torr)', str(grp[name_col].iloc[0]))
+                        if m:
+                            plabel = m.group(1)
+                    for j in range(len(wn)):
+                        rec = {
+                            "wavenumber": wn[j],
+                            "spectrum": plabel,
+                            "alpha_minus_bg": alpha_sub[j],
+                        }
+                        if model_sub is not None:
+                            rec["model_minus_bg"] = model_sub[j]
+                        bsub_records.append(rec)
             else:
                 wn = _shifted_wn(1, wn_all)
                 mask = _clip_mask(wn)
                 wn = wn[mask]
                 alpha_sub = summary[alpha_col].values[mask] - summary[bg_col].values[mask]
                 ax.plot(wn, alpha_sub, "b.", ms=2, alpha=0.5, label="Data")
+                model_sub = None
                 if model_col:
                     model_sub = summary[model_col].values[mask] - summary[bg_col].values[mask]
                     ax.plot(wn, model_sub, "r-", lw=1, label="Fit")
                 ax.legend(fontsize=8)
+                for j in range(len(wn)):
+                    rec = {
+                        "wavenumber": wn[j],
+                        "spectrum": "single",
+                        "alpha_minus_bg": alpha_sub[j],
+                    }
+                    if model_sub is not None:
+                        rec["model_minus_bg"] = model_sub[j]
+                    bsub_records.append(rec)
             ax.axhline(0, color="gray", lw=0.5, ls="--")
             ax.set_ylabel("α − baseline (ppm/cm)")
             ax.set_title("Baseline-subtracted")
         else:
             ax.set_visible(False)
         ax.grid(True, alpha=0.3)
+
+        # 保存 baseline-subtracted 数据
+        if bsub_records:
+            bsub_df = pd.DataFrame(bsub_records)
+            bsub_path = output_dir / "baseline_subtracted.csv"
+            bsub_df.to_csv(str(bsub_path), index=False)
+            logger.info(f"  Baseline-subtracted 数据已保存: {bsub_path}")
 
         # ── Panel 3: Residuals ──
         ax = axes[2]
