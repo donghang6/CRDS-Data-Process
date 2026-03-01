@@ -219,6 +219,10 @@ class CRDSPipeline:
         线强筛选阈值 (默认 1e-35)
     refit_threshold : float
         参数相对误差阈值 (默认 0.5 即 50%)，超过则固定该参数并重新拟合
+    targets : list[str], optional
+        指定要处理的数据子集，格式为 "气体类型/跃迁" 或 "气体类型/跃迁/压力"。
+        例如: ["O2/9386.2076", "O2_N2/9386.2076/500Torr"]
+        默认 None 表示处理全部数据。
     """
 
     def __init__(
@@ -240,6 +244,7 @@ class CRDSPipeline:
         threshold_intensity: float = 1e-35,
         refit_threshold: float = 0.5,
         max_workers: int | None = None,
+        targets: list[str] | None = None,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -251,6 +256,9 @@ class CRDSPipeline:
 
         # ── 并行 ──
         self.max_workers = max_workers or min(os.cpu_count() or 1, 6)
+
+        # ── 目标过滤 ──
+        self.targets = targets  # e.g. ["O2/9386.2076", "O2_N2/9386.2076/500Torr"]
 
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
@@ -266,6 +274,77 @@ class CRDSPipeline:
 
 
     # ==============================================================
+    # 目标过滤
+    # ==============================================================
+    def _filter_tasks(
+        self,
+        tasks: list[tuple[str, str, str, Path]],
+    ) -> list[tuple[str, str, str, Path]]:
+        """根据 self.targets 过滤任务列表。
+
+        targets 条目格式:
+          - "O2"                      → 匹配该气体类型下所有数据
+          - "O2/9386.2076"            → 匹配该气体 + 跃迁下所有压力
+          - "O2/9386.2076/100Torr"    → 精确匹配气体 + 跃迁 + 压力
+
+        Parameters
+        ----------
+        tasks : list of (gas_type, transition, pressure, path)
+
+        Returns
+        -------
+        list of (gas_type, transition, pressure, path)
+        """
+        if not self.targets:
+            return tasks
+
+        filtered = []
+        for gas_type, transition, pressure, path in tasks:
+            for t in self.targets:
+                parts = t.strip("/").split("/")
+                if len(parts) == 1:
+                    # "O2" → match gas_type only
+                    if gas_type == parts[0]:
+                        filtered.append((gas_type, transition, pressure, path))
+                        break
+                elif len(parts) == 2:
+                    # "O2/9386.2076" → match gas_type + transition
+                    if gas_type == parts[0] and transition == parts[1]:
+                        filtered.append((gas_type, transition, pressure, path))
+                        break
+                elif len(parts) >= 3:
+                    # "O2/9386.2076/100Torr" → exact match
+                    if (gas_type == parts[0] and transition == parts[1]
+                            and pressure == parts[2]):
+                        filtered.append((gas_type, transition, pressure, path))
+                        break
+        return filtered
+
+    def _target_gas_types(self) -> set[str] | None:
+        """从 targets 中提取涉及的气体类型集合，None 表示全部"""
+        if not self.targets:
+            return None
+        gas_types = set()
+        for t in self.targets:
+            parts = t.strip("/").split("/")
+            gas_types.add(parts[0])
+        return gas_types
+
+    def _target_transitions(self, gas_type: str) -> set[str] | None:
+        """从 targets 中提取某气体类型下涉及的跃迁集合，None 表示全部"""
+        if not self.targets:
+            return None
+        transitions = set()
+        for t in self.targets:
+            parts = t.strip("/").split("/")
+            if parts[0] == gas_type:
+                if len(parts) >= 2:
+                    transitions.add(parts[1])
+                else:
+                    return None  # "O2" → all transitions
+        return transitions if transitions else None
+
+    # ==============================================================
     # Step 1: 衰荡时间处理
     # ==============================================================
     def step1_ringdown(self) -> None:
@@ -277,6 +356,7 @@ class CRDSPipeline:
         logger.info("=" * 60)
 
         tasks = discover_tasks(self.raw_root)
+        tasks = self._filter_tasks(tasks)
         if not tasks:
             logger.error(f"  未在 {self.raw_root} 下找到数据")
             return
@@ -323,6 +403,7 @@ class CRDSPipeline:
             for t, p, csv in proc.discover():
                 all_tasks.append((gas_type, t, p, csv))
 
+        all_tasks = self._filter_tasks(all_tasks)
         if not all_tasks:
             logger.error(f"  未在 {self.ringdown_root} 下找到数据")
             return
@@ -389,6 +470,7 @@ class CRDSPipeline:
             for t, p, csv in proc.discover():
                 all_tasks.append((gas_type, t, p, csv))
 
+        all_tasks = self._filter_tasks(all_tasks)
         if not all_tasks:
             logger.error(f"  未在 {self.etalon_root} 下找到数据")
             return
@@ -439,14 +521,22 @@ class CRDSPipeline:
                 continue
             gas_type = gas_dir.name
 
+            # 目标过滤: 跳过不在 targets 中的气体类型
+            target_gas = self._target_gas_types()
+            if target_gas and gas_type not in target_gas:
+                continue
+
             # O₂+N₂ 混合气: 跳过联合拟合, N₂ 展宽由 Step 5 线性回归提取
             if gas_type == "O2_N2":
                 logger.info(f"\n  [{gas_type}] 跳过多光谱联合拟合"
                             f" (N₂ 展宽将在 Step 5 通过线性回归提取)")
                 continue
 
+            target_trans = self._target_transitions(gas_type)
             for t_dir in sorted(gas_dir.iterdir()):
                 if not t_dir.is_dir() or t_dir.name.startswith("."):
+                    continue
+                if target_trans and t_dir.name not in target_trans:
                     continue
                 self._process_transition_multi_fit(
                     gas_type, t_dir.name)
@@ -615,6 +705,10 @@ class CRDSPipeline:
         logger.info(f"  线强筛选: {self.sw_sigma}σ (Step 4)")
         logger.info(f"  并行进程: {self.max_workers}")
         logger.info(f"  原始数据: {self.raw_root}")
+        if self.targets:
+            logger.info(f"  指定目标: {', '.join(self.targets)}")
+        else:
+            logger.info(f"  指定目标: 全部")
         logger.info(f"  日志文件: {log_path}")
         logger.info("=" * 60)
 
