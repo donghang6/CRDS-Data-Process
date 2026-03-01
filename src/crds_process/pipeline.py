@@ -1,9 +1,10 @@
-"""CRDS 四步处理流水线
+"""CRDS 五步处理流水线
 
 Step 1: 衰荡时间处理       (raw → ringdown_results.csv)
 Step 2: 去除标准具          (ringdown_results → tau_etalon_corrected.csv)
 Step 3: MATS 单光谱拟合    (etalon_corrected → 各压力独立拟合)
 Step 4: 筛选 + 多光谱联合拟合  (剔除线强离群点 → 联合拟合 → 最终参数)
+Step 5: 线性回归提取 N₂ 展宽  (O₂+N₂ 单光谱 + 纯 O₂ 联合拟合 → γ₀_N₂ 等)
 
 目录约定:
     data/raw/{跃迁波数}/{压力}/*.txt                       ← 原始数据
@@ -12,6 +13,7 @@ Step 4: 筛选 + 多光谱联合拟合  (剔除线强离群点 → 联合拟合 
     output/results/mats/{跃迁波数}/{压力}/                  ← Step 3 输出
     output/results/mats_multi/{跃迁波数}/                   ← Step 4 输出
     output/results/final/                                   ← 最终汇总
+    output/results/final/O2_N2/{跃迁}/linear_regression_*   ← Step 5 输出
 
 用法:
     # 默认参数
@@ -179,7 +181,7 @@ def _worker_mats(
 
 
 class CRDSPipeline:
-    """CRDS 四步处理流水线
+    """CRDS 五步处理流水线
 
     Parameters
     ----------
@@ -529,10 +531,85 @@ class CRDSPipeline:
             logger.exception("  详细错误信息:")
 
     # ==============================================================
-    # 完整四步流水线
+    # Step 5: 线性回归提取 N₂ 展宽
+    # ==============================================================
+    def step5_linear_regression(self) -> None:
+        """Step 5: 利用 O₂+N₂ 单光谱拟合结果 + 纯 O₂ 联合拟合结果，
+        通过线性回归提取 N₂ 展宽 / 位移参数。
+
+        物理基础:
+            γ₀_total = γ₀_O₂ · x_O₂ + γ₀_N₂ · x_N₂
+
+        固定 γ₀_O₂ (来自纯 O₂ 多光谱联合拟合)，
+        对各混合比的 γ₀_air 做加权线性回归提取 γ₀_N₂。
+        """
+        from crds_process.spectral.linear_regression import N2BroadeningExtractor
+
+        logger.info("\n" + "=" * 60)
+        logger.info("  Step 5 / 5 — 线性回归提取 N₂ 展宽参数")
+        logger.info("=" * 60)
+
+        # 遍历 O₂+N₂ 的各个跃迁
+        o2n2_dir = self.final_root / "O2_N2"
+        if not o2n2_dir.exists():
+            logger.warning("  未找到 O₂+N₂ 数据，跳过 Step 5")
+            return
+
+        for t_dir in sorted(o2n2_dir.iterdir()):
+            if not t_dir.is_dir() or t_dir.name.startswith("."):
+                continue
+            transition = t_dir.name
+
+            # 检查所需文件
+            mix_stats = t_dir / "fit_summary_statistics.csv"
+            o2_multi = self.final_root / "O2" / transition / "multi_fit_result.csv"
+
+            if not mix_stats.exists():
+                logger.warning(f"  [{transition}] 未找到 O₂+N₂ 单光谱统计表: "
+                               f"{mix_stats}")
+                continue
+            if not o2_multi.exists():
+                logger.warning(f"  [{transition}] 未找到纯 O₂ 联合拟合结果: "
+                               f"{o2_multi}")
+                logger.warning(f"  ⚠ 请先运行纯 O₂ 的 Step 4 联合拟合")
+                continue
+
+            logger.info(f"\n  [{transition}] 线性回归提取 N₂ 参数...")
+            logger.info(f"    O₂+N₂ 数据: {mix_stats}")
+            logger.info(f"    纯 O₂ 参考: {o2_multi}")
+
+            output_dir = t_dir  # 直接保存在 final/O2_N2/{transition}/ 下
+            extractor = N2BroadeningExtractor(
+                transition=transition,
+                outlier_sigma=self.sw_sigma,
+            )
+
+            try:
+                results = extractor.run(
+                    mix_stats_csv=mix_stats,
+                    o2_multi_csv=o2_multi,
+                    output_dir=output_dir,
+                )
+
+                if results:
+                    logger.info(f"\n  {'─' * 60}")
+                    logger.info(f"  线性回归结果 ({transition}):")
+                    logger.info(f"  {'─' * 60}")
+                    for name, r in results.items():
+                        logger.info(r.summary())
+                    logger.info(f"  {'─' * 60}")
+                else:
+                    logger.warning(f"  [{transition}] 线性回归无有效结果")
+
+            except Exception as e:
+                logger.error(f"  [{transition}] 线性回归失败: {e}")
+                logger.exception("  详细错误信息:")
+
+    # ==============================================================
+    # 完整五步流水线
     # ==============================================================
     def run(self) -> None:
-        """执行完整的 CRDS 四步处理流水线"""
+        """执行完整的 CRDS 五步处理流水线"""
         log_path = setup_logging()
         t0 = time.time()
 
@@ -542,6 +619,7 @@ class CRDSPipeline:
         logger.info("  Step 2: 去除标准具效应")
         logger.info("  Step 3: MATS 单光谱拟合 (各压力独立)")
         logger.info("  Step 4: 筛选 + 多光谱联合拟合 (最终结果)")
+        logger.info("  Step 5: 线性回归提取 N₂ 展宽")
         logger.info("=" * 60)
         logger.info(f"  线形:     {self.lineprofile}")
         logger.info(f"  线强筛选: {self.sw_sigma}σ (Step 4)")
@@ -554,6 +632,7 @@ class CRDSPipeline:
         self.step2_etalon()
         self.step3_mats()
         self.step4_multi_fit()
+        self.step5_linear_regression()
 
         elapsed = time.time() - t0
         logger.info(f"\n{'#' * 60}")

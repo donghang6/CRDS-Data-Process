@@ -8,6 +8,10 @@ from crds_process.spectral.mats_wrapper import (
     MATSBatchProcessor,
     batch_mats_fitting,
 )
+from crds_process.spectral.linear_regression import (
+    N2BroadeningExtractor,
+    LinearRegressionResult,
+)
 
 __all__ = [
     "MATSSpectrumPreparer",
@@ -16,4 +20,6 @@ __all__ = [
     "MATSFitResult",
     "MATSBatchProcessor",
     "batch_mats_fitting",
+    "N2BroadeningExtractor",
+    "LinearRegressionResult",
 ]
