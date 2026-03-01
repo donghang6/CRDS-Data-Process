@@ -537,6 +537,7 @@ class CRDSPipeline:
         logger.info("  Step 5 / 5 — 线性回归提取 N₂ 展宽参数")
         logger.info("=" * 60)
 
+
         # 遍历 O₂+N₂ 的各个跃迁
         o2n2_dir = self.final_root / "O2_N2"
         if not o2n2_dir.exists():
@@ -557,9 +558,10 @@ class CRDSPipeline:
                                f"{mix_stats}")
                 continue
             if not o2_multi.exists():
-                logger.warning(f"  [{transition}] 未找到纯 O₂ 联合拟合结果: "
-                               f"{o2_multi}")
-                logger.warning(f"  ⚠ 请先运行纯 O₂ 的 Step 4 联合拟合")
+                logger.warning(f"  [{transition}] 未找到该跃迁对应的纯 O₂ "
+                               f"多光谱联合拟合结果，跳过 N₂ 线性回归")
+                logger.warning(f"    缺少: {o2_multi}")
+                logger.warning(f"    ⚠ 请先对该跃迁运行纯 O₂ 的 Step 4 联合拟合")
                 continue
 
             logger.info(f"\n  [{transition}] 线性回归提取 N₂ 参数...")
