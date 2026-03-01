@@ -409,11 +409,14 @@ class CRDSPipeline:
         self._collect_final_summary()
 
     # ==============================================================
-    # Step 4: 筛选线强离群点 + 多光谱联合拟合
+    # Step 4: 筛选线强离群点 + 多光谱联合拟合 (仅纯 O₂)
     # ==============================================================
     def step4_multi_fit(self) -> None:
         """Step 4: 根据 Step 3 单光谱结果筛除线强离群点，
-        用剩余光谱做多光谱联合拟合 (按气体类型分别处理)。
+        用剩余光谱做多光谱联合拟合。
+
+        仅对纯 O₂ 数据执行联合拟合；
+        O₂+N₂ 混合气的 N₂ 展宽由 Step 5 线性回归提取。
         """
         if not self.mats_root.exists():
             logger.error(f"   Step 3 结果不存在: {self.mats_root}")
@@ -421,13 +424,20 @@ class CRDSPipeline:
             return
 
         logger.info("\n" + "=" * 60)
-        logger.info(f"  Step 4 / 4 — 筛选 + 多光谱联合拟合 (σ={self.sw_sigma})")
+        logger.info(f"  Step 4 / 5 — 筛选 + 多光谱联合拟合 (σ={self.sw_sigma})")
         logger.info("=" * 60)
 
         for gas_dir in sorted(self.mats_root.iterdir()):
             if not gas_dir.is_dir() or gas_dir.name.startswith("."):
                 continue
             gas_type = gas_dir.name
+
+            # O₂+N₂ 混合气: 跳过联合拟合, N₂ 展宽由 Step 5 线性回归提取
+            if gas_type == "O2_N2":
+                logger.info(f"\n  [{gas_type}] 跳过多光谱联合拟合"
+                            f" (N₂ 展宽将在 Step 5 通过线性回归提取)")
+                continue
+
             for t_dir in sorted(gas_dir.iterdir()):
                 if not t_dir.is_dir() or t_dir.name.startswith("."):
                     continue
@@ -436,13 +446,15 @@ class CRDSPipeline:
 
     def _process_transition_multi_fit(self, gas_type: str,
                                       transition: str) -> None:
-        """对单个 (气体类型, 跃迁) 执行线强筛选 + 多光谱联合拟合"""
+        """对单个 (气体类型, 跃迁) 执行线强筛选 + 多光谱联合拟合
+
+        仅用于纯 O₂ 数据。
+        """
         t_dir = self.mats_root / gas_type / transition
         tag = f"{gas_type}/{transition}"
 
         # ---- 1. 收集 Step 3 各压力点的拟合线强 ----
-        # Step 3 单光谱用 air 近似, Step 4 多光谱用双稀释气
-        diluent_col = "gamma0_O2" if gas_type == "O2" else "gamma0_air"
+        diluent_col = "gamma0_O2"
         records = self._collect_sw_records(t_dir, diluent_col)
         if not records:
             logger.info(f"\n  [{tag}] 未找到 Step 3 拟合结果，跳过")
@@ -470,34 +482,6 @@ class CRDSPipeline:
         base_kw = self._base_fitter_kwargs()
         base_kw.update(fitter_kw)
 
-        # O₂+N₂ 双稀释气: 每条光谱的 Diluent/molefraction 不同
-        per_spectrum_diluent = None
-        per_spectrum_molefraction = None
-        fixed_params = None
-        if gas_type == "O2_N2":
-            from crds_process.gas_config import parse_gas_dir
-            per_spectrum_diluent = []
-            per_spectrum_molefraction = []
-            for _, r in kept.iterrows():
-                gc = parse_gas_dir(r["pressure"], gas_type)
-                per_spectrum_diluent.append(gc.Diluent_dual)
-                per_spectrum_molefraction.append(gc.molefraction)
-                logger.info(f"    {r['pressure']}: O₂={gc.o2_fraction:.3f}, "
-                          f"N₂={gc.n2_fraction:.3f}")
-            # Diluent 基础设置: 使用双稀释气模式
-            # (第一个光谱的 Diluent_dual 用于 linelist 列名识别)
-            base_kw["Diluent"] = per_spectrum_diluent[0]
-
-            # 从纯 O₂ 多光谱联合拟合结果中读取 γ₀_O₂, 固定在 N₂ 展宽拟合中
-            fixed_params = self._load_o2_fixed_params(transition)
-            if fixed_params:
-                logger.info(f"\n  从纯 O₂ 联合拟合结果中约束参数:")
-                for k, v in fixed_params.items():
-                    logger.info(f"    {k} = {v:.6f} (固定)")
-            else:
-                logger.warning(f"  ⚠ 未找到纯 O₂ 联合拟合结果, "
-                             f"γ₀_O₂ 和 γ₀_N₂ 将同时浮动拟合")
-
         from crds_process.spectral.mats_wrapper import MATSFitter
         fitter = MATSFitter(**base_kw)
 
@@ -510,9 +494,6 @@ class CRDSPipeline:
                 labels=labels,
                 output_dir=multi_out,
                 dataset_name=f"{transition}_multi",
-                per_spectrum_diluent=per_spectrum_diluent,
-                per_spectrum_molefraction=per_spectrum_molefraction,
-                fixed_params=fixed_params,
             )
             if (result and result.summary_df is not None
                     and not result.summary_df.empty):
@@ -618,7 +599,7 @@ class CRDSPipeline:
         logger.info("  Step 1: 衰荡时间处理")
         logger.info("  Step 2: 去除标准具效应")
         logger.info("  Step 3: MATS 单光谱拟合 (各压力独立)")
-        logger.info("  Step 4: 筛选 + 多光谱联合拟合 (最终结果)")
+        logger.info("  Step 4: 筛选 + 多光谱联合拟合 (纯 O₂)")
         logger.info("  Step 5: 线性回归提取 N₂ 展宽")
         logger.info("=" * 60)
         logger.info(f"  线形:     {self.lineprofile}")
@@ -642,77 +623,6 @@ class CRDSPipeline:
     # ==============================================================
     # Step 4 辅助方法
     # ==============================================================
-    def _load_o2_fixed_params(self, transition: str) -> dict | None:
-        """从纯 O₂ 多光谱联合拟合结果中读取 γ₀_O₂ 等参数
-
-        用于 O₂+N₂ 双稀释气拟合时固定 O₂ 自展宽系数，
-        只让 N₂ 外展宽系数 (γ₀_N₂) 自由浮动。
-
-        只固定拟合可靠的参数 (相对误差 < 50%)，
-        误差过大的参数不固定，让其在 O₂+N₂ 拟合中重新确定。
-
-        Parameters
-        ----------
-        transition : str
-            跃迁波数 (如 "9386.2076")
-
-        Returns
-        -------
-        dict | None
-            {"gamma0_O2": value, ...} 若未找到纯 O₂ 结果则返回 None
-        """
-        o2_result_path = (self.mats_multi_root / "O2" / transition
-                          / "multi_fit_result.csv")
-        if not o2_result_path.exists():
-            # 回退: 尝试 final 目录
-            o2_result_path = (self.final_root / "O2" / transition
-                              / "multi_fit_result.csv")
-        if not o2_result_path.exists():
-            return None
-
-        try:
-            o2_df = pd.read_csv(o2_result_path)
-            if o2_df.empty:
-                return None
-
-            row = o2_df.iloc[0]
-            fixed = {}
-
-            def _is_reliable(col: str) -> bool:
-                """判断参数拟合是否可靠 (相对误差 < 50%)"""
-                val = row.get(col, 0)
-                err = row.get(f"{col}_err", 0)
-                if val == 0 or abs(val) < 1e-10:
-                    return False
-                if err == 0:
-                    return True  # 无误差信息, 信任该值
-                return abs(err / val) < 0.5
-
-            # γ₀_O₂ — 核心参数 (最重要, 必须可靠)
-            if "gamma0_O2" in row and row["gamma0_O2"] > 0 and _is_reliable("gamma0_O2"):
-                fixed["gamma0_O2"] = float(row["gamma0_O2"])
-
-            # n_γ₀_O₂ — 温度依赖指数
-            if "n_gamma0_O2" in row and row["n_gamma0_O2"] > 0:
-                fixed["n_gamma0_O2"] = float(row["n_gamma0_O2"])
-
-            # SD_γ_O₂ — 速度依赖展宽
-            if "SD_gamma_O2" in row and row["SD_gamma_O2"] > 0 and _is_reliable("SD_gamma_O2"):
-                fixed["SD_gamma_O2"] = float(row["SD_gamma_O2"])
-
-            # δ₀_O₂ — 压力位移 (仅在可靠时固定)
-            if "delta0_O2" in row and _is_reliable("delta0_O2"):
-                fixed["delta0_O2"] = float(row["delta0_O2"])
-
-            # SD_δ_O₂ — 速度依赖位移 (仅在可靠时固定)
-            if "SD_delta_O2" in row and _is_reliable("SD_delta_O2"):
-                fixed["SD_delta_O2"] = float(row["SD_delta_O2"])
-
-            return fixed if fixed else None
-
-        except Exception as e:
-            logger.warning(f"  读取纯 O₂ 结果失败: {e}")
-            return None
 
     @staticmethod
     def _collect_sw_records(t_dir: Path,
@@ -812,7 +722,7 @@ class CRDSPipeline:
     def _save_multi_fit_summary(self, result, output_dir: Path,
                                 gas_type: str, transition: str,
                                 labels: list[str]) -> None:
-        """保存多光谱联合拟合的最终统计 CSV"""
+        """保存多光谱联合拟合的最终统计 CSV (仅纯 O₂)"""
         if result is None or result.param_linelist.empty:
             return
 
@@ -821,11 +731,7 @@ class CRDSPipeline:
         if fitted.empty:
             return
 
-        # 根据气体类型决定展宽/位移列名
-        is_dual = gas_type == "O2_N2"
-        # O₂+N₂ 双稀释气: 输出 O2 和 N2 两套参数
-        # 纯 O₂: 只输出 O2 一套参数
-        diluents_to_output = ["O2", "N2"] if is_dual else ["O2"]
+        diluents_to_output = ["O2"]
 
         rows: list[dict] = []
         for _, row in fitted.iterrows():
