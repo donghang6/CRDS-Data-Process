@@ -929,6 +929,7 @@ class MATSFitter:
         tau_col = _find_col(["Tau"])
         spec_col = _find_col(["Spectrum", "Number"])
         name_col = _find_col(["Spectrum", "Name"])
+        bg_col = _find_col(["Background"])
 
         if wn_col is None:
             logger.warning(f"  找不到波数列，可用: {list(summary.columns)}")
@@ -941,7 +942,8 @@ class MATSFitter:
         # 全局波数范围
         wn_all = summary[wn_col].values
 
-        fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+        fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True,
+                                 gridspec_kw={"height_ratios": [3, 3, 2, 3]})
 
         # 读取各光谱的 x_shift (从 baseline_linelist)
         x_shifts = {}
@@ -1057,8 +1059,39 @@ class MATSFitter:
         ax.legend(fontsize=8, ncol=3, loc="upper right")
         ax.grid(True, alpha=0.3)
 
-        # ── Panel 2: Residuals ──
+        # ── Panel 2: Baseline-subtracted (α − Background) ──
         ax = axes[1]
+        if bg_col and alpha_col:
+            if is_multi:
+                for i, (spec_id, grp) in enumerate(groups):
+                    wn = _shifted_wn(spec_id, grp[wn_col].values)
+                    mask = _clip_mask(wn)
+                    wn = wn[mask]
+                    color = colors[i]
+                    alpha_sub = grp[alpha_col].values[mask] - grp[bg_col].values[mask]
+                    ax.plot(wn, alpha_sub, ".", ms=2, alpha=0.5, color=color)
+                    if model_col:
+                        model_sub = grp[model_col].values[mask] - grp[bg_col].values[mask]
+                        ax.plot(wn, model_sub, "-", lw=1, color=color)
+            else:
+                wn = _shifted_wn(1, wn_all)
+                mask = _clip_mask(wn)
+                wn = wn[mask]
+                alpha_sub = summary[alpha_col].values[mask] - summary[bg_col].values[mask]
+                ax.plot(wn, alpha_sub, "b.", ms=2, alpha=0.5, label="Data")
+                if model_col:
+                    model_sub = summary[model_col].values[mask] - summary[bg_col].values[mask]
+                    ax.plot(wn, model_sub, "r-", lw=1, label="Fit")
+                ax.legend(fontsize=8)
+            ax.axhline(0, color="gray", lw=0.5, ls="--")
+            ax.set_ylabel("α − baseline (ppm/cm)")
+            ax.set_title("Baseline-subtracted")
+        else:
+            ax.set_visible(False)
+        ax.grid(True, alpha=0.3)
+
+        # ── Panel 3: Residuals ──
+        ax = axes[2]
         if res_col:
             if is_multi:
                 for i, (spec_id, grp) in enumerate(groups):
@@ -1083,8 +1116,8 @@ class MATSFitter:
             ax.set_title(f"Residual (σ={res_std:.4e})")
         ax.grid(True, alpha=0.3)
 
-        # ── Panel 3: Tau ──
-        ax = axes[2]
+        # ── Panel 4: Tau ──
+        ax = axes[3]
         if tau_col and "Error" not in tau_col:
             if is_multi:
                 for i, (spec_id, grp) in enumerate(groups):
