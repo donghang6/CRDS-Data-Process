@@ -351,6 +351,7 @@ class MATSFitter:
         fit_intensity: float = 1e-30,
         threshold_intensity: float = 1e-35,
         gas_type: str = "O2",
+        refit_threshold: float = 0.5,
     ):
         self.molecule = molecule
         self.isotopologue = isotopologue
@@ -375,10 +376,78 @@ class MATSFitter:
         self.etalons = etalons or {}
         self.fit_intensity = fit_intensity
         self.threshold_intensity = threshold_intensity
+        self.refit_threshold = refit_threshold
         self._preparer = MATSSpectrumPreparer()
         self._linelist_builder = HitranLinelistBuilder(
             molecule=molecule, isotopologue=isotopologue,
         )
+
+    # ----------------------------------------------------------
+    # 参数可靠性检查 & 重拟合辅助方法
+    # ----------------------------------------------------------
+    @staticmethod
+    def _apply_param_constraints(params):
+        """对浮动参数施加物理约束"""
+        for param in params:
+            if not params[param].vary:
+                continue
+            if "SD_gamma" in param:
+                params[param].set(value=0.10, min=0.01, max=0.25)
+            elif "SD_delta" in param:
+                params[param].set(value=0.05, min=0.0, max=0.25)
+            elif "delta0" in param:
+                params[param].set(min=-0.05, max=0.05)
+            elif "gamma0" in param and "n_gamma0" not in param:
+                params[param].set(min=0.005, max=0.15)
+            elif param.startswith("sw_") or "_sw_" in param:
+                params[param].set(min=1.0)
+        return params
+
+    def _find_unreliable_params(self, result) -> dict[str, float]:
+        """检查拟合结果，找出相对误差超过阈值的参数
+
+        Parameters
+        ----------
+        result : lmfit MinimizerResult
+            拟合结果
+
+        Returns
+        -------
+        dict[str, float]
+            {参数名: 第一次拟合值} 需要固定的参数
+        """
+        to_fix: dict[str, float] = {}
+        if result is None or not hasattr(result, "params"):
+            return to_fix
+
+        # 只检查光谱学物理参数 (不检查基线、x_shift 等)
+        spectral_keys = [
+            "gamma0", "n_gamma0", "SD_gamma",
+            "delta0", "n_delta0", "SD_delta",
+            "nuVC", "eta",
+        ]
+
+        for pname, par in result.params.items():
+            if not par.vary:
+                continue
+            # 是否是光谱学参数
+            is_spectral = any(k in pname for k in spectral_keys)
+            if not is_spectral:
+                continue
+            # 检查相对误差
+            val = par.value
+            err = par.stderr
+            if err is None or err == 0:
+                continue
+            if val == 0 or abs(val) < 1e-15:
+                # 值本身为零，误差无论多大都不可靠
+                to_fix[pname] = val
+                continue
+            rel_err = abs(err / val)
+            if rel_err > self.refit_threshold:
+                to_fix[pname] = val
+
+        return to_fix
 
     def fit(
         self,
@@ -604,7 +673,7 @@ class MATSFitter:
             param_file = fitparam.param_linelist_savename
             base_file = fitparam.base_linelist_savename
 
-            # 拟合
+            # 拟合 (含自动重拟合)
             logger.info(f"  开始多光谱联合拟合 ({self.lineprofile} 线形, "
                   f"{len(spectra)} 光谱)...")
             fit = Fit_DataSet(
@@ -618,27 +687,41 @@ class MATSFitter:
             if fixed_params:
                 for param_name in params:
                     for fix_key, fix_val in fixed_params.items():
-                        # MATS 参数名格式: gamma0_O2_7_1_..., delta0_O2_7_1_...
-                        # 匹配: 参数名以 fix_key 开头且后面跟 _数字
                         if param_name.startswith(fix_key + "_"):
                             params[param_name].set(value=fix_val, vary=False)
                             logger.info(f"    固定: {param_name} = {fix_val:.6f}")
 
-            for param in params:
-                if not params[param].vary:
-                    continue
-                if "SD_gamma" in param:
-                    params[param].set(value=0.10, min=0.01, max=0.25)
-                elif "SD_delta" in param:
-                    params[param].set(value=0.05, min=0.0, max=0.25)
-                elif "delta0" in param:
-                    params[param].set(min=-0.05, max=0.05)
-                elif "gamma0" in param and "n_gamma0" not in param:
-                    params[param].set(min=0.005, max=0.15)
-                elif param.startswith("sw_") or "_sw_" in param:
-                    params[param].set(min=1.0)
+            self._apply_param_constraints(params)
 
+            # 第一次拟合
             result = fit.fit_data(params, wing_cutoff=25)
+
+            # 检查参数可靠性, 必要时固定不可靠参数并重拟合
+            unreliable = self._find_unreliable_params(result)
+            if unreliable:
+                logger.info(f"\n  检测到 {len(unreliable)} 个不可靠参数 "
+                            f"(相对误差 > {self.refit_threshold*100:.0f}%):")
+                for pname, pval in unreliable.items():
+                    stderr = result.params[pname].stderr or 0
+                    rel = abs(stderr / pval) * 100 if pval != 0 else float("inf")
+                    logger.info(f"    {pname} = {pval:.6g} ± {stderr:.4g} "
+                                f"(相对误差 {rel:.0f}%) → 固定")
+
+                # 重新生成参数并固定不可靠参数 + 外部约束
+                params2 = fit.generate_params()
+                if fixed_params:
+                    for param_name in params2:
+                        for fix_key, fix_val in fixed_params.items():
+                            if param_name.startswith(fix_key + "_"):
+                                params2[param_name].set(value=fix_val, vary=False)
+                self._apply_param_constraints(params2)
+                for pname, pval in unreliable.items():
+                    if pname in params2:
+                        params2[pname].set(value=pval, vary=False)
+
+                logger.info(f"\n  使用 {sum(1 for p in params2 if params2[p].vary)} "
+                            f"个浮动参数重新拟合...")
+                result = fit.fit_data(params2, wing_cutoff=25)
 
             # 更新参数 & 生成结果
             fit.residual_analysis(result, indv_resid_plot=False)
@@ -746,7 +829,7 @@ class MATSFitter:
         param_file = fitparam.param_linelist_savename
         base_file = fitparam.base_linelist_savename
 
-        # ---- Step 7: 拟合 ----
+        # ---- Step 7: 拟合 (含自动重拟合) ----
         logger.info(f"  开始拟合 ({self.lineprofile} 线形)...")
         fit = Fit_DataSet(
             ds, base_file, param_file,
@@ -755,22 +838,8 @@ class MATSFitter:
         )
         params = fit.generate_params()
 
-        # 参数约束 (参考 Fitting_Protocol_ABand)
-        for param in params:
-            if not params[param].vary:
-                continue
-            if "SD_gamma" in param:
-                params[param].set(value=0.10, min=0.01, max=0.25)
-            elif "SD_delta" in param:
-                params[param].set(value=0.05, min=0.0, max=0.25)
-            elif "delta0" in param:
-                params[param].set(min=-0.05, max=0.05)
-            elif "gamma0" in param and "n_gamma0" not in param:
-                # 展宽系数必须为正值
-                params[param].set(min=0.005, max=0.15)
-            elif param.startswith("sw_") or "_sw_" in param:
-                # 线强不能变为零/负值 (sw 已被 scale_factor 放大为 ~300)
-                params[param].set(min=1.0)
+        # 参数约束
+        self._apply_param_constraints(params)
 
         # 调试: 打印浮动参数及约束
         for param in params:
@@ -779,7 +848,30 @@ class MATSFitter:
                 logger.info(f"    Param: {param} = {p.value:.6g}  "
                             f"[{p.min}, {p.max}]")
 
+        # 第一次拟合
         result = fit.fit_data(params, wing_cutoff=25)
+
+        # 检查参数可靠性, 必要时固定不可靠参数并重拟合
+        unreliable = self._find_unreliable_params(result)
+        if unreliable:
+            logger.info(f"\n  检测到 {len(unreliable)} 个不可靠参数 "
+                        f"(相对误差 > {self.refit_threshold*100:.0f}%):")
+            for pname, pval in unreliable.items():
+                stderr = result.params[pname].stderr or 0
+                rel = abs(stderr / pval) * 100 if pval != 0 else float("inf")
+                logger.info(f"    {pname} = {pval:.6g} ± {stderr:.4g} "
+                            f"(相对误差 {rel:.0f}%) → 固定")
+
+            # 重新生成参数并固定不可靠参数
+            params2 = fit.generate_params()
+            self._apply_param_constraints(params2)
+            for pname, pval in unreliable.items():
+                if pname in params2:
+                    params2[pname].set(value=pval, vary=False)
+
+            logger.info(f"\n  使用 {sum(1 for p in params2 if params2[p].vary)} "
+                        f"个浮动参数重新拟合...")
+            result = fit.fit_data(params2, wing_cutoff=25)
 
         # ---- Step 8: 更新参数 & 生成结果 ----
         fit.residual_analysis(result, indv_resid_plot=False)

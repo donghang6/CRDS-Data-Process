@@ -215,6 +215,8 @@ class CRDSPipeline:
         拟合线强阈值 (默认 1e-30)
     threshold_intensity : float
         线强筛选阈值 (默认 1e-35)
+    refit_threshold : float
+        参数相对误差阈值 (默认 0.5 即 50%)，超过则固定该参数并重新拟合
     """
 
     def __init__(
@@ -234,6 +236,7 @@ class CRDSPipeline:
         baseline_order: int = 1,
         fit_intensity: float = 1e-30,
         threshold_intensity: float = 1e-35,
+        refit_threshold: float = 0.5,
         max_workers: int | None = None,
     ):
         # ── 路径 ──
@@ -257,6 +260,7 @@ class CRDSPipeline:
         self.baseline_order = baseline_order
         self.fit_intensity = fit_intensity
         self.threshold_intensity = threshold_intensity
+        self.refit_threshold = refit_threshold
 
 
     # ==============================================================
@@ -350,6 +354,7 @@ class CRDSPipeline:
             baseline_order=self.baseline_order,
             fit_intensity=self.fit_intensity,
             threshold_intensity=self.threshold_intensity,
+            refit_threshold=self.refit_threshold,
         )
 
     def _fitter_kwargs_for_gas(self, gas_type: str,
