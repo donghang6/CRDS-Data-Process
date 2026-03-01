@@ -313,7 +313,8 @@ class N2BroadeningExtractor:
         y = y_obs - gamma_O2_fixed * x_O2
 
         # 权重 (1/σ²), 零误差时等权
-        w = np.where(y_err > 0, 1.0 / y_err**2, np.ones(n))
+        safe_err = np.where(y_err > 0, y_err, 1.0)
+        w = np.where(y_err > 0, 1.0 / safe_err**2, np.ones(n))
 
         # 离群点筛选 (如果数据点 >= 4)
         mask = np.ones(n, dtype=bool)
