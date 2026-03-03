@@ -51,6 +51,7 @@ import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -191,6 +192,41 @@ def _worker_mats(
         return f"  ✗ {label}: {e}"
 
 
+def _worker_trial_multi_fit(
+    etalon_csvs: list[Path],
+    labels: list[str],
+    fitter_kwargs: dict,
+    transition: str,
+    combo: tuple[str, ...],
+) -> tuple[tuple[str, ...], float]:
+    """子进程: 对一个压力组合执行试拟合，返回 (combo, QF)。
+
+    轻量版本: 在临时目录中拟合，不保存最终输出，仅获取 QF 值。
+    拟合失败时返回 (combo, -1.0)。
+    """
+    import tempfile
+    import matplotlib
+    matplotlib.use("Agg")
+    from crds_process.spectral.mats_wrapper import MATSFitter
+
+    if len(etalon_csvs) < 2:
+        return combo, -1.0
+
+    try:
+        fitter = MATSFitter(**fitter_kwargs)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = fitter.fit_multi(
+                etalon_csvs=etalon_csvs,
+                labels=labels,
+                output_dir=Path(tmp_dir),
+                dataset_name=f"{transition}_trial",
+            )
+            qf = result.qf if result else -1.0
+            return combo, qf
+    except Exception:
+        return combo, -1.0
+
+
 class CRDSPipeline:
     """CRDS 五步处理流水线
 
@@ -238,6 +274,12 @@ class CRDSPipeline:
         例如: {"O2/9386.2076": ["100Torr", "200Torr", "300Torr"]}
         未指定的跃迁仍使用默认的 MAD 自动筛选。
         默认 None 表示全部使用自动筛选。
+    auto_optimize_pressures : bool
+        是否自动搜索最优压力组合 (默认 False)。
+        启用后，Step 4 会枚举所有压力组合 (最少 min_multi_pressures 个，
+        最多全部)，逐一执行多光谱联合拟合，选取 QF 最大的组合作为最终结果。
+    min_multi_pressures : int
+        自动搜索时每次组合的最少压力数 (默认 3)。
     """
 
     def __init__(
@@ -261,6 +303,8 @@ class CRDSPipeline:
         max_workers: int | None = None,
         targets: list[str] | None = None,
         multi_fit_pressures: dict[str, list[str]] | None = None,
+        auto_optimize_pressures: bool = False,
+        min_multi_pressures: int = 3,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -278,6 +322,10 @@ class CRDSPipeline:
 
         # ── 多光谱联合拟合压力指定 ──
         self.multi_fit_pressures = multi_fit_pressures  # e.g. {"O2/9386.2076": ["100Torr", "200Torr"]}
+
+        # ── 自动搜索最优压力组合 ──
+        self.auto_optimize_pressures = auto_optimize_pressures
+        self.min_multi_pressures = max(min_multi_pressures, 2)
 
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
@@ -714,8 +762,10 @@ class CRDSPipeline:
 
         仅用于纯 O₂ 数据。
 
-        若 self.multi_fit_pressures 中指定了该跃迁的压力列表，
-        则直接使用指定压力，跳过 MAD 自动筛选。
+        三种模式 (优先级从高到低):
+          1. multi_fit_pressures 指定 → 直接使用指定压力
+          2. auto_optimize_pressures → 枚举组合，选 QF 最大
+          3. 默认 → MAD 线强筛选后拟合
         """
         t_dir = self.mats_root / gas_type / transition
         tag = f"{gas_type}/{transition}"
@@ -732,11 +782,10 @@ class CRDSPipeline:
             gas_type, transition)
 
         if specified_pressures is not None:
-            # 用户指定压力: 跳过 MAD 筛选，直接使用
+            # 模式 1: 用户指定压力
             sw_df = pd.DataFrame(records)
             sw_df["keep"] = sw_df["pressure"].isin(specified_pressures)
 
-            # 检查是否所有指定压力都存在于数据中
             available = set(sw_df["pressure"].tolist())
             missing = [p for p in specified_pressures if p not in available]
             if missing:
@@ -751,24 +800,40 @@ class CRDSPipeline:
             if len(kept) < 2:
                 logger.warning(f"   有效压力点 < 2，无法联合拟合，跳过")
                 return
+
+            self._do_multi_fit_and_save(
+                gas_type, transition, sw_df, kept)
+
+        elif self.auto_optimize_pressures:
+            # 模式 2: 自动搜索最优压力组合
+            self._optimize_pressure_combination(
+                gas_type, transition, records)
+
         else:
-            # 默认: MAD 筛选
+            # 模式 3: 默认 MAD 筛选
             sw_df = self._screen_sw(records, tag)
             kept = sw_df[sw_df["keep"]]
             if len(kept) < 2:
                 logger.warning(f"   保留点数 < 2，无法联合拟合，跳过")
                 return
 
-        # ---- 3. 收集保留的 etalon CSV ----
+            self._do_multi_fit_and_save(
+                gas_type, transition, sw_df, kept)
+
+    def _do_multi_fit_and_save(
+        self, gas_type: str, transition: str,
+        sw_df: pd.DataFrame, kept: pd.DataFrame,
+    ) -> None:
+        """执行多光谱联合拟合并保存结果 (核心拟合流程)"""
+        tag = f"{gas_type}/{transition}"
+
         etalon_csvs, labels = self._collect_etalon_csvs(
             gas_type, transition, kept)
         if len(etalon_csvs) < 2:
             logger.warning(f"   有效 etalon CSV < 2，跳过联合拟合")
             return
 
-        # ---- 4. 多光谱联合拟合 ----
         logger.info(f"\n  开始多光谱联合拟合 ({len(etalon_csvs)} 条光谱)...")
-        # 使用第一个压力目录的名称确定气体参数
         first_pressure = kept.iloc[0]["pressure"]
         fitter_kw = self._fitter_kwargs_for_gas(gas_type, first_pressure)
         base_kw = self._base_fitter_kwargs()
@@ -802,6 +867,122 @@ class CRDSPipeline:
         except Exception as e:
             logger.error(f"  多光谱联合拟合失败: {e}")
             logger.exception("  详细错误信息:")
+
+    def _optimize_pressure_combination(
+        self, gas_type: str, transition: str,
+        records: list[dict],
+    ) -> None:
+        """枚举所有压力组合 (≥ min_multi_pressures 个)，
+        使用多进程并行拟合，选取 QF 最大的组合作为最终结果。
+        """
+        tag = f"{gas_type}/{transition}"
+        all_pressures = [r["pressure"] for r in records]
+        n = len(all_pressures)
+        min_k = self.min_multi_pressures
+
+        if n < min_k:
+            logger.warning(f"  [{tag}] 可用压力 ({n}) < 最少要求 ({min_k})，跳过")
+            return
+
+        # 生成所有组合: C(n, min_k), C(n, min_k+1), ..., C(n, n)
+        all_combos: list[tuple[str, ...]] = []
+        for k in range(min_k, n + 1):
+            all_combos.extend(combinations(all_pressures, k))
+
+        total = len(all_combos)
+        n_workers = min(self.max_workers, total)
+        logger.info(f"\n  [{tag}] 自动搜索最优压力组合")
+        logger.info(f"  可用压力: {', '.join(all_pressures)}")
+        logger.info(f"  组合数: {total} (最少 {min_k} 个, 最多 {n} 个)")
+        logger.info(f"  并行进程: {n_workers}")
+        logger.info(f"  {'─' * 60}")
+
+        # 预构建 fitter 参数 (所有组合共享)
+        first_pressure = all_pressures[0]
+        fitter_kw = self._fitter_kwargs_for_gas(gas_type, first_pressure)
+        base_kw = self._base_fitter_kwargs()
+        base_kw.update(fitter_kw)
+
+        # 预构建每个组合的 etalon CSV 路径和 labels
+        combo_tasks: list[tuple[tuple[str, ...], list[Path], list[str]]] = []
+        for combo in all_combos:
+            etalon_csvs: list[Path] = []
+            labels: list[str] = []
+            for p in combo:
+                csv_path = (self.etalon_root / gas_type / transition
+                            / p / "tau_etalon_corrected.csv")
+                if csv_path.exists():
+                    etalon_csvs.append(csv_path)
+                    labels.append(p)
+            combo_tasks.append((combo, etalon_csvs, labels))
+
+        # 多进程并行拟合
+        results_log: list[tuple[tuple[str, ...], float]] = []
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = []
+            for combo, etalon_csvs, labels in combo_tasks:
+                fut = pool.submit(
+                    _worker_trial_multi_fit,
+                    etalon_csvs, labels, base_kw, transition, combo,
+                )
+                futures.append((combo, fut))
+
+            for idx, (combo, fut) in enumerate(futures, 1):
+                combo_result, qf = fut.result()
+                results_log.append((combo_result, qf))
+                combo_str = ", ".join(combo_result)
+                status = f"QF = {qf:.2f}" if qf >= 0 else "失败"
+                logger.info(f"  [{idx}/{total}] {combo_str}  →  {status}")
+
+        # 找最优
+        best_qf = -1.0
+        best_combo: tuple[str, ...] | None = None
+        for combo, qf in results_log:
+            if qf > best_qf:
+                best_qf = qf
+                best_combo = combo
+
+        # 打印汇总排名
+        logger.info(f"\n  {'═' * 60}")
+        logger.info(f"  [{tag}] 压力组合搜索结果 (按 QF 降序)")
+        logger.info(f"  {'═' * 60}")
+        ranked = sorted(results_log, key=lambda x: x[1], reverse=True)
+        for rank, (combo, qf) in enumerate(ranked, 1):
+            marker = " ← 最优" if combo == best_combo else ""
+            qf_str = f"{qf:.2f}" if qf >= 0 else "失败"
+            logger.info(f"  #{rank:<3d} QF={qf_str:<10s} "
+                        f"{', '.join(combo)}{marker}")
+        logger.info(f"  {'═' * 60}")
+
+        if best_combo is None or best_qf < 0:
+            logger.warning(f"  [{tag}] 所有组合均拟合失败，跳过")
+            return
+
+        # 用最优组合执行正式拟合 (保存结果和图表)
+        logger.info(f"\n  ★ 最优组合: {', '.join(best_combo)}  "
+                    f"(QF = {best_qf:.2f})")
+        logger.info(f"  正在用最优组合执行正式拟合...")
+
+        sw_df = pd.DataFrame(records)
+        sw_df["keep"] = sw_df["pressure"].isin(best_combo)
+        kept = sw_df[sw_df["keep"]]
+
+        # 保存搜索结果日志
+        multi_out = self.mats_multi_root / gas_type / transition
+        multi_out.mkdir(parents=True, exist_ok=True)
+        search_rows = []
+        for combo, qf in ranked:
+            search_rows.append({
+                "pressures": "+".join(combo),
+                "n_pressures": len(combo),
+                "QF": qf,
+                "is_best": combo == best_combo,
+            })
+        pd.DataFrame(search_rows).to_csv(
+            multi_out / "pressure_optimization.csv", index=False)
+
+        self._do_multi_fit_and_save(
+            gas_type, transition, sw_df, kept)
 
     # ==============================================================
     # Step 5: 线性回归提取 N₂ 展宽
@@ -928,6 +1109,9 @@ class CRDSPipeline:
         if self.multi_fit_pressures:
             for key, pressures in self.multi_fit_pressures.items():
                 logger.info(f"  联合拟合压力 [{key}]: {', '.join(pressures)}")
+        if self.auto_optimize_pressures:
+            logger.info(f"  自动搜索最优压力组合: 开启 "
+                        f"(最少 {self.min_multi_pressures} 个压力)")
         logger.info(f"  日志文件: {log_path}")
         logger.info("=" * 60)
 

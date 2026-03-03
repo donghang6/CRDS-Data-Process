@@ -9,6 +9,10 @@
     # 指定参与多光谱联合拟合的压力 (跳过自动筛选)
     python main.py --pressures O2/9386.2076=100Torr,200Torr,300Torr
     python main.py O2/9386.2076 --pressures O2/9386.2076=100Torr,200Torr
+
+    # 自动搜索最优压力组合 (枚举所有组合, 选 QF 最大)
+    python main.py O2/9386.2076 --optimize
+    python main.py O2/9386.2076 --optimize --min-pressures 4
 """
 
 import sys
@@ -16,18 +20,18 @@ import sys
 from crds_process.pipeline import CRDSPipeline
 
 
-def _parse_args(argv: list[str]) -> tuple[list[str] | None, dict[str, list[str]] | None]:
+def _parse_args(argv: list[str]) -> dict:
     """解析命令行参数
 
     Returns
     -------
-    targets : list[str] | None
-        目标列表 (位置参数)
-    multi_fit_pressures : dict[str, list[str]] | None
-        多光谱联合拟合指定压力
+    dict
+        CRDSPipeline 构造参数
     """
     targets = []
     multi_fit_pressures: dict[str, list[str]] = {}
+    auto_optimize = False
+    min_pressures = 3
 
     i = 0
     while i < len(argv):
@@ -46,14 +50,30 @@ def _parse_args(argv: list[str]) -> tuple[list[str] | None, dict[str, list[str]]
                     print(f"警告: 忽略无效的 --pressures 参数: {spec}")
                     print(f"  格式应为: 气体类型/跃迁=压力1,压力2,...")
                 i += 1
+        elif arg == "--optimize":
+            auto_optimize = True
+            i += 1
+        elif arg == "--min-pressures":
+            i += 1
+            if i < len(argv):
+                try:
+                    min_pressures = int(argv[i])
+                except ValueError:
+                    print(f"警告: --min-pressures 参数无效: {argv[i]}，使用默认值 3")
+            i += 1
         else:
             targets.append(arg)
             i += 1
 
-    return targets or None, multi_fit_pressures or None
+    return {
+        "targets": targets or None,
+        "multi_fit_pressures": multi_fit_pressures or None,
+        "auto_optimize_pressures": auto_optimize,
+        "min_multi_pressures": min_pressures,
+    }
 
 
 if __name__ == "__main__":
-    targets, multi_fit_pressures = _parse_args(sys.argv[1:])
-    pipeline = CRDSPipeline(targets=targets, multi_fit_pressures=multi_fit_pressures)
+    kwargs = _parse_args(sys.argv[1:])
+    pipeline = CRDSPipeline(**kwargs)
     pipeline.run()
