@@ -781,6 +781,7 @@ class CRDSPipeline:
         else:
             target_trans = None  # 无过滤，全部处理
 
+        n_processed = 0
         for t_dir in sorted(o2n2_dir.iterdir()):
             if not t_dir.is_dir() or t_dir.name.startswith("."):
                 continue
@@ -805,6 +806,7 @@ class CRDSPipeline:
                 logger.warning(f"    ⚠ 请先对该跃迁运行纯 O₂ 的 Step 4 联合拟合")
                 continue
 
+            n_processed += 1
             logger.info(f"\n  [{transition}] 线性回归提取 N₂ 参数...")
             logger.info(f"    O₂+N₂ 数据: {mix_stats}")
             logger.info(f"    纯 O₂ 参考: {o2_multi}")
@@ -835,6 +837,9 @@ class CRDSPipeline:
             except Exception as e:
                 logger.error(f"  [{transition}] 线性回归失败: {e}")
                 logger.exception("  详细错误信息:")
+
+        if n_processed == 0:
+            logger.info("  未检测到符合条件的 O₂+N₂ 跃迁，跳过线性回归")
 
     # ==============================================================
     # 完整五步流水线
@@ -1111,7 +1116,8 @@ class CRDSPipeline:
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 9),
                                  gridspec_kw={"height_ratios": [3, 1],
-                                              "hspace": 0.08, "wspace": 0.30})
+                                              "hspace": 0.08, "wspace": 0.30},
+                                 constrained_layout=True)
 
         # ─────── Panel 1: 线强 (sw) ───────
         ax_sw = axes[0, 0]
@@ -1159,8 +1165,7 @@ class CRDSPipeline:
         ax_gam_res.grid(True, alpha=0.3)
 
         fig.suptitle("Fitted Parameters vs HITRAN Reference  —  O₂ A-band",
-                     fontsize=13, fontweight="bold", y=0.98)
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
+                     fontsize=13, fontweight="bold")
 
         # ── 保存 ──
         self._FIGURES_ROOT.mkdir(parents=True, exist_ok=True)
