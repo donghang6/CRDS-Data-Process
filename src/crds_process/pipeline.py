@@ -867,9 +867,58 @@ class CRDSPipeline:
     # ==============================================================
     _MASTER_TABLE_NAME = "spectral_parameters.csv"
 
+    # HITRAN 参考数据路径
+    _HITRAN_CSV = _PROJECT_ROOT / "data" / "hitran" / "O2_9000_10000_sw_ge_1e-29.csv"
+
+    def _load_hitran_reference(self) -> pd.DataFrame | None:
+        """加载 HITRAN 参考数据 CSV，返回 DataFrame (nu 为索引列)。
+
+        若文件不存在则返回 None。
+        """
+        csv_path = self._HITRAN_CSV
+        if not csv_path.exists():
+            logger.warning(f"  HITRAN 参考数据文件不存在: {csv_path}")
+            return None
+        try:
+            df = pd.read_csv(csv_path)
+            logger.info(f"  已加载 HITRAN 参考数据: {csv_path.name}"
+                        f" ({len(df)} 条吸收线)")
+            return df
+        except Exception as e:
+            logger.warning(f"  读取 HITRAN 参考数据失败: {e}")
+            return None
+
+    @staticmethod
+    def _match_hitran_line(nu_transition: float, hitran_df: pd.DataFrame,
+                           tol: float = 0.01) -> pd.Series | None:
+        """根据跃迁波数在 HITRAN 数据中查找最近匹配。
+
+        Parameters
+        ----------
+        nu_transition : float
+            跃迁波数 (cm⁻¹)
+        hitran_df : pd.DataFrame
+            HITRAN 参考数据
+        tol : float
+            最大允许偏差 (cm⁻¹)，默认 0.01
+
+        Returns
+        -------
+        pd.Series or None
+            匹配的 HITRAN 行，或 None (无匹配)
+        """
+        diffs = np.abs(hitran_df["nu"].values - nu_transition)
+        idx_min = int(np.argmin(diffs))
+        if diffs[idx_min] <= tol:
+            return hitran_df.iloc[idx_min]
+        return None
+
     def _build_master_table(self) -> None:
         """将 O₂ 多光谱联合拟合和 N₂ 线性回归的所有参数
         合并为一张主表，以跃迁波数为第一列。
+
+        同时将 HITRAN 参考值 (线强、自展宽、空气展宽等) 写在对应参数旁边，
+        方便对比。
 
         若表格已存在，先备份为 spectral_parameters_YYYYMMDD_HHMMSS.csv，
         再写入新表。
@@ -877,6 +926,9 @@ class CRDSPipeline:
         logger.info("\n" + "=" * 60)
         logger.info("  汇总: 构建参数主表")
         logger.info("=" * 60)
+
+        # ── 加载 HITRAN 参考数据 ──
+        hitran_df = self._load_hitran_reference()
 
         rows: list[dict] = []
 
@@ -891,6 +943,21 @@ class CRDSPipeline:
 
         for transition in sorted(transitions):
             rec: dict = {"nu": transition}
+
+            # ── HITRAN 参考值 ──
+            if hitran_df is not None:
+                try:
+                    nu_val = float(transition)
+                    hitran_row = self._match_hitran_line(nu_val, hitran_df)
+                    if hitran_row is not None:
+                        rec["sw_HITRAN"] = hitran_row["sw"]
+                        rec["gamma_self_HITRAN"] = hitran_row["gamma_self"]
+                        rec["gamma_air_HITRAN"] = hitran_row["gamma_air"]
+                        rec["n_air_HITRAN"] = hitran_row["n_air"]
+                        rec["delta_air_HITRAN"] = hitran_row["delta_air"]
+                        rec["elower_HITRAN"] = hitran_row["elower"]
+                except (ValueError, KeyError):
+                    pass
 
             # ── O₂ 多光谱联合拟合 ──
             o2_csv = self.final_root / "O2" / transition / "multi_fit_result.csv"
@@ -934,23 +1001,32 @@ class CRDSPipeline:
 
         master_df = pd.DataFrame(rows)
 
-        # 列排序: nu → O₂ 参数 → N₂ 参数 → 辅助信息
+        # 列排序: nu → 各参数组 (拟合值 + HITRAN 参考 紧邻排列)
         desired_order = ["nu"]
-        # O₂ 参数 (值 + 误差 交替)
-        o2_params = ["sw", "gamma0_O2", "n_gamma0_O2",
-                     "SD_gamma_O2", "delta0_O2", "SD_delta_O2"]
-        for p in o2_params:
-            desired_order.append(p)
-            desired_order.append(f"{p}_err")
-        # N₂ 参数
+        # ── 线强: sw, sw_err, sw_HITRAN ──
+        desired_order.extend(["sw", "sw_err", "sw_HITRAN"])
+        # ── O₂ 自展宽: gamma0_O2, gamma0_O2_err, gamma_self_HITRAN ──
+        desired_order.extend(["gamma0_O2", "gamma0_O2_err", "gamma_self_HITRAN"])
+        # ── n_air: n_gamma0_O2, n_gamma0_O2_err, n_air_HITRAN ──
+        desired_order.extend(["n_gamma0_O2", "n_gamma0_O2_err", "n_air_HITRAN"])
+        # ── SD_gamma_O2 ──
+        desired_order.extend(["SD_gamma_O2", "SD_gamma_O2_err"])
+        # ── delta0_O2, delta0_O2_err, delta_air_HITRAN ──
+        desired_order.extend(["delta0_O2", "delta0_O2_err", "delta_air_HITRAN"])
+        # ── SD_delta_O2 ──
+        desired_order.extend(["SD_delta_O2", "SD_delta_O2_err"])
+        # ── gamma_air_HITRAN (空气展宽参考) ──
+        desired_order.append("gamma_air_HITRAN")
+        # ── N₂ 参数 ──
         n2_params = ["gamma0_N2", "SD_gamma_N2", "delta0_N2", "SD_delta_N2"]
         for p in n2_params:
             desired_order.append(p)
             desired_order.append(f"{p}_err")
             desired_order.append(f"{p}_R2")
             desired_order.append(f"{p}_npts")
-        # 辅助列
-        desired_order.extend(["n_spectra_O2", "QF_O2", "residual_std_O2"])
+        # ── 辅助列 ──
+        desired_order.extend(["elower_HITRAN",
+                              "n_spectra_O2", "QF_O2", "residual_std_O2"])
 
         # 只保留实际存在的列，按 desired_order 排序，其余追加在末尾
         existing = list(master_df.columns)
@@ -984,6 +1060,115 @@ class CRDSPipeline:
                 if pd.notna(val) and val != "":
                     logger.info(f"    {col:<25s} = {val}")
         logger.info(f"  {'─' * 80}")
+
+        # ── 绘制与 HITRAN 对比图 ──
+        self._plot_hitran_comparison(master_df)
+
+    # ==============================================================
+    # 对比图: 线强 & 自展宽 vs HITRAN
+    # ==============================================================
+    _FIGURES_ROOT = _PROJECT_ROOT / "output" / "figures"
+
+    def _plot_hitran_comparison(self, master_df: pd.DataFrame) -> None:
+        """绘制拟合结果与 HITRAN 参考数据的对比图
+
+        Panel 1: 线强 (sw) vs HITRAN — 上方主图 + 下方残差
+        Panel 2: O₂ 自展宽 (gamma0_O2) vs HITRAN — 上方主图 + 下方残差
+
+        同时保存 PNG 和 PDF。
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import ScalarFormatter
+
+        # 筛选有拟合数据 且 有 HITRAN 匹配的行
+        needed = ["sw", "sw_err", "sw_HITRAN",
+                  "gamma0_O2", "gamma0_O2_err", "gamma_self_HITRAN"]
+        df = master_df.dropna(subset=needed).copy()
+        if df.empty:
+            logger.warning("  无有效数据用于绘制 HITRAN 对比图")
+            return
+
+        nu = df["nu"].astype(float).values
+        sw_fit = df["sw"].astype(float).values
+        sw_err = df["sw_err"].astype(float).values
+        sw_hitran = df["sw_HITRAN"].astype(float).values
+        gamma_fit = df["gamma0_O2"].astype(float).values
+        gamma_err = df["gamma0_O2_err"].astype(float).values
+        gamma_hitran = df["gamma_self_HITRAN"].astype(float).values
+
+        # 残差 (相对百分比)
+        sw_res_pct = (sw_fit - sw_hitran) / sw_hitran * 100
+        gamma_res_pct = np.where(
+            gamma_hitran != 0,
+            (gamma_fit - gamma_hitran) / gamma_hitran * 100,
+            0.0,
+        )
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9),
+                                 gridspec_kw={"height_ratios": [3, 1],
+                                              "hspace": 0.08, "wspace": 0.30})
+
+        # ─────── Panel 1: 线强 (sw) ───────
+        ax_sw = axes[0, 0]
+        ax_sw_res = axes[1, 0]
+
+        ax_sw.errorbar(nu, sw_fit, yerr=sw_err, fmt="o", ms=5, capsize=3,
+                       color="C0", label="This work", zorder=3)
+        ax_sw.scatter(nu, sw_hitran, marker="^", s=50, color="C3",
+                      label="HITRAN", zorder=2)
+        ax_sw.set_ylabel("Line intensity  S  (cm/molecule)", fontsize=11)
+        ax_sw.set_title("Line Intensity Comparison", fontsize=12, fontweight="bold")
+        ax_sw.legend(fontsize=10, loc="best")
+        ax_sw.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
+        ax_sw.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
+        ax_sw.set_xticklabels([])
+        ax_sw.grid(True, alpha=0.3)
+
+        # 残差
+        ax_sw_res.bar(nu, sw_res_pct, width=1.5, color="C0", alpha=0.7)
+        ax_sw_res.axhline(0, color="k", lw=0.8)
+        ax_sw_res.set_xlabel("Wavenumber  (cm⁻¹)", fontsize=11)
+        ax_sw_res.set_ylabel("Residual  (%)", fontsize=10)
+        ax_sw_res.grid(True, alpha=0.3)
+
+        # ─────── Panel 2: 自展宽 (gamma0_O2) ───────
+        ax_gam = axes[0, 1]
+        ax_gam_res = axes[1, 1]
+
+        ax_gam.errorbar(nu, gamma_fit, yerr=gamma_err, fmt="s", ms=5,
+                        capsize=3, color="C0", label="This work", zorder=3)
+        ax_gam.scatter(nu, gamma_hitran, marker="^", s=50, color="C3",
+                       label="HITRAN", zorder=2)
+        ax_gam.set_ylabel(r"$\gamma_{\rm self}$  (cm⁻¹/atm)", fontsize=11)
+        ax_gam.set_title("Self-broadening Comparison", fontsize=12,
+                         fontweight="bold")
+        ax_gam.legend(fontsize=10, loc="best")
+        ax_gam.set_xticklabels([])
+        ax_gam.grid(True, alpha=0.3)
+
+        # 残差
+        ax_gam_res.bar(nu, gamma_res_pct, width=1.5, color="C0", alpha=0.7)
+        ax_gam_res.axhline(0, color="k", lw=0.8)
+        ax_gam_res.set_xlabel("Wavenumber  (cm⁻¹)", fontsize=11)
+        ax_gam_res.set_ylabel("Residual  (%)", fontsize=10)
+        ax_gam_res.grid(True, alpha=0.3)
+
+        fig.suptitle("Fitted Parameters vs HITRAN Reference  —  O₂ A-band",
+                     fontsize=13, fontweight="bold", y=0.98)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        # ── 保存 ──
+        self._FIGURES_ROOT.mkdir(parents=True, exist_ok=True)
+        png_path = self._FIGURES_ROOT / "hitran_comparison.png"
+        pdf_path = self._FIGURES_ROOT / "hitran_comparison.pdf"
+        fig.savefig(str(png_path), dpi=150, bbox_inches="tight")
+        fig.savefig(str(pdf_path), bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  HITRAN 对比图已保存:")
+        logger.info(f"    PNG: {png_path}")
+        logger.info(f"    PDF: {pdf_path}")
 
     # ==============================================================
     # Step 4 辅助方法
