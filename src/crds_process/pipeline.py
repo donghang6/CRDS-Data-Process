@@ -1047,19 +1047,6 @@ class CRDSPipeline:
         master_df.to_csv(out_path, index=False)
         logger.info(f"  参数主表已保存: {out_path}")
 
-        # 打印表格
-        logger.info(f"\n  {'─' * 80}")
-        logger.info(f"  参数主表 ({len(master_df)} 个跃迁)")
-        logger.info(f"  {'─' * 80}")
-        for _, row in master_df.iterrows():
-            logger.info(f"\n  ν = {row['nu']} cm⁻¹")
-            for col in master_df.columns:
-                if col == "nu":
-                    continue
-                val = row[col]
-                if pd.notna(val) and val != "":
-                    logger.info(f"    {col:<25s} = {val}")
-        logger.info(f"  {'─' * 80}")
 
         # ── 绘制与 HITRAN 对比图 ──
         self._plot_hitran_comparison(master_df)
@@ -1415,56 +1402,9 @@ class CRDSPipeline:
             trans_dir.mkdir(parents=True, exist_ok=True)
             sub.to_csv(trans_dir / "fitted_parameters.csv", index=False)
 
-        self._print_summary_table(df, summary_path)
         self._generate_fit_statistics()
 
-    def _print_summary_table(self, df: pd.DataFrame, summary_path: Path) -> None:
-        """打印单光谱拟合汇总表"""
-        logger.info(f"\n{'#' * 60}")
-        logger.info(f"  单光谱拟合结果汇总 ({self.lineprofile} 线形)")
-        logger.info(f"{'#' * 60}")
-
-        x_cols = ["gas_type", "transition", "pressure_label", "x_shift"]
-        x_cols = [c for c in x_cols if c in df.columns]
-        x_shifts = df[x_cols].drop_duplicates()
-        for _, xs in x_shifts.iterrows():
-            prefix = f"{xs.get('gas_type', '')}/" if "gas_type" in xs else ""
-            logger.info(f"\n  [{prefix}{xs['transition']}/{xs['pressure_label']}] "
-                  f"x_shift = {xs['x_shift']:.6f} cm⁻¹")
-
-        fitted = df[df["sw_vary"] == True] if "sw_vary" in df.columns else df
-        if fitted.empty:
-            fitted = df
-
-        # 找到展宽列名
-        gamma_col = next((c for c in df.columns if c.startswith("gamma0_")
-                          and not c.endswith("_err")), "gamma0")
-
-        logger.info(f"\n  {'─' * 110}")
-        logger.info(f"  {'气体':<6s} {'跃迁':<12s} {'压力':<28s} {'ν (cm⁻¹)':<14s} "
-              f"{'S (cm/molec)':<14s} "
-              f"{gamma_col:<18s} "
-              f"{'Res. σ':<12s}")
-        logger.info(f"  {'─' * 110}")
-
-        for _, row in fitted.iterrows():
-            gas = str(row.get("gas_type", ""))
-            gamma_val = row.get(gamma_col, 0)
-            gamma_err = row.get(f"{gamma_col}_err", 0)
-            gamma_str = f"{gamma_val:.6f}"
-            if gamma_err > 0:
-                gamma_str += f" ± {gamma_err:.6f}"
-            logger.info(
-                f"  {gas:<6s} {row['transition']:<12s} "
-                f"{str(row['pressure_label']):<28s} "
-                f"{row['nu']:>12.6f}  "
-                f"{row['sw']:>12.4e}  "
-                f"{gamma_str:<18s} "
-                f"{row['residual_std']:>10.4e}"
-            )
-
-        logger.info(f"  {'─' * 110}")
-        logger.info(f"\n  汇总表: {summary_path}")
+        logger.info(f"\n  单光谱拟合汇总表: {summary_path}")
         logger.info(f"  详细目录: {self.final_root}")
 
     def _generate_fit_statistics(self) -> None:
@@ -1535,7 +1475,6 @@ class CRDSPipeline:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_path = out_dir / "fit_summary_statistics.csv"
                 stat_df.to_csv(out_path, index=False)
-                logger.info(f"\n  统计表: {out_path}")
 
     # ==============================================================
     # 通用 I/O 辅助方法
