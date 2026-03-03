@@ -769,10 +769,26 @@ class CRDSPipeline:
             logger.warning("  未找到 O₂+N₂ 数据，跳过 Step 5")
             return
 
+        # 目标跃迁过滤 (同时接受 O2_N2/xxx 和 O2/xxx 指定)
+        target_trans_n2 = self._target_transitions("O2_N2")
+        target_trans_o2 = self._target_transitions("O2")
+        if target_trans_n2 is not None and target_trans_o2 is not None:
+            target_trans = target_trans_n2 | target_trans_o2
+        elif target_trans_n2 is not None:
+            target_trans = target_trans_n2
+        elif target_trans_o2 is not None:
+            target_trans = target_trans_o2
+        else:
+            target_trans = None  # 无过滤，全部处理
+
         for t_dir in sorted(o2n2_dir.iterdir()):
             if not t_dir.is_dir() or t_dir.name.startswith("."):
                 continue
             transition = t_dir.name
+
+            # 跳过不在目标列表中的跃迁
+            if target_trans is not None and transition not in target_trans:
+                continue
 
             # 检查所需文件
             mix_stats = t_dir / "fit_summary_statistics.csv"
