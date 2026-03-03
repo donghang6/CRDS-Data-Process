@@ -198,11 +198,11 @@ def _worker_trial_multi_fit(
     fitter_kwargs: dict,
     transition: str,
     combo: tuple[str, ...],
-) -> tuple[tuple[str, ...], float]:
-    """子进程: 对一个压力组合执行试拟合，返回 (combo, QF)。
+) -> tuple[tuple[str, ...], float, float]:
+    """子进程: 对一个压力组合执行试拟合，返回 (combo, QF, sw)。
 
-    轻量版本: 在临时目录中拟合，不保存最终输出，仅获取 QF 值。
-    拟合失败时返回 (combo, -1.0)。
+    轻量版本: 在临时目录中拟合，不保存最终输出，仅获取 QF 和线强。
+    拟合失败时返回 (combo, -1.0, 0.0)。
     """
     import tempfile
     import matplotlib
@@ -210,7 +210,7 @@ def _worker_trial_multi_fit(
     from crds_process.spectral.mats_wrapper import MATSFitter
 
     if len(etalon_csvs) < 2:
-        return combo, -1.0
+        return combo, -1.0, 0.0
 
     try:
         fitter = MATSFitter(**fitter_kwargs)
@@ -221,10 +221,21 @@ def _worker_trial_multi_fit(
                 output_dir=Path(tmp_dir),
                 dataset_name=f"{transition}_trial",
             )
-            qf = result.qf if result else -1.0
-            return combo, qf
+            if not result:
+                return combo, -1.0, 0.0
+            qf = result.qf
+            # 提取目标跃迁的拟合线强
+            sw = 0.0
+            if not result.param_linelist.empty:
+                fitted = result.param_linelist[
+                    result.param_linelist["sw_vary"] == True]
+                if not fitted.empty:
+                    row = fitted.iloc[0]
+                    scale = row.get("sw_scale_factor", 1.0)
+                    sw = row["sw"] * scale
+            return combo, qf, sw
     except Exception:
-        return combo, -1.0
+        return combo, -1.0, 0.0
 
 
 class CRDSPipeline:
@@ -917,7 +928,7 @@ class CRDSPipeline:
             combo_tasks.append((combo, etalon_csvs, labels))
 
         # 多进程并行拟合
-        results_log: list[tuple[tuple[str, ...], float]] = []
+        results_log: list[tuple[tuple[str, ...], float, float]] = []
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = []
             for combo, etalon_csvs, labels in combo_tasks:
@@ -928,16 +939,17 @@ class CRDSPipeline:
                 futures.append((combo, fut))
 
             for idx, (combo, fut) in enumerate(futures, 1):
-                combo_result, qf = fut.result()
-                results_log.append((combo_result, qf))
+                combo_result, qf, sw = fut.result()
+                results_log.append((combo_result, qf, sw))
                 combo_str = ", ".join(combo_result)
                 status = f"QF = {qf:.2f}" if qf >= 0 else "失败"
-                logger.info(f"  [{idx}/{total}] {combo_str}  →  {status}")
+                sw_str = f", S = {sw:.4e}" if sw > 0 else ""
+                logger.info(f"  [{idx}/{total}] {combo_str}  →  {status}{sw_str}")
 
         # 找最优
         best_qf = -1.0
         best_combo: tuple[str, ...] | None = None
-        for combo, qf in results_log:
+        for combo, qf, sw in results_log:
             if qf > best_qf:
                 best_qf = qf
                 best_combo = combo
@@ -947,11 +959,12 @@ class CRDSPipeline:
         logger.info(f"  [{tag}] 压力组合搜索结果 (按 QF 降序)")
         logger.info(f"  {'═' * 60}")
         ranked = sorted(results_log, key=lambda x: x[1], reverse=True)
-        for rank, (combo, qf) in enumerate(ranked, 1):
+        for rank, (combo, qf, sw) in enumerate(ranked, 1):
             marker = " ← 最优" if combo == best_combo else ""
             qf_str = f"{qf:.2f}" if qf >= 0 else "失败"
-            logger.info(f"  #{rank:<3d} QF={qf_str:<10s} "
-                        f"{', '.join(combo)}{marker}")
+            sw_str = f"  S={sw:.4e}" if sw > 0 else ""
+            logger.info(f"  #{rank:<3d} QF={qf_str:<10s}{sw_str}"
+                        f"  {', '.join(combo)}{marker}")
         logger.info(f"  {'═' * 60}")
 
         if best_combo is None or best_qf < 0:
@@ -971,11 +984,12 @@ class CRDSPipeline:
         multi_out = self.mats_multi_root / gas_type / transition
         multi_out.mkdir(parents=True, exist_ok=True)
         search_rows = []
-        for combo, qf in ranked:
+        for combo, qf, sw in ranked:
             search_rows.append({
                 "pressures": "+".join(combo),
                 "n_pressures": len(combo),
                 "QF": qf,
+                "sw": sw,
                 "is_best": combo == best_combo,
             })
         pd.DataFrame(search_rows).to_csv(
