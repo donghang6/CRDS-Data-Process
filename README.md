@@ -44,9 +44,10 @@ CRDS-Data-Process/
 │   ├── raw/                                # 原始数据 (gas_type/transition/pressure/)
 │   │   ├── O2/                             #   纯 O₂ 数据
 │   │   └── O2_N2/                          #   O₂+N₂ 混合气数据
-│   └── hitran/                             # HITRAN 光谱数据库文件
+│   ├── processed/                          # 预留的中间数据目录
+│   └── hitran/                             # HITRAN 参考数据（运行下载脚本后生成）
 ├── scripts/
-│   └── download_o2_lines.py                # HITRAN O₂ 谱线数据下载脚本
+│   └── download_o2_lines.py                # HITRAN O₂ 谱线数据下载脚本（依赖 hitran-api/hapi）
 └── output/
     ├── results/                            # 各步骤处理结果
     │   ├── ringdown/                       #   Step 1 输出
@@ -63,8 +64,14 @@ CRDS-Data-Process/
 ## 快速开始
 
 ```bash
-# 安装（开发模式）
-pip install -e ".[dev,notebook]"
+# 安装（含开发工具 / notebook / MATS 适配）
+pip install -e ".[dev,notebook,mats]"
+
+# 若仅下载 HITRAN 参考线（可选）需额外安装 HAPI
+pip install hitran-api
+
+# 下载 HITRAN O₂ 参考数据（推荐）
+python scripts/download_o2_lines.py
 
 # 运行完整流水线（处理全部数据）
 python main.py
@@ -73,6 +80,13 @@ python main.py
 python main.py O2/9386.2076                  # O₂ 下 9386.2076 跃迁（所有压力）
 python main.py O2/9386.2076/100Torr          # 精确到单个压力
 python main.py O2/9386.2076 O2_N2/9386.2076  # 同时处理多个目标
+
+# Step 4: 指定多光谱联合拟合压力（跳过自动筛选）
+python main.py --pressures O2/9386.2076=100Torr,200Torr,300Torr
+
+# Step 4: 自动搜索最优压力组合（按 QF 最大）
+python main.py O2/9386.2076 --optimize
+python main.py O2/9386.2076 --optimize --min-pressures 4
 ```
 
 也可在代码中直接调用：
@@ -87,6 +101,14 @@ CRDSPipeline().run()
 CRDSPipeline(targets=["O2/9386.2076"]).run()
 ```
 
+### Step 4 压力选择优先级
+
+Step 4（纯 O₂ 联合拟合）的压力点选择按以下顺序执行：
+
+1. 若传入 `--pressures`，使用你指定的压力列表。
+2. 否则若启用 `--optimize`，枚举组合并选择 QF 最大的组合。
+3. 否则使用默认 MAD 线强离群筛选。
+
 ## 输出说明
 
 ### 参数主表 (`spectral_parameters.csv`)
@@ -95,8 +117,9 @@ CRDSPipeline(targets=["O2/9386.2076"]).run()
 
 | 列组 | 参数 | 说明 |
 |------|------|------|
-| O₂ 参数 | `sw`, `gamma0_O2`, `SD_gamma_O2`, `delta0_O2`, `SD_delta_O2` | 线强、展宽、位移及其误差 |
-| N₂ 参数 | `gamma0_N2`, `SD_gamma_N2`, `delta0_N2`, `SD_delta_N2` | 线性回归提取的 N₂ 展宽/位移及 R² |
+| O₂ 参数 | `sw`, `gamma0_O2`, `n_gamma0_O2`, `SD_gamma_O2`, `delta0_O2`, `SD_delta_O2` | 纯 O₂ 联合拟合结果；每项带对应 `_err` 列 |
+| N₂ 参数 | `gamma0_N2`, `SD_gamma_N2`, `delta0_N2`, `SD_delta_N2` | 线性回归结果；每项带 `_err`、`_R2`、`_npts` 列 |
+| HITRAN 参考 | `sw_HITRAN`, `gamma_self_HITRAN`, `gamma_air_HITRAN`, `n_air_HITRAN`, `delta_air_HITRAN`, `elower_HITRAN` | 与拟合参数并列，便于直接对比 |
 | 辅助 | `n_spectra_O2`, `QF_O2`, `residual_std_O2` | 拟合质量指标 |
 
 每次运行若表格已存在，自动备份为 `spectral_parameters_YYYYMMDD_HHMMSS.csv`。
@@ -126,6 +149,12 @@ data/raw/
         └── ...
 ```
 
+若需要主表中的 HITRAN 参考列，请准备：
+
+```
+data/hitran/O2_9000_10000_sw_ge_1e-29.csv
+```
+
 ### 命名规范检测
 
 流水线在 Step 1 之前会自动检测 `data/raw/` 下的命名是否符合规范：
@@ -145,3 +174,4 @@ data/raw/
 - Python ≥ 3.10
 - NumPy, SciPy, Pandas, Matplotlib, lmfit
 - [MATS](https://github.com/usnistgov/MATS)（多光谱联合拟合引擎）
+- `hitran-api`（仅 `scripts/download_o2_lines.py` 需要）
