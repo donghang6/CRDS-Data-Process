@@ -13,6 +13,10 @@
     # 自动搜索最优压力组合 (枚举所有组合, 选 QF 最大)
     python main.py O2/9386.2076 --optimize
     python main.py O2/9386.2076 --optimize --min-pressures 4
+
+    # 跳过 Step 1/2, 直接从已有的去除标准具数据开始执行 Step 3~5
+    python main.py --from-etalon
+    python main.py --from-etalon O2/9386.2076
 """
 
 import sys
@@ -32,11 +36,15 @@ def _parse_args(argv: list[str]) -> dict:
     multi_fit_pressures: dict[str, list[str]] = {}
     auto_optimize = False
     min_pressures = 3
+    from_etalon = False
 
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in ("--pressures", "-p"):
+        if arg == "--from-etalon":
+            from_etalon = True
+            i += 1
+        elif arg in ("--pressures", "-p"):
             # 后续参数格式: "气体/跃迁=压力1,压力2,..."
             i += 1
             while i < len(argv) and not argv[i].startswith("-"):
@@ -70,10 +78,15 @@ def _parse_args(argv: list[str]) -> dict:
         "multi_fit_pressures": multi_fit_pressures or None,
         "auto_optimize_pressures": auto_optimize,
         "min_multi_pressures": min_pressures,
+        "_from_etalon": from_etalon,
     }
 
 
 if __name__ == "__main__":
     kwargs = _parse_args(sys.argv[1:])
+    from_etalon = kwargs.pop("_from_etalon")
     pipeline = CRDSPipeline(**kwargs)
-    pipeline.run()
+    if from_etalon:
+        pipeline.run_from_etalon()
+    else:
+        pipeline.run()

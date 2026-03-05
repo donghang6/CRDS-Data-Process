@@ -1172,6 +1172,61 @@ class CRDSPipeline:
         logger.info(f"  全部完成! 耗时 {elapsed:.1f} s")
         logger.info(f"{'#' * 60}")
 
+    def run_from_etalon(self) -> None:
+        """从已有的去除标准具数据开始执行 Step 3~5
+
+        跳过 Step 1 (衰荡时间处理) 和 Step 2 (去除标准具)，
+        直接使用 etalon_root 下已有的 tau_etalon_corrected.csv
+        执行后续的光谱拟合、联合拟合和线性回归。
+
+        适用于:
+          - 已手动调整过去除标准具后的数据，只需重新拟合
+          - 只修改了拟合参数，不需要重新处理原始数据
+        """
+        log_path = setup_logging()
+        t0 = time.time()
+
+        logger.info("=" * 60)
+        logger.info("  CRDS 处理流水线 (从去除标准具后数据开始)")
+        logger.info("  ── 跳过 Step 1: 衰荡时间处理")
+        logger.info("  ── 跳过 Step 2: 去除标准具效应")
+        logger.info("  Step 3: MATS 单光谱拟合 (各压力独立)")
+        logger.info("  Step 4: 筛选 + 多光谱联合拟合 (纯 O₂)")
+        logger.info("  Step 5: 线性回归提取 N₂ 展宽")
+        logger.info("=" * 60)
+        logger.info(f"  线形:     {self.lineprofile}")
+        logger.info(f"  线强筛选: {self.sw_sigma}σ (Step 4)")
+        logger.info(f"  并行进程: {self.max_workers}")
+        logger.info(f"  Etalon 数据: {self.etalon_root}")
+        if self.targets:
+            logger.info(f"  指定目标: {', '.join(self.targets)}")
+        else:
+            logger.info(f"  指定目标: 全部")
+        if self.multi_fit_pressures:
+            for key, pressures in self.multi_fit_pressures.items():
+                logger.info(f"  联合拟合压力 [{key}]: {', '.join(pressures)}")
+        if self.auto_optimize_pressures:
+            logger.info(f"  自动搜索最优压力组合: 开启 "
+                        f"(最少 {self.min_multi_pressures} 个压力)")
+        logger.info(f"  日志文件: {log_path}")
+        logger.info("=" * 60)
+
+        # 检查 etalon 数据是否存在
+        if not self.etalon_root.exists():
+            logger.error(f"  去除标准具数据目录不存在: {self.etalon_root}")
+            logger.error(f"  请先运行完整流水线生成 etalon 数据")
+            return
+
+        self.step3_mats()
+        self.step4_multi_fit()
+        self.step5_linear_regression()
+        self._build_master_table()
+
+        elapsed = time.time() - t0
+        logger.info(f"\n{'#' * 60}")
+        logger.info(f"  全部完成! 耗时 {elapsed:.1f} s")
+        logger.info(f"{'#' * 60}")
+
     # ==============================================================
     # 汇总表: 将所有拟合参数合并为一张主表
     # ==============================================================
