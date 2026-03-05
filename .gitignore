@@ -227,5 +227,8 @@ output/figures/*
 !output/figures/.gitkeep
 output/results/*
 !output/results/.gitkeep
+!output/results/final/
+output/results/final/*
+!output/results/final/spectral_parameters.csv
 output/logs/
 
