@@ -668,7 +668,29 @@ class CRDSPipeline:
             fit_intensity=self.fit_intensity,
             threshold_intensity=self.threshold_intensity,
             refit_threshold=self.refit_threshold,
+            allowed_nu=self._get_allowed_nu(),
         )
+
+    def _get_allowed_nu(self) -> list[float] | None:
+        """从原始数据目录中提取所有跃迁波数列表。
+
+        返回的列表将传给 HitranLinelistBuilder.build()，
+        使 HITRAN 线表中仅保留与这些波数匹配的谱线。
+        """
+        if not self.raw_root.exists():
+            return None
+        nu_set: set[float] = set()
+        for gas_dir in self.raw_root.iterdir():
+            if not gas_dir.is_dir() or gas_dir.name.startswith("."):
+                continue
+            for t_dir in gas_dir.iterdir():
+                if not t_dir.is_dir() or t_dir.name.startswith("."):
+                    continue
+                try:
+                    nu_set.add(float(t_dir.name))
+                except ValueError:
+                    continue
+        return sorted(nu_set) if nu_set else None
 
     def _fitter_kwargs_for_gas(self, gas_type: str,
                                pressure_label: str = "") -> dict:

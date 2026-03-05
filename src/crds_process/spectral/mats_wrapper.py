@@ -200,8 +200,17 @@ class HitranLinelistBuilder:
         return tname
 
     def build(self, wn_min: float, wn_max: float,
-              save_path: Path | str | None = None) -> pd.DataFrame:
-        """构建 MATS 格式 param_linelist"""
+              save_path: Path | str | None = None,
+              allowed_nu: list[float] | None = None,
+              ) -> pd.DataFrame:
+        """构建 MATS 格式 param_linelist
+
+        Parameters
+        ----------
+        allowed_nu : list[float] | None
+            若指定，则仅保留波数与列表中某值差 < 0.01 cm⁻¹ 的谱线，
+            其余谱线从线表中移除，不参与拟合。
+        """
         self._init_hapi()
         table = self._resolve_table(wn_min - 5, wn_max + 5)
         data = self._hapi.LOCAL_TABLE_CACHE[table]["data"]
@@ -222,6 +231,18 @@ class HitranLinelistBuilder:
         })
         margin = 5.0
         df = df[(df["nu"] >= wn_min - margin) & (df["nu"] <= wn_max + margin)]
+        # 仅保留用户指定的跃迁谱线
+        if allowed_nu is not None and len(allowed_nu) > 0:
+            import numpy as np
+            allowed_arr = np.array(allowed_nu)
+            keep_mask = df["nu"].apply(
+                lambda nu: np.min(np.abs(allowed_arr - nu)) < 0.01)
+            n_before = len(df)
+            df = df[keep_mask]
+            n_removed = n_before - len(df)
+            if n_removed > 0:
+                logger.info(f"  [HITRAN] 线表过滤: 保留 {len(df)} 条 "
+                            f"(移除 {n_removed} 条非目标谱线)")
         df["sw_scale_factor"] = 1.0
         # 注意: n_gamma0_O2 已从 HITRAN 赋值，不在此列表中覆盖为 0
         # SD_gamma 设置非零初始值 (SDVP 线形需要)
@@ -352,12 +373,14 @@ class MATSFitter:
         threshold_intensity: float = 1e-35,
         gas_type: str = "O2",
         refit_threshold: float = 0.5,
+        allowed_nu: list[float] | None = None,
     ):
         self.molecule = molecule
         self.isotopologue = isotopologue
         self.molefraction = molefraction or {molecule: 1.0}
         self.diluent = diluent
         self.gas_type = gas_type
+        self.allowed_nu = allowed_nu
         # 显式设置 Diluent (与参考脚本一致)
         # 纯 O₂: Diluent={'O2': {'composition':1, 'm': 31.9988}}
         # O₂+N₂: Diluent={'O2': {'composition': x_O2, 'm': 31.9988},
@@ -481,6 +504,7 @@ class MATSFitter:
             linelist_csv = f"{dataset_name}_linelist.csv"
             param_linelist = self._linelist_builder.build(
                 wn_min, wn_max, save_path=linelist_csv,
+                allowed_nu=self.allowed_nu,
             )
             logger.info(f"  线表: {len(param_linelist)} 条谱线")
             for _, row in param_linelist.iterrows():
@@ -565,6 +589,7 @@ class MATSFitter:
             linelist_csv = f"{dataset_name}_linelist.csv"
             param_linelist = self._linelist_builder.build(
                 wn_global_min, wn_global_max, save_path=linelist_csv,
+                allowed_nu=self.allowed_nu,
             )
 
             # 应用固定参数值 (如纯 O₂ 结果中的 γ₀_O₂)
