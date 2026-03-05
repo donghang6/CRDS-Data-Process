@@ -887,7 +887,8 @@ class CRDSPipeline:
         使用多进程并行拟合，选取 QF 最大的组合作为最终结果。
         """
         tag = f"{gas_type}/{transition}"
-        all_pressures = [r["pressure"] for r in records]
+        # 去重并保持顺序 (一个压力下可能有多条 sw_vary=True 的谱线)
+        all_pressures = list(dict.fromkeys(r["pressure"] for r in records))
         n = len(all_pressures)
         min_k = self.min_multi_pressures
 
