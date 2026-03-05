@@ -224,13 +224,18 @@ def _worker_trial_multi_fit(
             if not result:
                 return combo, -1.0, 0.0
             qf = result.qf
-            # 提取目标跃迁的拟合线强
+            # 提取目标跃迁的拟合线强 (选 nu 与 transition 最接近的行)
             sw = 0.0
             if not result.param_linelist.empty:
                 fitted = result.param_linelist[
                     result.param_linelist["sw_vary"] == True]
                 if not fitted.empty:
-                    row = fitted.iloc[0]
+                    try:
+                        nu_target = float(transition)
+                        idx_closest = (fitted["nu"] - nu_target).abs().idxmin()
+                        row = fitted.loc[idx_closest]
+                    except (ValueError, KeyError):
+                        row = fitted.iloc[0]
                     scale = row.get("sw_scale_factor", 1.0)
                     sw = row["sw"] * scale
             return combo, qf, sw
@@ -1248,7 +1253,13 @@ class CRDSPipeline:
                 try:
                     o2_df = pd.read_csv(o2_csv)
                     if not o2_df.empty:
-                        row = o2_df.iloc[0]
+                        # 匹配目标跃迁: 选 nu_HITRAN 与 transition 波数最接近的行
+                        nu_target = float(transition)
+                        if "nu_HITRAN" in o2_df.columns:
+                            idx_closest = (o2_df["nu_HITRAN"] - nu_target).abs().idxmin()
+                            row = o2_df.loc[idx_closest]
+                        else:
+                            row = o2_df.iloc[0]
                         rec["n_spectra_O2"] = int(row.get("n_spectra", 0))
                         rec["QF_O2"] = row.get("QF", 0)
                         rec["residual_std_O2"] = row.get("residual_std", 0)
