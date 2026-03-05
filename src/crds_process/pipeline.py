@@ -1248,7 +1248,9 @@ class CRDSPipeline:
             d = self.final_root / sub
             if d.exists():
                 for t_dir in d.iterdir():
-                    if t_dir.is_dir() and not t_dir.name.startswith("."):
+                    if (t_dir.is_dir()
+                            and not t_dir.name.startswith(".")
+                            and not t_dir.name.startswith("merged_")):
                         transitions.add(t_dir.name)
 
         for transition in sorted(transitions):
