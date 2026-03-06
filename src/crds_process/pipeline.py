@@ -305,6 +305,10 @@ class CRDSPipeline:
         例如: [9403.163069]
     """
 
+    # 干空气近似组成，用于由 HITRAN air/self 展宽反推 N2 展宽
+    _AIR_O2_FRACTION = 0.21
+    _AIR_N2_FRACTION = 0.79
+
     def __init__(
         self,
         raw_root: Path | str | None = None,
@@ -1418,6 +1422,25 @@ class CRDSPipeline:
             return hitran_df.iloc[idx_min]
         return None
 
+    @classmethod
+    def _estimate_hitran_n2_broadening(
+        cls,
+        gamma_air: float,
+        gamma_self: float,
+    ) -> float | None:
+        """由 HITRAN air/self 展宽近似反推 N2 展宽。
+
+        采用干空气二组分近似:
+            gamma_air = x_O2 * gamma_O2 + x_N2 * gamma_N2
+
+        其中对 O2 谱线取 gamma_O2 = gamma_self。
+        """
+        if cls._AIR_N2_FRACTION <= 0:
+            return None
+        return (
+            gamma_air - cls._AIR_O2_FRACTION * gamma_self
+        ) / cls._AIR_N2_FRACTION
+
     def _build_master_table(self) -> None:
         """将 O₂ 多光谱联合拟合和 N₂ 线性回归的所有参数
         合并为一张主表，以跃迁波数为第一列。
@@ -1460,6 +1483,10 @@ class CRDSPipeline:
                         rec["sw_HITRAN"] = hitran_row["sw"]
                         rec["gamma_self_HITRAN"] = hitran_row["gamma_self"]
                         rec["gamma_air_HITRAN"] = hitran_row["gamma_air"]
+                        rec["gamma0_N2_HITRAN"] = self._estimate_hitran_n2_broadening(
+                            gamma_air=float(hitran_row["gamma_air"]),
+                            gamma_self=float(hitran_row["gamma_self"]),
+                        )
                         rec["n_air_HITRAN"] = hitran_row["n_air"]
                         rec["delta_air_HITRAN"] = hitran_row["delta_air"]
                         rec["elower_HITRAN"] = hitran_row["elower"]
@@ -1513,6 +1540,8 @@ class CRDSPipeline:
             return
 
         master_df = pd.DataFrame(rows)
+        if "gamma0_N2" not in master_df.columns:
+            master_df["gamma0_N2"] = np.nan
 
         # 列排序: nu → 各参数组 (拟合值 + HITRAN 参考 紧邻排列)
         desired_order = ["nu"]
@@ -1530,8 +1559,13 @@ class CRDSPipeline:
         desired_order.extend(["SD_delta_O2", "SD_delta_O2_err"])
         # ── gamma_air_HITRAN (空气展宽参考) ──
         desired_order.append("gamma_air_HITRAN")
+        # ── N₂ 展宽: 拟合值 + HITRAN 反推值 ──
+        desired_order.extend([
+            "gamma0_N2", "gamma0_N2_HITRAN",
+            "gamma0_N2_err", "gamma0_N2_R2", "gamma0_N2_npts",
+        ])
         # ── N₂ 参数 ──
-        n2_params = ["gamma0_N2", "SD_gamma_N2", "delta0_N2", "SD_delta_N2"]
+        n2_params = ["SD_gamma_N2", "delta0_N2", "SD_delta_N2"]
         for p in n2_params:
             desired_order.append(p)
             desired_order.append(f"{p}_err")
