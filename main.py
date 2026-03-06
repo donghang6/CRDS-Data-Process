@@ -14,6 +14,16 @@
     python main.py O2/9386.2076 --optimize
     python main.py O2/9386.2076 --optimize --min-pressures 4
 
+    # 仅拟合指定跃迁(吸收线); 多个值可用逗号分隔
+    python main.py O2/9403.163069 --fit-transitions 9403.163069
+    python main.py O2/9403.163069 --fit-lines 9403.163069,9401.731225
+
+    # 跳过 Step 1, 直接从已有的 ringdown 结果开始执行 Step 2~5
+    python main.py --from-ringdown
+    python main.py --from-ringdown O2/9386.2076
+    python main.py --from-ringdown O2/9386.2076 \
+        --pressures O2/9386.2076=100Torr,200Torr,300Torr
+
     # 跳过 Step 1/2, 直接从已有的去除标准具数据开始执行 Step 3~5
     python main.py --from-etalon
     python main.py --from-etalon O2/9386.2076
@@ -34,14 +44,19 @@ def _parse_args(argv: list[str]) -> dict:
     """
     targets = []
     multi_fit_pressures: dict[str, list[str]] = {}
+    fit_transitions: list[float] = []
     auto_optimize = False
     min_pressures = 3
+    from_ringdown = False
     from_etalon = False
 
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--from-etalon":
+        if arg == "--from-ringdown":
+            from_ringdown = True
+            i += 1
+        elif arg == "--from-etalon":
             from_etalon = True
             i += 1
         elif arg in ("--pressures", "-p"):
@@ -58,6 +73,18 @@ def _parse_args(argv: list[str]) -> dict:
                     print(f"警告: 忽略无效的 --pressures 参数: {spec}")
                     print(f"  格式应为: 气体类型/跃迁=压力1,压力2,...")
                 i += 1
+        elif arg in ("--fit-transitions", "--fit-lines", "--fit-nu"):
+            i += 1
+            if i >= len(argv) or argv[i].startswith("-"):
+                print(f"警告: {arg} 缺少参数，已忽略")
+                continue
+            raw_vals = [v.strip() for v in argv[i].split(",") if v.strip()]
+            for raw in raw_vals:
+                try:
+                    fit_transitions.append(float(raw))
+                except ValueError:
+                    print(f"警告: 忽略无效的跃迁波数: {raw}")
+            i += 1
         elif arg == "--optimize":
             auto_optimize = True
             i += 1
@@ -76,17 +103,27 @@ def _parse_args(argv: list[str]) -> dict:
     return {
         "targets": targets or None,
         "multi_fit_pressures": multi_fit_pressures or None,
+        "fit_transitions": sorted(set(fit_transitions)) or None,
         "auto_optimize_pressures": auto_optimize,
         "min_multi_pressures": min_pressures,
+        "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,
     }
 
 
 if __name__ == "__main__":
     kwargs = _parse_args(sys.argv[1:])
+    from_ringdown = kwargs.pop("_from_ringdown")
     from_etalon = kwargs.pop("_from_etalon")
+
+    if from_ringdown and from_etalon:
+        print("错误: --from-ringdown 与 --from-etalon 不能同时使用")
+        sys.exit(2)
+
     pipeline = CRDSPipeline(**kwargs)
     if from_etalon:
         pipeline.run_from_etalon()
+    elif from_ringdown:
+        pipeline.run_from_ringdown()
     else:
         pipeline.run()
