@@ -85,6 +85,11 @@ python main.py O2/9386.2076 O2_N2/9386.2076  # 同时处理多个目标
 python main.py O2/9403.163069 --fit-transitions 9403.163069
 python main.py O2/9403.163069 --fit-lines 9403.163069,9401.731225
 
+# 仅提取 N2 展宽，跳过纯 O2 联合拟合（依赖已有纯 O2 Step 4 结果）
+python main.py --n2-only O2_N2/9403.163069
+python main.py --from-ringdown --n2-only O2_N2/9403.163069
+python main.py --from-etalon --n2-only O2_N2/9403.163069
+
 # 跳过 Step 1，复用已生成 ringdown 结果，从 Step 2 开始
 python main.py --from-ringdown
 python main.py --from-ringdown O2/9386.2076
@@ -133,6 +138,14 @@ Step 4（纯 O₂ 联合拟合）的压力点选择按以下顺序执行：
 - `--fit-nu`（别名）
 
 参数值为跃迁波数（cm⁻¹），支持逗号分隔多个值。启用后 Step 3/4 的 HITRAN 线表会仅保留这些跃迁。
+
+### 仅提取 N2 展宽
+
+若纯 O2 的 Step 4 联合拟合结果已经存在，而你只想更新 O2+N2 的单光谱拟合和
+Step 5 线性回归，可使用 `--n2-only`。
+
+该模式只处理 `O2_N2` 数据，跳过纯 O2 联合拟合，但 Step 5 仍会读取
+`output/results/final/O2/{transition}/multi_fit_result.csv` 作为固定 O2 参考。
 
 ## 输出说明
 

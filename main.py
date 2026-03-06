@@ -18,6 +18,11 @@
     python main.py O2/9403.163069 --fit-transitions 9403.163069
     python main.py O2/9403.163069 --fit-lines 9403.163069,9401.731225
 
+    # 仅提取 N2 展宽; 跳过纯 O2 联合拟合, 依赖已有纯 O2 Step 4 结果
+    python main.py --n2-only O2_N2/9403.163069
+    python main.py --from-ringdown --n2-only O2_N2/9403.163069
+    python main.py --from-etalon --n2-only O2_N2/9403.163069
+
     # 跳过 Step 1, 直接从已有的 ringdown 结果开始执行 Step 2~5
     python main.py --from-ringdown
     python main.py --from-ringdown O2/9386.2076
@@ -47,6 +52,7 @@ def _parse_args(argv: list[str]) -> dict:
     fit_transitions: list[float] = []
     auto_optimize = False
     min_pressures = 3
+    n2_only = False
     from_ringdown = False
     from_etalon = False
 
@@ -58,6 +64,9 @@ def _parse_args(argv: list[str]) -> dict:
             i += 1
         elif arg == "--from-etalon":
             from_etalon = True
+            i += 1
+        elif arg == "--n2-only":
+            n2_only = True
             i += 1
         elif arg in ("--pressures", "-p"):
             # 后续参数格式: "气体/跃迁=压力1,压力2,..."
@@ -106,6 +115,7 @@ def _parse_args(argv: list[str]) -> dict:
         "fit_transitions": sorted(set(fit_transitions)) or None,
         "auto_optimize_pressures": auto_optimize,
         "min_multi_pressures": min_pressures,
+        "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,
     }
@@ -113,6 +123,7 @@ def _parse_args(argv: list[str]) -> dict:
 
 if __name__ == "__main__":
     kwargs = _parse_args(sys.argv[1:])
+    n2_only = kwargs.pop("_n2_only")
     from_ringdown = kwargs.pop("_from_ringdown")
     from_etalon = kwargs.pop("_from_etalon")
 
@@ -121,7 +132,14 @@ if __name__ == "__main__":
         sys.exit(2)
 
     pipeline = CRDSPipeline(**kwargs)
-    if from_etalon:
+    if n2_only:
+        if from_etalon:
+            pipeline.run_n2_only_from_etalon()
+        elif from_ringdown:
+            pipeline.run_n2_only_from_ringdown()
+        else:
+            pipeline.run_n2_only()
+    elif from_etalon:
         pipeline.run_from_etalon()
     elif from_ringdown:
         pipeline.run_from_ringdown()
