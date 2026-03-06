@@ -1693,6 +1693,8 @@ class CRDSPipeline:
                     n2_df = pd.read_csv(n2_csv)
                     for _, lr_row in n2_df.iterrows():
                         param_base = lr_row["parameter"]  # gamma0, SD_gamma, ...
+                        if param_base != "gamma0":
+                            continue
                         col_n2 = f"{param_base}_N2"
                         rec[col_n2] = lr_row["value_N2"]
                         rec[f"{col_n2}_err"] = lr_row["uncertainty_N2"]
@@ -1732,16 +1734,17 @@ class CRDSPipeline:
             "gamma0_N2", "gamma0_N2_HITRAN",
             "gamma0_N2_err", "gamma0_N2_R2", "gamma0_N2_npts",
         ])
-        # ── N₂ 参数 ──
-        n2_params = ["SD_gamma_N2", "delta0_N2", "SD_delta_N2"]
-        for p in n2_params:
-            desired_order.append(p)
-            desired_order.append(f"{p}_err")
-            desired_order.append(f"{p}_R2")
-            desired_order.append(f"{p}_npts")
         # ── 辅助列 ──
         desired_order.extend(["elower_HITRAN",
                               "n_spectra_O2", "QF_O2", "residual_std_O2"])
+
+        # 主表中仅保留 N2 展宽，不包含其他 N2 参数
+        drop_cols = [
+            "SD_gamma_N2", "SD_gamma_N2_err", "SD_gamma_N2_R2", "SD_gamma_N2_npts",
+            "delta0_N2", "delta0_N2_err", "delta0_N2_R2", "delta0_N2_npts",
+            "SD_delta_N2", "SD_delta_N2_err", "SD_delta_N2_R2", "SD_delta_N2_npts",
+        ]
+        master_df = master_df.drop(columns=drop_cols, errors="ignore")
 
         # 只保留实际存在的列，按 desired_order 排序，其余追加在末尾
         existing = list(master_df.columns)

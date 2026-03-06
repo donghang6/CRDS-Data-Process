@@ -156,7 +156,7 @@ Step 5 线性回归，可使用 `--n2-only`。
 | 列组 | 参数 | 说明 |
 |------|------|------|
 | O₂ 参数 | `sw`, `gamma0_O2`, `n_gamma0_O2`, `SD_gamma_O2`, `delta0_O2`, `SD_delta_O2` | 纯 O₂ 联合拟合结果；每项带对应 `_err` 列 |
-| N₂ 参数 | `gamma0_N2`, `SD_gamma_N2`, `delta0_N2`, `SD_delta_N2` | 线性回归结果；每项带 `_err`、`_R2`、`_npts` 列。若当前未生成 N₂ 线性回归结果，则 `gamma0_N2` 保留为 `NaN` |
+| N₂ 参数 | `gamma0_N2` | 仅保留 N₂ 展宽线性回归结果；附带 `_err`、`_R2`、`_npts` 列。若当前未生成 N₂ 线性回归结果，则为 `NaN` |
 | HITRAN 参考 | `sw_HITRAN`, `gamma_self_HITRAN`, `gamma_air_HITRAN`, `gamma0_N2_HITRAN`, `n_air_HITRAN`, `delta_air_HITRAN`, `elower_HITRAN` | 其中 `gamma0_N2_HITRAN` 由干空气近似 `gamma_air = 0.21*gamma_self + 0.79*gamma_N2` 反推得到 |
 | 辅助 | `n_spectra_O2`, `QF_O2`, `residual_std_O2` | 拟合质量指标 |
 
