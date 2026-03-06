@@ -1204,6 +1204,21 @@ class CRDSPipeline:
             logger.info(f"    O₂+N₂ 数据: {mix_stats}")
             logger.info(f"    纯 O₂ 参考: {o2_multi}")
 
+            specified_pressures = self._lookup_multi_fit_pressures(
+                "O2_N2", transition)
+            optimize_pressures = (
+                self.auto_optimize_pressures and specified_pressures is None
+            )
+            if specified_pressures is not None:
+                logger.info("    Step 5 压力: 使用手动指定压力 "
+                            + ", ".join(specified_pressures))
+            elif optimize_pressures:
+                logger.info("    Step 5 压力: 自动搜索最优组合 "
+                            f"(按 gamma0_N2 的 R², 最少 "
+                            f"{max(self.min_multi_pressures, 3)} 个压力)")
+            else:
+                logger.info("    Step 5 压力: 使用全部可用压力")
+
             output_dir = t_dir  # 直接保存在 final/O2_N2/{transition}/ 下
             extractor = N2BroadeningExtractor(
                 transition=transition,
@@ -1215,6 +1230,9 @@ class CRDSPipeline:
                     mix_stats_csv=mix_stats,
                     o2_multi_csv=o2_multi,
                     output_dir=output_dir,
+                    allowed_pressures=specified_pressures,
+                    optimize_pressures=optimize_pressures,
+                    min_pressures=max(self.min_multi_pressures, 3),
                 )
 
                 if results:

@@ -89,6 +89,8 @@ python main.py O2/9403.163069 --fit-lines 9403.163069,9401.731225
 python main.py --n2-only O2_N2/9403.163069
 python main.py --from-ringdown --n2-only O2_N2/9403.163069
 python main.py --from-etalon --n2-only O2_N2/9403.163069
+python main.py --n2-only O2_N2/9403.163069 --optimize
+python main.py --n2-only O2_N2/9403.163069 --optimize --min-pressures 4
 
 # 跳过 Step 1，复用已生成 ringdown 结果，从 Step 2 开始
 python main.py --from-ringdown
@@ -128,6 +130,16 @@ Step 4（纯 O₂ 联合拟合）的压力点选择按以下顺序执行：
 
 补充：在 `--from-ringdown` / `--from-etalon` 续跑模式下，若同时提供
 `--pressures`，Step 2/Step 3 也会仅处理该跃迁指定的压力。
+
+### Step 5 压力选择优先级
+
+Step 5（N₂ 线性回归）的压力点选择按以下顺序执行：
+
+1. 若对 `O2_N2/{transition}` 传入 `--pressures`，仅使用这些压力做回归。
+2. 否则若启用 `--optimize`，枚举所有压力组合（最少 3 个压力，或 `--min-pressures` 与 3 取较大值），按 `gamma0_N2` 的 `R²` 最大选择最终组合。
+3. 否则使用全部可用压力直接回归。
+
+启用自动搜索时，会额外输出 `pressure_optimization_n2.csv`，记录各组合的 `R²`、`gamma0_N2` 和最终选中的压力组合。
 
 ### 指定拟合跃迁
 
