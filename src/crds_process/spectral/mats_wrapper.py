@@ -76,7 +76,7 @@ class MATSSpectrumPreparer:
         - temperature_column: 温度 (°C)
         - frequency_column: 波数 (cm⁻¹)
         - tau_column: 衰荡时间 (μs)
-        - tau_stats_column: tau 标准差 (可选)
+        - tau_stats_column: tau 相对误差百分比 (可选)
     """
 
     MATS_PRESSURE = "Cavity Pressure /Torr"
@@ -125,7 +125,17 @@ class MATSSpectrumPreparer:
         mats_df[self.MATS_FREQUENCY] = df[self.wavenumber_col]
         mats_df[self.MATS_TAU] = df[self.tau_col]
         if self.tau_stats_col and self.tau_stats_col in df.columns:
-            mats_df[self.MATS_TAU_STATS] = df[self.tau_stats_col]
+            tau_vals = pd.to_numeric(df[self.tau_col], errors="coerce").to_numpy(dtype=float)
+            tau_stats = pd.to_numeric(df[self.tau_stats_col], errors="coerce").to_numpy(dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rel_pct = np.abs(tau_stats / tau_vals) * 100.0
+            rel_pct[~np.isfinite(rel_pct)] = np.nan
+            if np.isfinite(rel_pct).any():
+                fallback = float(np.nanmedian(rel_pct[np.isfinite(rel_pct)]))
+                rel_pct = np.nan_to_num(rel_pct, nan=fallback, posinf=fallback, neginf=fallback)
+            else:
+                rel_pct = np.zeros_like(tau_vals, dtype=float)
+            mats_df[self.MATS_TAU_STATS] = rel_pct
 
         parent = Path(csv_path).parent
         if str(parent) != ".":
@@ -817,7 +827,7 @@ class MATSFitter:
             fit = Fit_DataSet(
                 ds, base_file, param_file,
                 minimum_parameter_fit_intensity=self.fit_intensity,
-                weight_spectra=False,
+                weight_spectra=True,
             )
             params = fit.generate_params()
 
@@ -972,7 +982,7 @@ class MATSFitter:
         fit = Fit_DataSet(
             ds, base_file, param_file,
             minimum_parameter_fit_intensity=self.fit_intensity,
-            weight_spectra=False,
+            weight_spectra=True,
         )
         params = fit.generate_params()
         params_initial = copy.deepcopy(params)
