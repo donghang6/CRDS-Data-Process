@@ -311,8 +311,12 @@ class CRDSPipeline:
         仅拟合指定跃迁波数(吸收线)，单位 cm⁻¹。
         若提供，则 Step 3/4 的 HITRAN 线表仅保留这些跃迁。
         例如: [9403.163069]
-    remeasure_rel_threshold : float
-        建议重测报告中，相对偏差阈值 (默认 0.05 = 5%)
+    remeasure_rel_threshold : float, optional
+        建议重测报告的统一相对偏差阈值。若提供，则同时覆盖 O2 和 O2_N2。
+    remeasure_rel_threshold_o2 : float, optional
+        建议重测报告中，纯 O2 的相对偏差阈值 (默认 0.05 = 5%)
+    remeasure_rel_threshold_o2n2 : float, optional
+        建议重测报告中，O2_N2 的相对偏差阈值 (默认 0.10 = 10%)
     remeasure_sigma_threshold : float
         建议重测报告中，偏差相对联合不确定度的阈值 (默认 3σ)
     """
@@ -345,7 +349,9 @@ class CRDSPipeline:
         auto_optimize_pressures: bool = False,
         min_multi_pressures: int = 3,
         fit_transitions: list[float] | None = None,
-        remeasure_rel_threshold: float = 0.05,
+        remeasure_rel_threshold: float | None = None,
+        remeasure_rel_threshold_o2: float | None = None,
+        remeasure_rel_threshold_o2n2: float | None = None,
         remeasure_sigma_threshold: float = 3.0,
     ):
         # ── 路径 ──
@@ -384,7 +390,20 @@ class CRDSPipeline:
             self.fit_transitions = None
 
         # ── 建议重测报告阈值 ──
-        self.remeasure_rel_threshold = max(float(remeasure_rel_threshold), 0.0)
+        self.remeasure_rel_threshold_o2 = (
+            max(float(remeasure_rel_threshold_o2), 0.0)
+            if remeasure_rel_threshold_o2 is not None else 0.05
+        )
+        self.remeasure_rel_threshold_o2n2 = (
+            max(float(remeasure_rel_threshold_o2n2), 0.0)
+            if remeasure_rel_threshold_o2n2 is not None else 0.10
+        )
+        if remeasure_rel_threshold is not None:
+            shared_rel = max(float(remeasure_rel_threshold), 0.0)
+            if remeasure_rel_threshold_o2 is None:
+                self.remeasure_rel_threshold_o2 = shared_rel
+            if remeasure_rel_threshold_o2n2 is None:
+                self.remeasure_rel_threshold_o2n2 = shared_rel
         self.remeasure_sigma_threshold = max(float(remeasure_sigma_threshold), 0.0)
 
         # ── MATS 拟合参数 ──
@@ -1702,12 +1721,17 @@ class CRDSPipeline:
         expected: float,
         observed_err: float = np.nan,
         expected_err: float = np.nan,
+        rel_threshold: float | None = None,
     ) -> tuple[bool, float, float]:
         """判断单个指标是否超出建议重测阈值。"""
         obs = self._safe_float(observed)
         exp = self._safe_float(expected)
         obs_err = self._safe_float(observed_err)
         exp_err = self._safe_float(expected_err)
+        rel_limit = (
+            self.remeasure_rel_threshold_o2
+            if rel_threshold is None else max(float(rel_threshold), 0.0)
+        )
 
         if not np.isfinite(obs) or not np.isfinite(exp):
             return False, np.nan, np.nan
@@ -1730,7 +1754,7 @@ class CRDSPipeline:
 
         flagged = False
         if np.isfinite(rel_diff_pct):
-            flagged |= rel_diff_pct > self.remeasure_rel_threshold * 100.0
+            flagged |= rel_diff_pct > rel_limit * 100.0
         if np.isfinite(sigma_ratio):
             flagged |= sigma_ratio > self.remeasure_sigma_threshold
 
@@ -2136,6 +2160,7 @@ class CRDSPipeline:
                     expected=sw_ref,
                     observed_err=row.get("sw_err"),
                     expected_err=sw_ref_err,
+                    rel_threshold=self.remeasure_rel_threshold_o2,
                 )
                 if sw_flagged:
                     failed_metrics.append("sw")
@@ -2224,27 +2249,11 @@ class CRDSPipeline:
             else:
                 logger.warning(f"  [O2_N2/{transition}] 缺少纯 O2 参考: {o2_multi_csv}")
 
-            gamma0_n2 = np.nan
-            gamma0_n2_err = np.nan
-            linreg_csv = t_dir / "linear_regression_n2.csv"
-            if linreg_csv.exists():
-                try:
-                    n2_df = pd.read_csv(linreg_csv)
-                    gamma_rows = n2_df[n2_df["parameter"].astype(str) == "gamma0"]
-                    if not gamma_rows.empty:
-                        gamma_row = gamma_rows.iloc[0]
-                        gamma0_n2 = self._safe_float(gamma_row.get("value_N2"))
-                        gamma0_n2_err = self._safe_float(gamma_row.get("uncertainty_N2"))
-                except Exception as exc:
-                    logger.warning(f"  [O2_N2/{transition}] 读取 N2 线性回归结果失败: {exc}")
-            else:
-                logger.warning(f"  [O2_N2/{transition}] 缺少 N2 回归结果: {linreg_csv}")
-
-            gamma0_o2 = np.nan
-            gamma0_o2_err = np.nan
+            sw_ref = np.nan
+            sw_ref_err = np.nan
             if o2_ref_row is not None:
-                gamma0_o2 = self._safe_float(o2_ref_row.get("gamma0_O2"))
-                gamma0_o2_err = self._safe_float(o2_ref_row.get("gamma0_O2_err"))
+                sw_ref = self._safe_float(o2_ref_row.get("sw"))
+                sw_ref_err = self._safe_float(o2_ref_row.get("sw_err"))
 
             for _, row in stat_df.iterrows():
                 fit_valid = (
@@ -2261,10 +2270,8 @@ class CRDSPipeline:
 
                 x_o2 = np.nan
                 x_n2 = np.nan
-                gamma_model = np.nan
-                gamma_model_err = np.nan
-                gamma_rel = np.nan
-                gamma_sigma = np.nan
+                sw_rel = np.nan
+                sw_sigma = np.nan
 
                 pressure_label = str(row.get("pressure", ""))
                 try:
@@ -2276,29 +2283,15 @@ class CRDSPipeline:
                         f"  [O2_N2/{transition}] 无法解析压力标签 '{pressure_label}': {exc}"
                     )
 
-                if (
-                    np.isfinite(gamma0_o2)
-                    and np.isfinite(gamma0_n2)
-                    and np.isfinite(x_o2)
-                    and np.isfinite(x_n2)
-                ):
-                    gamma_model = gamma0_o2 * x_o2 + gamma0_n2 * x_n2
-                    err_terms = []
-                    if np.isfinite(gamma0_o2_err) and gamma0_o2_err > 0:
-                        err_terms.append((x_o2 * gamma0_o2_err) ** 2)
-                    if np.isfinite(gamma0_n2_err) and gamma0_n2_err > 0:
-                        err_terms.append((x_n2 * gamma0_n2_err) ** 2)
-                    if err_terms:
-                        gamma_model_err = float(np.sqrt(sum(err_terms)))
-
-                    gamma_flagged, gamma_rel, gamma_sigma = self._evaluate_remeasure_metric(
-                        observed=row.get("gamma0_air"),
-                        expected=gamma_model,
-                        observed_err=row.get("gamma0_air_err"),
-                        expected_err=gamma_model_err,
-                    )
-                    if gamma_flagged:
-                        failed_metrics.append("gamma0_N2")
+                sw_flagged, sw_rel, sw_sigma = self._evaluate_remeasure_metric(
+                    observed=row.get("sw"),
+                    expected=sw_ref,
+                    observed_err=row.get("sw_err"),
+                    expected_err=sw_ref_err,
+                    rel_threshold=self.remeasure_rel_threshold_o2n2,
+                )
+                if sw_flagged:
+                    failed_metrics.append("sw")
 
                 if not failed_metrics:
                     continue
@@ -2314,24 +2307,24 @@ class CRDSPipeline:
                     "residual_std": self._safe_float(row.get("residual_std")),
                     "sw_value": self._safe_float(row.get("sw")),
                     "sw_err": self._safe_float(row.get("sw_err")),
-                    "sw_ref": np.nan,
-                    "sw_ref_err": np.nan,
-                    "sw_rel_diff_pct": np.nan,
-                    "sw_sigma_ratio": np.nan,
+                    "sw_ref": sw_ref,
+                    "sw_ref_err": sw_ref_err,
+                    "sw_rel_diff_pct": sw_rel,
+                    "sw_sigma_ratio": sw_sigma,
                     "gamma0_O2_value": np.nan,
                     "gamma0_O2_err": np.nan,
-                    "gamma0_O2_ref": gamma0_o2,
-                    "gamma0_O2_ref_err": gamma0_o2_err,
+                    "gamma0_O2_ref": np.nan,
+                    "gamma0_O2_ref_err": np.nan,
                     "gamma0_O2_rel_diff_pct": np.nan,
                     "gamma0_O2_sigma_ratio": np.nan,
                     "gamma0_air_value": self._safe_float(row.get("gamma0_air")),
                     "gamma0_air_err": self._safe_float(row.get("gamma0_air_err")),
-                    "gamma0_air_model": gamma_model,
-                    "gamma0_air_model_err": gamma_model_err,
-                    "gamma0_air_rel_diff_pct": gamma_rel,
-                    "gamma0_air_sigma_ratio": gamma_sigma,
-                    "gamma0_N2_ref": gamma0_n2,
-                    "gamma0_N2_ref_err": gamma0_n2_err,
+                    "gamma0_air_model": np.nan,
+                    "gamma0_air_model_err": np.nan,
+                    "gamma0_air_rel_diff_pct": np.nan,
+                    "gamma0_air_sigma_ratio": np.nan,
+                    "gamma0_N2_ref": np.nan,
+                    "gamma0_N2_ref_err": np.nan,
                     "x_O2": x_o2,
                     "x_N2": x_n2,
                 })
@@ -2354,7 +2347,11 @@ class CRDSPipeline:
         logger.info("  建议重测点报告")
         logger.info("=" * 60)
         logger.info("  数据来源: 已有 final/ 结果")
-        logger.info(f"  相对偏差阈值: {self.remeasure_rel_threshold * 100:.1f}%")
+        logger.info(
+            "  相对偏差阈值: "
+            f"O2={self.remeasure_rel_threshold_o2 * 100:.1f}%, "
+            f"O2_N2={self.remeasure_rel_threshold_o2n2 * 100:.1f}%"
+        )
         logger.info(f"  sigma 阈值: {self.remeasure_sigma_threshold:.1f}σ")
         logger.info(f"  纯 O2 压力计划表: {_O2_REMEASURE_PLAN_CSV}")
         if self.targets:
@@ -2758,8 +2755,9 @@ class CRDSPipeline:
         1. 窗口宽度固定为 width cm^-1
         2. 目标跃迁必须落在窗口内
         3. 仅在当前气体类型的已测跃迁集合内比较相邻线
-        4. 在所有候选窗口中优先选包含跃迁数最少的
-        5. 若并列，则优先目标线更接近窗口中心
+        4. 优先保持目标跃迁位于窗口中央区域
+        5. 在该前提下优先选包含跃迁数最少的
+        6. 若并列，则优先目标线更接近窗口中心
         """
         cache_key = (f"{gas_type}:{transition}", float(width))
         cached = self._measurement_window_cache.get(cache_key)
@@ -2810,8 +2808,8 @@ class CRDSPipeline:
             candidate_starts.add(float(value))
             candidate_starts.add(float(value) - width)
 
-        best_score = None
-        best_rec = None
+        candidate_records: list[tuple[tuple[float, float, float, float], dict]] = []
+        max_center_shift = width / 4.0
         for raw_start in sorted(candidate_starts):
             start = min(max(raw_start, start_min), start_max)
             end = start + width
@@ -2828,18 +2826,25 @@ class CRDSPipeline:
                 abs(shift),
                 start,
             )
-            if best_score is None or score < best_score:
-                best_score = score
-                best_rec = {
+            candidate_records.append((
+                score,
+                {
                     "start": float(start),
                     "end": float(end),
                     "n_lines": line_count,
                     "is_isolated": line_count == 1,
                     "shift": float(shift),
                     "line_positions": [float(x) for x in inside],
-                }
+                },
+            ))
 
-        if best_rec is None:
+        if candidate_records:
+            preferred = [
+                item for item in candidate_records
+                if abs(item[1]["shift"]) <= max_center_shift + tol
+            ]
+            _, best_rec = min(preferred or candidate_records, key=lambda item: item[0])
+        else:
             best_rec = {
                 "start": default_start,
                 "end": default_end,

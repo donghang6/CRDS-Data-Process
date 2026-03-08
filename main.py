@@ -27,6 +27,7 @@
     python main.py --remeasure-report
     python main.py --remeasure-report O2/9403.163069
     python main.py --remeasure-report --remeasure-rel 0.05 --remeasure-sigma 3
+    python main.py --remeasure-report --remeasure-rel-o2 0.05 --remeasure-rel-o2n2 0.10
 
     # 跳过 Step 1, 直接从已有的 ringdown 结果开始执行 Step 2~5
     python main.py --from-ringdown
@@ -61,7 +62,9 @@ def _parse_args(argv: list[str]) -> dict:
     from_ringdown = False
     from_etalon = False
     remeasure_report = False
-    remeasure_rel = 0.05
+    remeasure_rel = None
+    remeasure_rel_o2 = None
+    remeasure_rel_o2n2 = None
     remeasure_sigma = 3.0
 
     i = 0
@@ -86,6 +89,22 @@ def _parse_args(argv: list[str]) -> dict:
                     remeasure_rel = float(argv[i])
                 except ValueError:
                     print(f"警告: --remeasure-rel 参数无效: {argv[i]}，使用默认值 0.05")
+            i += 1
+        elif arg == "--remeasure-rel-o2":
+            i += 1
+            if i < len(argv):
+                try:
+                    remeasure_rel_o2 = float(argv[i])
+                except ValueError:
+                    print(f"警告: --remeasure-rel-o2 参数无效: {argv[i]}，使用默认值 0.05")
+            i += 1
+        elif arg == "--remeasure-rel-o2n2":
+            i += 1
+            if i < len(argv):
+                try:
+                    remeasure_rel_o2n2 = float(argv[i])
+                except ValueError:
+                    print(f"警告: --remeasure-rel-o2n2 参数无效: {argv[i]}，使用默认值 0.10")
             i += 1
         elif arg == "--remeasure-sigma":
             i += 1
@@ -143,6 +162,8 @@ def _parse_args(argv: list[str]) -> dict:
         "auto_optimize_pressures": auto_optimize,
         "min_multi_pressures": min_pressures,
         "remeasure_rel_threshold": remeasure_rel,
+        "remeasure_rel_threshold_o2": remeasure_rel_o2,
+        "remeasure_rel_threshold_o2n2": remeasure_rel_o2n2,
         "remeasure_sigma_threshold": remeasure_sigma,
         "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,

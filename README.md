@@ -97,6 +97,7 @@ python main.py --remeasure-report
 python main.py --remeasure-report O2/9403.163069
 python main.py --remeasure-report O2/9403.163069 O2_N2/9403.163069
 python main.py --remeasure-report --remeasure-rel 0.05 --remeasure-sigma 3
+python main.py --remeasure-report --remeasure-rel-o2 0.05 --remeasure-rel-o2n2 0.10
 
 # 跳过 Step 1，复用已生成 ringdown 结果，从 Step 2 开始
 python main.py --from-ringdown
@@ -189,16 +190,16 @@ Step 5 线性回归，可使用 `--n2-only`。
 1. 纯 O2：仅检查单谱 `sw`，并与同一跃迁下其他压力点的 `sw` 自比较，找出偏差过大的压力点
    仅在 `data/reference/o2_remeasure_pressure_plan.csv` 定义的压力集合内判断；
    额外加测但不在表内的纯 O2 压力，不列入重测建议
-2. O2_N2：单谱 `gamma0_air` 相对模型
-   `gamma0_O2 * x_O2 + gamma0_N2 * x_N2`
-   的偏差
+2. O2_N2：单谱 `sw` 相对对应纯 O2 联合拟合 `sw` 的偏差
 3. 若单谱结果 `fit_valid=False` 或缺失关键误差，也会直接列入建议重测点
 4. `spectral_parameters.csv` 中若核心参数为空，也会在跃迁级报告里单独标记为漏测参数
    （不添加压力），当前检查 `sw`、`gamma0_O2`、`gamma0_N2`
 
 可通过以下参数调节阈值：
 
-- `--remeasure-rel`：相对偏差阈值，默认 `0.05`（即 5%）
+- `--remeasure-rel`：统一覆盖 O2 和 O2_N2 的相对偏差阈值
+- `--remeasure-rel-o2`：纯 O2 的相对偏差阈值，默认 `0.05`（即 5%）
+- `--remeasure-rel-o2n2`：O2_N2 的相对偏差阈值，默认 `0.10`（即 10%）
 - `--remeasure-sigma`：偏差超过联合不确定度的阈值，默认 `3`
 
 ## 输出说明
