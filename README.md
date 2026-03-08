@@ -173,16 +173,22 @@ Step 5 线性回归，可使用 `--n2-only`。
 若你只想检查哪些压力点质量较差、建议重新测量，可使用 `--remeasure-report`。
 
 该命令不会重新执行 Step 1~5，只会读取已有的 `output/results/final/` 结果，
-并输出四张表：
+并输出七张表以及一组按压力拆分的 `PDF` 清单：
 
 - `output/results/final/remeasure_candidates.csv`：压力点明细
+- `output/results/final/remeasure_pressures.csv`：按压力汇总后的建议重测列表
+- `output/results/final/remeasure_pressures_O2.csv`：仅纯 O2 的按压力重测清单
+- `output/results/final/remeasure_pressures_O2_N2.csv`：仅 O2_N2 的按压力重测清单
 - `output/results/final/remeasure_transitions.csv`：按跃迁波数汇总后的建议重测列表
 - `output/results/final/remeasure_transitions_O2.csv`：仅纯 O2 的建议重测跃迁
 - `output/results/final/remeasure_transitions_O2_N2.csv`：仅 O2_N2 的建议重测跃迁
+- `output/results/final/remeasure_pressure_lists/{gas_type}/*.pdf`：一个压力一个 PDF 清单，列出该压力下需要重测的跃迁波数
 
 检查规则包括：
 
 1. 纯 O2：仅检查单谱 `sw`，并与同一跃迁下其他压力点的 `sw` 自比较，找出偏差过大的压力点
+   仅在 `data/reference/o2_remeasure_pressure_plan.csv` 定义的压力集合内判断；
+   额外加测但不在表内的纯 O2 压力，不列入重测建议
 2. O2_N2：单谱 `gamma0_air` 相对模型
    `gamma0_O2 * x_O2 + gamma0_N2 * x_N2`
    的偏差

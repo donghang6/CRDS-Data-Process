@@ -81,6 +81,10 @@ _DEFAULT_PATHS = {
     "final": _PROJECT_ROOT / "output" / "results" / "final",
 }
 
+_O2_REMEASURE_PLAN_CSV = (
+    _PROJECT_ROOT / "data" / "reference" / "o2_remeasure_pressure_plan.csv"
+)
+
 
 # ==================================================================
 # 子进程 worker 函数 (模块级，可被 pickle 序列化)
@@ -357,6 +361,7 @@ class CRDSPipeline:
 
         # ── 目标过滤 ──
         self.targets = targets  # e.g. ["O2/9386.2076", "O2_N2/9386.2076/500Torr"]
+        self._o2_remeasure_plan_cache: dict[str, set[str]] | None = None
 
         # ── 多光谱联合拟合压力指定 ──
         self.multi_fit_pressures = multi_fit_pressures  # e.g. {"O2/9386.2076": ["100Torr", "200Torr"]}
@@ -1775,6 +1780,102 @@ class CRDSPipeline:
         return (first, second, label)
 
     @staticmethod
+    def _pressure_filename(label: str, suffix: str = ".pdf") -> str:
+        """将压力标签转换为稳定的报告文件名。"""
+        safe = re.sub(r"[^0-9A-Za-z._-]+", "_", str(label).strip())
+        safe = re.sub(r"_+", "_", safe).strip("_")
+        return (safe or "pressure") + suffix
+
+    @staticmethod
+    def _write_pressure_pdf(
+        out_path: Path,
+        gas_type: str,
+        pressure: str,
+        transitions: list[str],
+    ) -> None:
+        """导出一个压力对应的重测跃迁 PDF 清单。"""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        lines_per_page = 42
+        if not transitions:
+            transitions = ["(empty)"]
+
+        total_pages = max(1, (len(transitions) + lines_per_page - 1) // lines_per_page)
+
+        with PdfPages(out_path) as pdf:
+            for page_idx in range(total_pages):
+                start = page_idx * lines_per_page
+                end = start + lines_per_page
+                page_lines = transitions[start:end]
+
+                fig = plt.figure(figsize=(8.27, 11.69))
+                ax = fig.add_axes([0.06, 0.05, 0.88, 0.9])
+                ax.axis("off")
+
+                ax.text(
+                    0.0,
+                    0.98,
+                    "Remeasure Transition List",
+                    fontsize=18,
+                    fontweight="bold",
+                    va="top",
+                    ha="left",
+                )
+                ax.text(
+                    0.0,
+                    0.94,
+                    f"Gas: {gas_type}",
+                    fontsize=12,
+                    va="top",
+                    ha="left",
+                )
+                ax.text(
+                    0.0,
+                    0.91,
+                    f"Pressure: {pressure}",
+                    fontsize=12,
+                    va="top",
+                    ha="left",
+                )
+                ax.text(
+                    0.0,
+                    0.88,
+                    f"Transitions: {len(transitions)}",
+                    fontsize=12,
+                    va="top",
+                    ha="left",
+                )
+
+                y = 0.83
+                step = 0.018
+                for item_idx, transition in enumerate(page_lines, start=start + 1):
+                    ax.text(
+                        0.02,
+                        y,
+                        f"{item_idx}. {transition}",
+                        fontsize=11,
+                        family="monospace",
+                        va="top",
+                        ha="left",
+                    )
+                    y -= step
+
+                ax.text(
+                    1.0,
+                    0.02,
+                    f"Page {page_idx + 1}/{total_pages}",
+                    fontsize=10,
+                    va="bottom",
+                    ha="right",
+                )
+
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+    @staticmethod
     def _is_missing_master_value(value) -> bool:
         """判断主表中的参数值是否为空。"""
         if pd.isna(value):
@@ -1792,6 +1893,93 @@ class CRDSPipeline:
         if not text or text.lower() == "nan":
             return []
         return [item for item in text.split(";") if item]
+
+    @staticmethod
+    def _transition_plan_key(value) -> str:
+        """将跃迁波数规整到压力计划表使用的显示精度。"""
+        text = str(value).strip()
+        if not text:
+            return ""
+        try:
+            return f"{float(text):.2f}".rstrip("0").rstrip(".")
+        except (TypeError, ValueError):
+            return text
+
+    @staticmethod
+    def _normalize_pressure_label(value) -> str:
+        """将压力值规整为目录中使用的标签格式。"""
+        text = str(value).strip()
+        if not text or text.lower() == "nan":
+            return ""
+        if re.search(r"[A-Za-z]", text):
+            return text
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            return text
+        if number.is_integer():
+            return f"{int(number)}Torr"
+        return f"{number:g}Torr"
+
+    def _load_o2_remeasure_plan(self) -> dict[str, set[str]]:
+        """读取纯 O2 重测压力计划表。"""
+        if self._o2_remeasure_plan_cache is not None:
+            return self._o2_remeasure_plan_cache
+
+        plan: dict[str, set[str]] = {}
+        if not _O2_REMEASURE_PLAN_CSV.exists():
+            logger.warning(
+                f"  建议重测报告缺少纯 O2 压力计划表: {_O2_REMEASURE_PLAN_CSV}"
+            )
+            self._o2_remeasure_plan_cache = plan
+            return plan
+
+        try:
+            plan_df = pd.read_csv(_O2_REMEASURE_PLAN_CSV, dtype=str)
+        except Exception as exc:
+            logger.warning(f"  读取纯 O2 压力计划表失败: {exc}")
+            self._o2_remeasure_plan_cache = plan
+            return plan
+
+        pressure_cols = [
+            col for col in plan_df.columns
+            if col.lower().startswith("pressure")
+        ]
+        for _, row in plan_df.iterrows():
+            transition_key = self._transition_plan_key(row.get("transition", ""))
+            if not transition_key:
+                continue
+            allowed = {
+                self._normalize_pressure_label(row.get(col, ""))
+                for col in pressure_cols
+            }
+            allowed = {item for item in allowed if item}
+            if allowed:
+                plan[transition_key] = allowed
+
+        self._o2_remeasure_plan_cache = plan
+        return plan
+
+    def _filter_o2_remeasure_plan_pressures(
+        self,
+        stat_df: pd.DataFrame,
+        transition: str,
+    ) -> pd.DataFrame:
+        """纯 O2 建议重测仅在压力计划表定义的压力集合内判断。"""
+        if stat_df.empty or "pressure" not in stat_df.columns:
+            return stat_df
+
+        plan = self._load_o2_remeasure_plan()
+        transition_key = self._transition_plan_key(transition)
+        allowed = plan.get(transition_key)
+        if not allowed:
+            logger.warning(
+                f"  [重测报告] [O2/{transition}] 未在纯 O2 压力计划表中找到，"
+                "跳过该跃迁的压力点重测判断"
+            )
+            return stat_df.iloc[0:0].copy()
+
+        return stat_df[stat_df["pressure"].astype(str).isin(allowed)].copy()
 
     def _collect_missing_master_params(self) -> dict[tuple[str, str], list[str]]:
         """从 spectral_parameters.csv 收集漏测的核心参数。"""
@@ -1869,6 +2057,7 @@ class CRDSPipeline:
 
             stat_df = self._select_target_line_rows(stat_df, transition)
             stat_df = self._filter_report_pressures(stat_df, "O2", transition)
+            stat_df = self._filter_o2_remeasure_plan_pressures(stat_df, transition)
             if stat_df.empty:
                 continue
 
@@ -2118,6 +2307,10 @@ class CRDSPipeline:
         transition_out_path = self.final_root / "remeasure_transitions.csv"
         transition_o2_out_path = self.final_root / "remeasure_transitions_O2.csv"
         transition_o2n2_out_path = self.final_root / "remeasure_transitions_O2_N2.csv"
+        pressure_out_path = self.final_root / "remeasure_pressures.csv"
+        pressure_o2_out_path = self.final_root / "remeasure_pressures_O2.csv"
+        pressure_o2n2_out_path = self.final_root / "remeasure_pressures_O2_N2.csv"
+        pressure_lists_root = self.final_root / "remeasure_pressure_lists"
 
         logger.info("=" * 60)
         logger.info("  建议重测点报告")
@@ -2125,6 +2318,7 @@ class CRDSPipeline:
         logger.info("  数据来源: 已有 final/ 结果")
         logger.info(f"  相对偏差阈值: {self.remeasure_rel_threshold * 100:.1f}%")
         logger.info(f"  sigma 阈值: {self.remeasure_sigma_threshold:.1f}σ")
+        logger.info(f"  纯 O2 压力计划表: {_O2_REMEASURE_PLAN_CSV}")
         if self.targets:
             logger.info(f"  指定目标: {', '.join(self.targets)}")
         else:
@@ -2187,6 +2381,98 @@ class CRDSPipeline:
 
         self.final_root.mkdir(parents=True, exist_ok=True)
         report_df.to_csv(point_out_path, index=False)
+
+        pressure_columns = [
+            "gas_type",
+            "pressure",
+            "recommend_remeasure",
+            "n_transitions",
+            "transitions",
+            "failed_metrics",
+            "has_invalid_fit",
+            "worst_sw_rel_diff_pct",
+            "worst_sw_sigma_ratio",
+            "worst_gamma0_air_rel_diff_pct",
+            "worst_gamma0_air_sigma_ratio",
+        ]
+        if report_df.empty:
+            pressure_df = pd.DataFrame(columns=pressure_columns)
+        else:
+            pressure_rows: list[dict] = []
+            for (gas_type, pressure), sub in report_df.groupby(
+                ["gas_type", "pressure"], sort=False
+            ):
+                transitions = sorted(
+                    sub["transition"].astype(str).tolist(),
+                    key=lambda item: (
+                        pd.to_numeric(pd.Series([item]), errors="coerce").iloc[0]
+                        if pd.notna(pd.to_numeric(pd.Series([item]), errors="coerce").iloc[0])
+                        else float("inf"),
+                        item,
+                    ),
+                )
+                metric_union = sorted({
+                    item
+                    for value in sub["failed_metrics"].astype(str)
+                    for item in value.split(";")
+                    if item and item.lower() != "nan"
+                })
+                pressure_rows.append({
+                    "gas_type": gas_type,
+                    "pressure": pressure,
+                    "recommend_remeasure": True,
+                    "n_transitions": int(len(transitions)),
+                    "transitions": ";".join(transitions),
+                    "failed_metrics": ";".join(metric_union),
+                    "has_invalid_fit": bool(
+                        (~sub["fit_valid"].map(self._as_bool)).any()
+                    ),
+                    "worst_sw_rel_diff_pct": pd.to_numeric(
+                        sub["sw_rel_diff_pct"], errors="coerce").max(),
+                    "worst_sw_sigma_ratio": pd.to_numeric(
+                        sub["sw_sigma_ratio"], errors="coerce").max(),
+                    "worst_gamma0_air_rel_diff_pct": pd.to_numeric(
+                        sub["gamma0_air_rel_diff_pct"], errors="coerce").max(),
+                    "worst_gamma0_air_sigma_ratio": pd.to_numeric(
+                        sub["gamma0_air_sigma_ratio"], errors="coerce").max(),
+                })
+
+            pressure_df = pd.DataFrame(pressure_rows, columns=pressure_columns)
+            pressure_sort = pressure_df["pressure"].map(self._pressure_sort_value)
+            pressure_df["_pressure_1"] = pressure_sort.map(lambda item: item[0])
+            pressure_df["_pressure_2"] = pressure_sort.map(lambda item: item[1])
+            pressure_df = pressure_df.sort_values(
+                ["gas_type", "_pressure_1", "_pressure_2", "pressure"],
+                na_position="last",
+            ).drop(columns=["_pressure_1", "_pressure_2"])
+
+        pressure_df.to_csv(pressure_out_path, index=False)
+        pressure_df[
+            pressure_df["gas_type"] == "O2"
+        ].to_csv(pressure_o2_out_path, index=False)
+        pressure_df[
+            pressure_df["gas_type"] == "O2_N2"
+        ].to_csv(pressure_o2n2_out_path, index=False)
+
+        if pressure_lists_root.exists():
+            shutil.rmtree(pressure_lists_root)
+        pressure_lists_root.mkdir(parents=True, exist_ok=True)
+        for _, row in pressure_df.iterrows():
+            gas_type = str(row.get("gas_type", "")).strip()
+            pressure = str(row.get("pressure", "")).strip()
+            transitions_text = str(row.get("transitions", "")).strip()
+            if not gas_type or not pressure:
+                continue
+
+            out_dir = pressure_lists_root / gas_type
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / self._pressure_filename(pressure)
+
+            transitions = [
+                item.strip() for item in transitions_text.split(";")
+                if item.strip()
+            ]
+            self._write_pressure_pdf(out_path, gas_type, pressure, transitions)
 
         transition_columns = [
             "gas_type",
@@ -2302,6 +2588,10 @@ class CRDSPipeline:
         ].to_csv(transition_o2n2_out_path, index=False)
 
         logger.info(f"  压力点明细已保存: {point_out_path}")
+        logger.info(f"  压力汇总已保存:   {pressure_out_path}")
+        logger.info(f"  纯 O2 压力清单:   {pressure_o2_out_path}")
+        logger.info(f"  O2_N2 压力清单:  {pressure_o2n2_out_path}")
+        logger.info(f"  压力 PDF 清单:   {pressure_lists_root}")
         logger.info(f"  跃迁汇总已保存:   {transition_out_path}")
         logger.info(f"  纯 O2 跃迁清单:   {transition_o2_out_path}")
         logger.info(f"  O2_N2 跃迁清单:  {transition_o2n2_out_path}")
@@ -2312,6 +2602,8 @@ class CRDSPipeline:
         logger.info(f"  共发现 {len(report_df)} 个建议重测点")
         for gas_type, sub in report_df.groupby("gas_type"):
             logger.info(f"    {gas_type}: {len(sub)} 个")
+        if not pressure_df.empty:
+            logger.info(f"  共涉及 {len(pressure_df)} 个需重测压力")
 
         logger.info(f"  共涉及 {len(transition_df)} 个建议重测跃迁")
         missing_transition_count = int(
