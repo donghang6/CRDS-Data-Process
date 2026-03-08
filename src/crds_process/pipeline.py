@@ -362,6 +362,9 @@ class CRDSPipeline:
         # ── 目标过滤 ──
         self.targets = targets  # e.g. ["O2/9386.2076", "O2_N2/9386.2076/500Torr"]
         self._o2_remeasure_plan_cache: dict[str, set[str]] | None = None
+        self._hitran_reference_cache: pd.DataFrame | None | bool = False
+        self._measurement_window_cache: dict[tuple[str, float], dict] = {}
+        self._measured_transition_cache: dict[str, np.ndarray] = {}
 
         # ── 多光谱联合拟合压力指定 ──
         self.multi_fit_pressures = multi_fit_pressures  # e.g. {"O2/9386.2076": ["100Torr", "200Torr"]}
@@ -1786,8 +1789,8 @@ class CRDSPipeline:
         safe = re.sub(r"_+", "_", safe).strip("_")
         return (safe or "pressure") + suffix
 
-    @staticmethod
     def _write_pressure_pdf(
+        self,
         out_path: Path,
         gas_type: str,
         pressure: str,
@@ -1799,7 +1802,7 @@ class CRDSPipeline:
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
 
-        lines_per_page = 42
+        lines_per_page = 32
         if not transitions:
             transitions = ["(empty)"]
 
@@ -1848,15 +1851,50 @@ class CRDSPipeline:
                     va="top",
                     ha="left",
                 )
+                ax.text(
+                    0.0,
+                    0.85,
+                    "Recommended window width: 2.000 cm^-1",
+                    fontsize=11,
+                    va="top",
+                    ha="left",
+                )
+                ax.text(
+                    0.02,
+                    0.81,
+                    "#   Transition    Recommended Range (cm^-1)     Lines",
+                    fontsize=10,
+                    family="monospace",
+                    fontweight="bold",
+                    va="top",
+                    ha="left",
+                )
 
-                y = 0.83
-                step = 0.018
+                y = 0.78
+                step = 0.022
                 for item_idx, transition in enumerate(page_lines, start=start + 1):
+                    rec = self._recommend_measurement_window(
+                        gas_type,
+                        transition,
+                        width=2.0,
+                    )
+                    if np.isfinite(rec["start"]) and np.isfinite(rec["end"]):
+                        range_text = f"{rec['start']:.3f}-{rec['end']:.3f}"
+                    else:
+                        range_text = "N/A"
+                    if np.isfinite(rec["n_lines"]):
+                        count_text = f"{int(rec['n_lines']):>2} line(s)"
+                    else:
+                        count_text = "N/A"
+                    line_text = (
+                        f"{item_idx:>2}. {transition:<12} "
+                        f"{range_text:<28} {count_text}"
+                    )
                     ax.text(
                         0.02,
                         y,
-                        f"{item_idx}. {transition}",
-                        fontsize=11,
+                        line_text,
+                        fontsize=9.5,
                         family="monospace",
                         va="top",
                         ha="left",
@@ -2639,17 +2677,25 @@ class CRDSPipeline:
 
         若文件不存在则返回 None。
         """
+        if isinstance(self._hitran_reference_cache, pd.DataFrame):
+            return self._hitran_reference_cache
+        if self._hitran_reference_cache is None:
+            return None
+
         csv_path = self._HITRAN_CSV
         if not csv_path.exists():
             logger.warning(f"  HITRAN 参考数据文件不存在: {csv_path}")
+            self._hitran_reference_cache = None
             return None
         try:
             df = pd.read_csv(csv_path)
             logger.info(f"  已加载 HITRAN 参考数据: {csv_path.name}"
                         f" ({len(df)} 条吸收线)")
+            self._hitran_reference_cache = df
             return df
         except Exception as e:
             logger.warning(f"  读取 HITRAN 参考数据失败: {e}")
+            self._hitran_reference_cache = None
             return None
 
     @staticmethod
@@ -2676,6 +2722,140 @@ class CRDSPipeline:
         if diffs[idx_min] <= tol:
             return hitran_df.iloc[idx_min]
         return None
+
+    def _get_measured_transition_nu(self, gas_type: str) -> np.ndarray:
+        """收集指定气体类型下已测跃迁波数，并按升序返回。"""
+        cached = self._measured_transition_cache.get(gas_type)
+        if cached is not None:
+            return cached
+
+        nu_set: set[float] = set()
+        for root in [self.final_root / gas_type, self.raw_root / gas_type]:
+            if not root.exists():
+                continue
+            for t_dir in root.iterdir():
+                if not t_dir.is_dir() or t_dir.name.startswith("."):
+                    continue
+                try:
+                    nu_set.add(float(t_dir.name))
+                except ValueError:
+                    continue
+
+        values = np.array(sorted(nu_set), dtype=float) if nu_set else np.array([], dtype=float)
+        self._measured_transition_cache[gas_type] = values
+        return values
+
+    def _recommend_measurement_window(
+        self,
+        gas_type: str,
+        transition: str,
+        width: float = 2.0,
+        tol: float = 0.01,
+    ) -> dict:
+        """为指定跃迁推荐固定宽度的测量窗口。
+
+        规则:
+        1. 窗口宽度固定为 width cm^-1
+        2. 目标跃迁必须落在窗口内
+        3. 仅在当前气体类型的已测跃迁集合内比较相邻线
+        4. 在所有候选窗口中优先选包含跃迁数最少的
+        5. 若并列，则优先目标线更接近窗口中心
+        """
+        cache_key = (f"{gas_type}:{transition}", float(width))
+        cached = self._measurement_window_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            nu_target = float(transition)
+        except (TypeError, ValueError):
+            rec = {
+                "start": np.nan,
+                "end": np.nan,
+                "n_lines": np.nan,
+                "is_isolated": False,
+                "shift": np.nan,
+                "line_positions": [],
+            }
+            self._measurement_window_cache[cache_key] = rec
+            return rec
+
+        default_start = nu_target - width / 2.0
+        default_end = nu_target + width / 2.0
+        nu_vals = self._get_measured_transition_nu(gas_type)
+        if nu_vals.size == 0:
+            rec = {
+                "start": default_start,
+                "end": default_end,
+                "n_lines": np.nan,
+                "is_isolated": False,
+                "shift": 0.0,
+                "line_positions": [nu_target],
+            }
+            self._measurement_window_cache[cache_key] = rec
+            return rec
+
+        start_min = nu_target - width
+        start_max = nu_target
+        candidate_starts = {
+            start_min,
+            nu_target - width / 2.0,
+            start_max,
+        }
+        nearby = nu_vals[
+            (nu_vals >= start_min - tol) &
+            (nu_vals <= nu_target + width + tol)
+        ]
+        for value in nearby:
+            candidate_starts.add(float(value))
+            candidate_starts.add(float(value) - width)
+
+        best_score = None
+        best_rec = None
+        for raw_start in sorted(candidate_starts):
+            start = min(max(raw_start, start_min), start_max)
+            end = start + width
+            if not (start - tol <= nu_target <= end + tol):
+                continue
+
+            inside = nu_vals[(nu_vals >= start - tol) & (nu_vals <= end + tol)]
+            line_count = int(len(inside))
+            center_penalty = abs((start + end) / 2.0 - nu_target)
+            shift = start - (nu_target - width / 2.0)
+            score = (
+                line_count,
+                center_penalty,
+                abs(shift),
+                start,
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_rec = {
+                    "start": float(start),
+                    "end": float(end),
+                    "n_lines": line_count,
+                    "is_isolated": line_count == 1,
+                    "shift": float(shift),
+                    "line_positions": [float(x) for x in inside],
+                }
+
+        if best_rec is None:
+            best_rec = {
+                "start": default_start,
+                "end": default_end,
+                "n_lines": int(((nu_vals >= default_start - tol) & (nu_vals <= default_end + tol)).sum()),
+                "is_isolated": False,
+                "shift": 0.0,
+                "line_positions": [
+                    float(x) for x in nu_vals[
+                        (nu_vals >= default_start - tol) &
+                        (nu_vals <= default_end + tol)
+                    ]
+                ],
+            }
+
+        self._measurement_window_cache[cache_key] = best_rec
+        return best_rec
 
     @classmethod
     def _estimate_hitran_n2_broadening(
