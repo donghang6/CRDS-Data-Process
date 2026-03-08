@@ -183,7 +183,7 @@ Step 5 线性回归，可使用 `--n2-only`。
 - `output/results/final/remeasure_transitions.csv`：按跃迁波数汇总后的建议重测列表
 - `output/results/final/remeasure_transitions_O2.csv`：仅纯 O2 的建议重测跃迁
 - `output/results/final/remeasure_transitions_O2_N2.csv`：仅 O2_N2 的建议重测跃迁
-- `output/results/final/remeasure_pressure_lists/{gas_type}/*.pdf`：一个压力一个 PDF 清单；若相邻待重测跃迁间隔小于 `1 cm^-1`，则合并为一次测量，并在整组左右各外扩 `2 cm^-1`
+- `output/results/final/remeasure_pressure_lists/{gas_type}/*.pdf`：一个压力一个 PDF 清单；单条跃迁默认左右各外扩 `1 cm^-1`；若相邻待重测跃迁间隔小于 `1 cm^-1`，则合并为一次测量，并在整组左右各外扩 `2 cm^-1`
 
 检查规则包括：
 

@@ -1817,7 +1817,8 @@ class CRDSPipeline:
     def _build_measurement_groups(
         transitions: list[str],
         merge_gap: float = 1.0,
-        margin: float = 2.0,
+        single_margin: float = 1.0,
+        merged_margin: float = 2.0,
     ) -> list[dict]:
         """将间隔较近的跃迁合并为一次测量，并给出推荐范围。"""
         parsed: list[tuple[float, str]] = []
@@ -1842,6 +1843,7 @@ class CRDSPipeline:
         for idx, group in enumerate(groups, start=1):
             left = group[0][0]
             right = group[-1][0]
+            margin = merged_margin if len(group) > 1 else single_margin
             measurement_groups.append({
                 "index": idx,
                 "transition_label": " + ".join(item[1] for item in group),
@@ -1941,7 +1943,10 @@ class CRDSPipeline:
                 ax.text(
                     0.0,
                     0.82,
-                    "Rule: gap < 1.000 cm^-1 -> merge; extend 2.000 cm^-1 on both sides",
+                    (
+                        "Rule: single line -> extend 1.000 cm^-1 on both sides; "
+                        "gap < 1.000 cm^-1 -> merge, then extend 2.000 cm^-1 on both sides"
+                    ),
                     fontsize=11,
                     va="top",
                     ha="left",
