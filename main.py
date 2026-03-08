@@ -23,6 +23,11 @@
     python main.py --from-ringdown --n2-only O2_N2/9403.163069
     python main.py --from-etalon --n2-only O2_N2/9403.163069
 
+    # 生成建议重测点报告 (只读取已有结果)
+    python main.py --remeasure-report
+    python main.py --remeasure-report O2/9403.163069
+    python main.py --remeasure-report --remeasure-rel 0.05 --remeasure-sigma 3
+
     # 跳过 Step 1, 直接从已有的 ringdown 结果开始执行 Step 2~5
     python main.py --from-ringdown
     python main.py --from-ringdown O2/9386.2076
@@ -55,6 +60,9 @@ def _parse_args(argv: list[str]) -> dict:
     n2_only = False
     from_ringdown = False
     from_etalon = False
+    remeasure_report = False
+    remeasure_rel = 0.05
+    remeasure_sigma = 3.0
 
     i = 0
     while i < len(argv):
@@ -67,6 +75,25 @@ def _parse_args(argv: list[str]) -> dict:
             i += 1
         elif arg == "--n2-only":
             n2_only = True
+            i += 1
+        elif arg == "--remeasure-report":
+            remeasure_report = True
+            i += 1
+        elif arg == "--remeasure-rel":
+            i += 1
+            if i < len(argv):
+                try:
+                    remeasure_rel = float(argv[i])
+                except ValueError:
+                    print(f"警告: --remeasure-rel 参数无效: {argv[i]}，使用默认值 0.05")
+            i += 1
+        elif arg == "--remeasure-sigma":
+            i += 1
+            if i < len(argv):
+                try:
+                    remeasure_sigma = float(argv[i])
+                except ValueError:
+                    print(f"警告: --remeasure-sigma 参数无效: {argv[i]}，使用默认值 3")
             i += 1
         elif arg in ("--pressures", "-p"):
             # 后续参数格式: "气体/跃迁=压力1,压力2,..."
@@ -115,9 +142,12 @@ def _parse_args(argv: list[str]) -> dict:
         "fit_transitions": sorted(set(fit_transitions)) or None,
         "auto_optimize_pressures": auto_optimize,
         "min_multi_pressures": min_pressures,
+        "remeasure_rel_threshold": remeasure_rel,
+        "remeasure_sigma_threshold": remeasure_sigma,
         "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,
+        "_remeasure_report": remeasure_report,
     }
 
 
@@ -126,13 +156,16 @@ if __name__ == "__main__":
     n2_only = kwargs.pop("_n2_only")
     from_ringdown = kwargs.pop("_from_ringdown")
     from_etalon = kwargs.pop("_from_etalon")
+    remeasure_report = kwargs.pop("_remeasure_report")
 
     if from_ringdown and from_etalon:
         print("错误: --from-ringdown 与 --from-etalon 不能同时使用")
         sys.exit(2)
 
     pipeline = CRDSPipeline(**kwargs)
-    if n2_only:
+    if remeasure_report:
+        pipeline.generate_remeasure_report()
+    elif n2_only:
         if from_etalon:
             pipeline.run_n2_only_from_etalon()
         elif from_ringdown:

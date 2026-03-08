@@ -92,6 +92,12 @@ python main.py --from-etalon --n2-only O2_N2/9403.163069
 python main.py --n2-only O2_N2/9403.163069 --optimize
 python main.py --n2-only O2_N2/9403.163069 --optimize --min-pressures 4
 
+# 生成建议重测点报告（只读取已有 final 结果）
+python main.py --remeasure-report
+python main.py --remeasure-report O2/9403.163069
+python main.py --remeasure-report O2/9403.163069 O2_N2/9403.163069
+python main.py --remeasure-report --remeasure-rel 0.05 --remeasure-sigma 3
+
 # 跳过 Step 1，复用已生成 ringdown 结果，从 Step 2 开始
 python main.py --from-ringdown
 python main.py --from-ringdown O2/9386.2076
@@ -161,6 +167,33 @@ Step 5 线性回归，可使用 `--n2-only`。
 
 该模式只处理 `O2_N2` 数据，跳过纯 O2 联合拟合，但 Step 5 仍会读取
 `output/results/final/O2/{transition}/multi_fit_result.csv` 作为固定 O2 参考。
+
+### 建议重测点报告
+
+若你只想检查哪些压力点质量较差、建议重新测量，可使用 `--remeasure-report`。
+
+该命令不会重新执行 Step 1~5，只会读取已有的 `output/results/final/` 结果，
+并输出四张表：
+
+- `output/results/final/remeasure_candidates.csv`：压力点明细
+- `output/results/final/remeasure_transitions.csv`：按跃迁波数汇总后的建议重测列表
+- `output/results/final/remeasure_transitions_O2.csv`：仅纯 O2 的建议重测跃迁
+- `output/results/final/remeasure_transitions_O2_N2.csv`：仅 O2_N2 的建议重测跃迁
+
+检查规则包括：
+
+1. 纯 O2：仅检查单谱 `sw`，并与同一跃迁下其他压力点的 `sw` 自比较，找出偏差过大的压力点
+2. O2_N2：单谱 `gamma0_air` 相对模型
+   `gamma0_O2 * x_O2 + gamma0_N2 * x_N2`
+   的偏差
+3. 若单谱结果 `fit_valid=False` 或缺失关键误差，也会直接列入建议重测点
+4. `spectral_parameters.csv` 中若核心参数为空，也会在跃迁级报告里单独标记为漏测参数
+   （不添加压力），当前检查 `sw`、`gamma0_O2`、`gamma0_N2`
+
+可通过以下参数调节阈值：
+
+- `--remeasure-rel`：相对偏差阈值，默认 `0.05`（即 5%）
+- `--remeasure-sigma`：偏差超过联合不确定度的阈值，默认 `3`
 
 ## 输出说明
 

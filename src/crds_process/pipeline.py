@@ -63,6 +63,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from crds_process.gas_config import parse_gas_dir
 from crds_process.log import logger, setup_logging
 
 
@@ -306,6 +307,10 @@ class CRDSPipeline:
         仅拟合指定跃迁波数(吸收线)，单位 cm⁻¹。
         若提供，则 Step 3/4 的 HITRAN 线表仅保留这些跃迁。
         例如: [9403.163069]
+    remeasure_rel_threshold : float
+        建议重测报告中，相对偏差阈值 (默认 0.05 = 5%)
+    remeasure_sigma_threshold : float
+        建议重测报告中，偏差相对联合不确定度的阈值 (默认 3σ)
     """
 
     # 干空气近似组成，用于由 HITRAN air/self 展宽反推 N2 展宽
@@ -336,6 +341,8 @@ class CRDSPipeline:
         auto_optimize_pressures: bool = False,
         min_multi_pressures: int = 3,
         fit_transitions: list[float] | None = None,
+        remeasure_rel_threshold: float = 0.05,
+        remeasure_sigma_threshold: float = 3.0,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -367,6 +374,10 @@ class CRDSPipeline:
             self.fit_transitions = sorted(set(parsed_nu)) if parsed_nu else None
         else:
             self.fit_transitions = None
+
+        # ── 建议重测报告阈值 ──
+        self.remeasure_rel_threshold = max(float(remeasure_rel_threshold), 0.0)
+        self.remeasure_sigma_threshold = max(float(remeasure_sigma_threshold), 0.0)
 
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
@@ -585,6 +596,29 @@ class CRDSPipeline:
                 else:
                     return None  # "O2" → all transitions
         return transitions if transitions else None
+
+    def _target_pressures(self, gas_type: str, transition: str) -> set[str] | None:
+        """从 targets 中提取某跃迁下涉及的压力集合，None 表示全部。"""
+        if not self.targets:
+            return None
+
+        matched_transition = False
+        pressures: set[str] = set()
+        for t in self.targets:
+            parts = t.strip("/").split("/")
+            if not parts or parts[0] != gas_type:
+                continue
+            if len(parts) == 1:
+                return None
+            if len(parts) >= 2 and parts[1] == transition:
+                matched_transition = True
+                if len(parts) == 2:
+                    return None
+                pressures.add(parts[2])
+
+        if matched_transition:
+            return pressures
+        return set()
 
     @staticmethod
     def _match_transition(dir_name: str, target_trans: set[str]) -> bool:
@@ -1559,6 +1593,749 @@ class CRDSPipeline:
         logger.info(f"\n{'#' * 60}")
         logger.info(f"  全部完成! 耗时 {elapsed:.1f} s")
         logger.info(f"{'#' * 60}")
+
+    @staticmethod
+    def _as_bool(value) -> bool:
+        """稳健解析布尔值。"""
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if pd.isna(value):
+            return False
+        return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+    @staticmethod
+    def _safe_float(value) -> float:
+        """将任意标量安全转换为 float，失败返回 NaN。"""
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return np.nan
+        return result if np.isfinite(result) else np.nan
+
+    @staticmethod
+    def _closest_transition_row(
+        df: pd.DataFrame,
+        transition: str,
+        nu_col: str = "nu_HITRAN",
+    ) -> pd.Series | None:
+        """返回与目标跃迁最接近的一行。"""
+        if df.empty:
+            return None
+        if nu_col not in df.columns:
+            return df.iloc[0]
+        try:
+            nu_target = float(transition)
+        except (TypeError, ValueError):
+            return df.iloc[0]
+
+        nu_vals = pd.to_numeric(df[nu_col], errors="coerce")
+        if nu_vals.notna().any():
+            idx = (nu_vals - nu_target).abs().idxmin()
+            return df.loc[idx]
+        return df.iloc[0]
+
+    def _select_target_line_rows(
+        self,
+        df: pd.DataFrame,
+        transition: str,
+    ) -> pd.DataFrame:
+        """每个压力仅保留最接近目标跃迁的一行。"""
+        if df.empty or "pressure" not in df.columns or "nu_HITRAN" not in df.columns:
+            return df.copy()
+
+        try:
+            nu_target = float(transition)
+        except (TypeError, ValueError):
+            return df.copy()
+
+        work = df.copy()
+        work["_pressure"] = work["pressure"].astype(str)
+        work["_nu_dist"] = (
+            pd.to_numeric(work["nu_HITRAN"], errors="coerce") - nu_target
+        ).abs()
+        if not np.isfinite(work["_nu_dist"]).any():
+            return df.copy()
+
+        idx = work.groupby("_pressure")["_nu_dist"].idxmin()
+        selected = work.loc[idx].copy()
+        selected = selected.drop(columns=["_pressure", "_nu_dist"])
+        return selected.reset_index(drop=True)
+
+    def _filter_report_pressures(
+        self,
+        df: pd.DataFrame,
+        gas_type: str,
+        transition: str,
+    ) -> pd.DataFrame:
+        """按 targets 中指定的压力过滤报告数据。"""
+        if df.empty or "pressure" not in df.columns:
+            return df.copy()
+
+        specified = self._target_pressures(gas_type, transition)
+        if specified is None:
+            return df.copy()
+        if not specified:
+            return df.iloc[0:0].copy()
+
+        available = df["pressure"].astype(str).tolist()
+        missing = [p for p in sorted(specified) if p not in set(available)]
+        if missing:
+            logger.warning(
+                f"  [重测报告] [{gas_type}/{transition}] 以下指定压力未找到: "
+                f"{', '.join(missing)}"
+            )
+            logger.warning(f"    可用压力: {', '.join(available)}")
+
+        return df[df["pressure"].astype(str).isin(specified)].copy()
+
+    def _evaluate_remeasure_metric(
+        self,
+        observed: float,
+        expected: float,
+        observed_err: float = np.nan,
+        expected_err: float = np.nan,
+    ) -> tuple[bool, float, float]:
+        """判断单个指标是否超出建议重测阈值。"""
+        obs = self._safe_float(observed)
+        exp = self._safe_float(expected)
+        obs_err = self._safe_float(observed_err)
+        exp_err = self._safe_float(expected_err)
+
+        if not np.isfinite(obs) or not np.isfinite(exp):
+            return False, np.nan, np.nan
+
+        diff = abs(obs - exp)
+        rel_diff_pct = np.nan
+        if exp != 0:
+            rel_diff_pct = diff / abs(exp) * 100.0
+
+        sigma_ratio = np.nan
+        err_terms = []
+        if np.isfinite(obs_err) and obs_err > 0:
+            err_terms.append(obs_err**2)
+        if np.isfinite(exp_err) and exp_err > 0:
+            err_terms.append(exp_err**2)
+        if err_terms:
+            combined_err = float(np.sqrt(sum(err_terms)))
+            if combined_err > 0:
+                sigma_ratio = diff / combined_err
+
+        flagged = False
+        if np.isfinite(rel_diff_pct):
+            flagged |= rel_diff_pct > self.remeasure_rel_threshold * 100.0
+        if np.isfinite(sigma_ratio):
+            flagged |= sigma_ratio > self.remeasure_sigma_threshold
+
+        return flagged, rel_diff_pct, sigma_ratio
+
+    @staticmethod
+    def _o2_sw_peer_reference(
+        stat_df: pd.DataFrame,
+        row_index,
+    ) -> tuple[float, float]:
+        """用同一跃迁下其他压力点的线强作为 O2 自比较参考。"""
+        if "sw" not in stat_df.columns:
+            return np.nan, np.nan
+
+        peers = stat_df.loc[stat_df.index != row_index].copy()
+        if peers.empty:
+            return np.nan, np.nan
+
+        sw_vals = pd.to_numeric(peers["sw"], errors="coerce")
+        sw_vals = sw_vals[np.isfinite(sw_vals)]
+        if sw_vals.empty:
+            return np.nan, np.nan
+
+        sw_ref = float(np.median(sw_vals))
+
+        err_terms: list[float] = []
+        if "sw_err" in peers.columns:
+            sw_err = pd.to_numeric(peers["sw_err"], errors="coerce")
+            sw_err = sw_err[np.isfinite(sw_err) & (sw_err > 0)]
+            if not sw_err.empty:
+                err_terms.append(float(np.median(sw_err)))
+
+        if len(sw_vals) >= 2:
+            peer_std = float(np.std(sw_vals.values, ddof=1))
+            if np.isfinite(peer_std) and peer_std > 0:
+                err_terms.append(peer_std)
+
+        sw_ref_err = max(err_terms) if err_terms else np.nan
+        return sw_ref, sw_ref_err
+
+    @staticmethod
+    def _pressure_sort_value(label: str) -> tuple[float, float, str]:
+        """为压力标签生成稳定排序键。"""
+        label = str(label)
+        nums = re.findall(r"(\d+(?:\.\d+)?)", label)
+        if not nums:
+            return (float("inf"), float("inf"), label)
+        first = float(nums[0])
+        second = float(nums[1]) if len(nums) > 1 else 0.0
+        return (first, second, label)
+
+    @staticmethod
+    def _is_missing_master_value(value) -> bool:
+        """判断主表中的参数值是否为空。"""
+        if pd.isna(value):
+            return True
+        if isinstance(value, str) and not value.strip():
+            return True
+        return False
+
+    @staticmethod
+    def _issue_tokens(value) -> list[str]:
+        """将 fit_issue 字段拆分为问题列表。"""
+        if pd.isna(value):
+            return []
+        text = str(value).strip()
+        if not text or text.lower() == "nan":
+            return []
+        return [item for item in text.split(";") if item]
+
+    def _collect_missing_master_params(self) -> dict[tuple[str, str], list[str]]:
+        """从 spectral_parameters.csv 收集漏测的核心参数。"""
+        master_csv = self.final_root / self._MASTER_TABLE_NAME
+        if not master_csv.exists():
+            logger.warning(f"  建议重测报告缺少主表: {master_csv}")
+            return {}
+
+        try:
+            master_df = pd.read_csv(master_csv, dtype={"nu": str})
+        except Exception as exc:
+            logger.warning(f"  读取主表失败，跳过漏测参数检查: {exc}")
+            return {}
+
+        if master_df.empty or "nu" not in master_df.columns:
+            return {}
+
+        missing_map: dict[tuple[str, str], list[str]] = {}
+        target_gases = self._target_gas_types()
+        target_trans_o2 = self._target_transitions("O2")
+        target_trans_o2n2 = self._target_transitions("O2_N2")
+
+        for _, row in master_df.iterrows():
+            transition = str(row.get("nu", "")).strip()
+            if not transition:
+                continue
+
+            if target_gases is None or "O2" in target_gases:
+                if target_trans_o2 is None or transition in target_trans_o2:
+                    missing_params: list[str] = []
+                    for param in ["sw", "gamma0_O2"]:
+                        if param in row.index and self._is_missing_master_value(row.get(param)):
+                            missing_params.append(param)
+                    if missing_params:
+                        missing_map[("O2", transition)] = missing_params
+
+            if target_gases is None or "O2_N2" in target_gases:
+                if target_trans_o2n2 is None or transition in target_trans_o2n2:
+                    missing_params = []
+                    if ("gamma0_N2" in row.index
+                            and self._is_missing_master_value(row.get("gamma0_N2"))):
+                        missing_params.append("gamma0_N2")
+                    if missing_params:
+                        missing_map[("O2_N2", transition)] = missing_params
+
+        return missing_map
+
+    def _build_remeasure_rows_o2(self) -> list[dict]:
+        """生成纯 O2 建议重测点列表。"""
+        rows: list[dict] = []
+        o2_root = self.final_root / "O2"
+        if not o2_root.exists():
+            return rows
+
+        target_trans = self._target_transitions("O2")
+        for t_dir in sorted(o2_root.iterdir()):
+            if not t_dir.is_dir() or t_dir.name.startswith("."):
+                continue
+            transition = t_dir.name
+            if target_trans is not None and transition not in target_trans:
+                continue
+
+            stat_csv = t_dir / "fit_summary_statistics.csv"
+            if not stat_csv.exists():
+                logger.warning(f"  [O2/{transition}] 缺少统计表: {stat_csv}")
+                continue
+
+            try:
+                stat_df = pd.read_csv(stat_csv)
+            except Exception as exc:
+                logger.warning(f"  [O2/{transition}] 读取统计表失败: {exc}")
+                continue
+            if stat_df.empty:
+                continue
+
+            stat_df = self._select_target_line_rows(stat_df, transition)
+            stat_df = self._filter_report_pressures(stat_df, "O2", transition)
+            if stat_df.empty:
+                continue
+
+            has_fit_valid = "fit_valid" in stat_df.columns
+            has_fit_issue = "fit_issue" in stat_df.columns
+
+            for idx, row in stat_df.iterrows():
+                raw_issue_tokens = (
+                    self._issue_tokens(row.get("fit_issue"))
+                    if has_fit_issue else []
+                )
+                # 纯 O2 重测只看线强相关问题，不把 gamma0_O2 问题计入。
+                fit_issue_tokens = [
+                    token for token in raw_issue_tokens
+                    if token in {"missing_sw_err", "sw_near_lower_bound"}
+                ]
+                if has_fit_issue:
+                    fit_valid = len(fit_issue_tokens) == 0
+                else:
+                    fit_valid = (
+                        self._as_bool(row.get("fit_valid"))
+                        if has_fit_valid else True
+                    )
+                fit_issue = ";".join(fit_issue_tokens)
+
+                failed_metrics: list[str] = []
+                sw_ref = np.nan
+                sw_ref_err = np.nan
+                sw_rel = np.nan
+                sw_sigma = np.nan
+
+                if not fit_valid:
+                    failed_metrics.append("fit_valid")
+
+                sw_ref, sw_ref_err = self._o2_sw_peer_reference(stat_df, idx)
+                sw_flagged, sw_rel, sw_sigma = self._evaluate_remeasure_metric(
+                    observed=row.get("sw"),
+                    expected=sw_ref,
+                    observed_err=row.get("sw_err"),
+                    expected_err=sw_ref_err,
+                )
+                if sw_flagged:
+                    failed_metrics.append("sw")
+
+                if not failed_metrics:
+                    continue
+
+                rows.append({
+                    "gas_type": "O2",
+                    "transition": transition,
+                    "pressure": str(row.get("pressure", "")),
+                    "recommend_remeasure": True,
+                    "failed_metrics": ";".join(sorted(set(failed_metrics))),
+                    "fit_valid": fit_valid,
+                    "fit_issue": fit_issue,
+                    "residual_std": self._safe_float(row.get("residual_std")),
+                    "sw_value": self._safe_float(row.get("sw")),
+                    "sw_err": self._safe_float(row.get("sw_err")),
+                    "sw_ref": sw_ref,
+                    "sw_ref_err": sw_ref_err,
+                    "sw_rel_diff_pct": sw_rel,
+                    "sw_sigma_ratio": sw_sigma,
+                    "gamma0_O2_value": self._safe_float(row.get("gamma0_O2")),
+                    "gamma0_O2_err": self._safe_float(row.get("gamma0_O2_err")),
+                    "gamma0_O2_ref": np.nan,
+                    "gamma0_O2_ref_err": np.nan,
+                    "gamma0_O2_rel_diff_pct": np.nan,
+                    "gamma0_O2_sigma_ratio": np.nan,
+                    "gamma0_air_value": np.nan,
+                    "gamma0_air_err": np.nan,
+                    "gamma0_air_model": np.nan,
+                    "gamma0_air_model_err": np.nan,
+                    "gamma0_air_rel_diff_pct": np.nan,
+                    "gamma0_air_sigma_ratio": np.nan,
+                    "gamma0_N2_ref": np.nan,
+                    "gamma0_N2_ref_err": np.nan,
+                    "x_O2": 1.0,
+                    "x_N2": 0.0,
+                })
+
+        return rows
+
+    def _build_remeasure_rows_o2n2(self) -> list[dict]:
+        """生成 O2_N2 建议重测点列表。"""
+        rows: list[dict] = []
+        mix_root = self.final_root / "O2_N2"
+        if not mix_root.exists():
+            return rows
+
+        target_trans = self._target_transitions("O2_N2")
+        for t_dir in sorted(mix_root.iterdir()):
+            if not t_dir.is_dir() or t_dir.name.startswith("."):
+                continue
+            transition = t_dir.name
+            if target_trans is not None and transition not in target_trans:
+                continue
+
+            stat_csv = t_dir / "fit_summary_statistics.csv"
+            if not stat_csv.exists():
+                logger.warning(f"  [O2_N2/{transition}] 缺少统计表: {stat_csv}")
+                continue
+
+            try:
+                stat_df = pd.read_csv(stat_csv)
+            except Exception as exc:
+                logger.warning(f"  [O2_N2/{transition}] 读取统计表失败: {exc}")
+                continue
+            if stat_df.empty:
+                continue
+
+            stat_df = self._select_target_line_rows(stat_df, transition)
+            stat_df = self._filter_report_pressures(stat_df, "O2_N2", transition)
+            if stat_df.empty:
+                continue
+
+            has_fit_valid = "fit_valid" in stat_df.columns
+            has_fit_issue = "fit_issue" in stat_df.columns
+            o2_ref_row = None
+            o2_multi_csv = self.final_root / "O2" / transition / "multi_fit_result.csv"
+            if o2_multi_csv.exists():
+                try:
+                    o2_df = pd.read_csv(o2_multi_csv)
+                    o2_ref_row = self._closest_transition_row(o2_df, transition)
+                except Exception as exc:
+                    logger.warning(f"  [O2_N2/{transition}] 读取纯 O2 参考失败: {exc}")
+            else:
+                logger.warning(f"  [O2_N2/{transition}] 缺少纯 O2 参考: {o2_multi_csv}")
+
+            gamma0_n2 = np.nan
+            gamma0_n2_err = np.nan
+            linreg_csv = t_dir / "linear_regression_n2.csv"
+            if linreg_csv.exists():
+                try:
+                    n2_df = pd.read_csv(linreg_csv)
+                    gamma_rows = n2_df[n2_df["parameter"].astype(str) == "gamma0"]
+                    if not gamma_rows.empty:
+                        gamma_row = gamma_rows.iloc[0]
+                        gamma0_n2 = self._safe_float(gamma_row.get("value_N2"))
+                        gamma0_n2_err = self._safe_float(gamma_row.get("uncertainty_N2"))
+                except Exception as exc:
+                    logger.warning(f"  [O2_N2/{transition}] 读取 N2 线性回归结果失败: {exc}")
+            else:
+                logger.warning(f"  [O2_N2/{transition}] 缺少 N2 回归结果: {linreg_csv}")
+
+            gamma0_o2 = np.nan
+            gamma0_o2_err = np.nan
+            if o2_ref_row is not None:
+                gamma0_o2 = self._safe_float(o2_ref_row.get("gamma0_O2"))
+                gamma0_o2_err = self._safe_float(o2_ref_row.get("gamma0_O2_err"))
+
+            for _, row in stat_df.iterrows():
+                fit_valid = (
+                    self._as_bool(row.get("fit_valid"))
+                    if has_fit_valid else True
+                )
+                fit_issue = str(row.get("fit_issue", "")).strip() if has_fit_issue else ""
+                if fit_issue.lower() == "nan":
+                    fit_issue = ""
+
+                failed_metrics: list[str] = []
+                if not fit_valid:
+                    failed_metrics.append("fit_valid")
+
+                x_o2 = np.nan
+                x_n2 = np.nan
+                gamma_model = np.nan
+                gamma_model_err = np.nan
+                gamma_rel = np.nan
+                gamma_sigma = np.nan
+
+                pressure_label = str(row.get("pressure", ""))
+                try:
+                    gas_cfg = parse_gas_dir(pressure_label, "O2_N2")
+                    x_o2 = gas_cfg.o2_fraction
+                    x_n2 = gas_cfg.n2_fraction
+                except Exception as exc:
+                    logger.warning(
+                        f"  [O2_N2/{transition}] 无法解析压力标签 '{pressure_label}': {exc}"
+                    )
+
+                if (
+                    np.isfinite(gamma0_o2)
+                    and np.isfinite(gamma0_n2)
+                    and np.isfinite(x_o2)
+                    and np.isfinite(x_n2)
+                ):
+                    gamma_model = gamma0_o2 * x_o2 + gamma0_n2 * x_n2
+                    err_terms = []
+                    if np.isfinite(gamma0_o2_err) and gamma0_o2_err > 0:
+                        err_terms.append((x_o2 * gamma0_o2_err) ** 2)
+                    if np.isfinite(gamma0_n2_err) and gamma0_n2_err > 0:
+                        err_terms.append((x_n2 * gamma0_n2_err) ** 2)
+                    if err_terms:
+                        gamma_model_err = float(np.sqrt(sum(err_terms)))
+
+                    gamma_flagged, gamma_rel, gamma_sigma = self._evaluate_remeasure_metric(
+                        observed=row.get("gamma0_air"),
+                        expected=gamma_model,
+                        observed_err=row.get("gamma0_air_err"),
+                        expected_err=gamma_model_err,
+                    )
+                    if gamma_flagged:
+                        failed_metrics.append("gamma0_N2")
+
+                if not failed_metrics:
+                    continue
+
+                rows.append({
+                    "gas_type": "O2_N2",
+                    "transition": transition,
+                    "pressure": pressure_label,
+                    "recommend_remeasure": True,
+                    "failed_metrics": ";".join(sorted(set(failed_metrics))),
+                    "fit_valid": fit_valid,
+                    "fit_issue": fit_issue,
+                    "residual_std": self._safe_float(row.get("residual_std")),
+                    "sw_value": self._safe_float(row.get("sw")),
+                    "sw_err": self._safe_float(row.get("sw_err")),
+                    "sw_ref": np.nan,
+                    "sw_ref_err": np.nan,
+                    "sw_rel_diff_pct": np.nan,
+                    "sw_sigma_ratio": np.nan,
+                    "gamma0_O2_value": np.nan,
+                    "gamma0_O2_err": np.nan,
+                    "gamma0_O2_ref": gamma0_o2,
+                    "gamma0_O2_ref_err": gamma0_o2_err,
+                    "gamma0_O2_rel_diff_pct": np.nan,
+                    "gamma0_O2_sigma_ratio": np.nan,
+                    "gamma0_air_value": self._safe_float(row.get("gamma0_air")),
+                    "gamma0_air_err": self._safe_float(row.get("gamma0_air_err")),
+                    "gamma0_air_model": gamma_model,
+                    "gamma0_air_model_err": gamma_model_err,
+                    "gamma0_air_rel_diff_pct": gamma_rel,
+                    "gamma0_air_sigma_ratio": gamma_sigma,
+                    "gamma0_N2_ref": gamma0_n2,
+                    "gamma0_N2_ref_err": gamma0_n2_err,
+                    "x_O2": x_o2,
+                    "x_N2": x_n2,
+                })
+
+        return rows
+
+    def generate_remeasure_report(self) -> None:
+        """读取已有最终结果，生成建议重测点报告。"""
+        log_path = setup_logging()
+        point_out_path = self.final_root / "remeasure_candidates.csv"
+        transition_out_path = self.final_root / "remeasure_transitions.csv"
+        transition_o2_out_path = self.final_root / "remeasure_transitions_O2.csv"
+        transition_o2n2_out_path = self.final_root / "remeasure_transitions_O2_N2.csv"
+
+        logger.info("=" * 60)
+        logger.info("  建议重测点报告")
+        logger.info("=" * 60)
+        logger.info("  数据来源: 已有 final/ 结果")
+        logger.info(f"  相对偏差阈值: {self.remeasure_rel_threshold * 100:.1f}%")
+        logger.info(f"  sigma 阈值: {self.remeasure_sigma_threshold:.1f}σ")
+        if self.targets:
+            logger.info(f"  指定目标: {', '.join(self.targets)}")
+        else:
+            logger.info("  指定目标: 全部")
+        logger.info(f"  日志文件: {log_path}")
+        logger.info("=" * 60)
+
+        rows: list[dict] = []
+        target_gases = self._target_gas_types()
+        if target_gases is None or "O2" in target_gases:
+            rows.extend(self._build_remeasure_rows_o2())
+        if target_gases is None or "O2_N2" in target_gases:
+            rows.extend(self._build_remeasure_rows_o2n2())
+
+        columns = [
+            "gas_type",
+            "transition",
+            "pressure",
+            "recommend_remeasure",
+            "failed_metrics",
+            "fit_valid",
+            "fit_issue",
+            "residual_std",
+            "sw_value",
+            "sw_err",
+            "sw_ref",
+            "sw_ref_err",
+            "sw_rel_diff_pct",
+            "sw_sigma_ratio",
+            "gamma0_O2_value",
+            "gamma0_O2_err",
+            "gamma0_O2_ref",
+            "gamma0_O2_ref_err",
+            "gamma0_O2_rel_diff_pct",
+            "gamma0_O2_sigma_ratio",
+            "gamma0_air_value",
+            "gamma0_air_err",
+            "gamma0_air_model",
+            "gamma0_air_model_err",
+            "gamma0_air_rel_diff_pct",
+            "gamma0_air_sigma_ratio",
+            "gamma0_N2_ref",
+            "gamma0_N2_ref_err",
+            "x_O2",
+            "x_N2",
+        ]
+
+        report_df = pd.DataFrame(rows, columns=columns)
+        if not report_df.empty:
+            report_df["_transition_num"] = pd.to_numeric(
+                report_df["transition"], errors="coerce")
+            pressure_sort = report_df["pressure"].map(self._pressure_sort_value)
+            report_df["_pressure_1"] = pressure_sort.map(lambda item: item[0])
+            report_df["_pressure_2"] = pressure_sort.map(lambda item: item[1])
+            report_df = report_df.sort_values(
+                ["gas_type", "_transition_num", "transition",
+                 "_pressure_1", "_pressure_2", "pressure"],
+                na_position="last",
+            ).drop(columns=["_transition_num", "_pressure_1", "_pressure_2"])
+
+        self.final_root.mkdir(parents=True, exist_ok=True)
+        report_df.to_csv(point_out_path, index=False)
+
+        transition_columns = [
+            "gas_type",
+            "transition",
+            "recommend_remeasure",
+            "n_bad_points",
+            "bad_pressures",
+            "failed_metrics",
+            "has_invalid_fit",
+            "has_missing_params",
+            "missing_params",
+            "n_missing_params",
+            "worst_sw_rel_diff_pct",
+            "worst_sw_sigma_ratio",
+            "worst_gamma0_O2_rel_diff_pct",
+            "worst_gamma0_O2_sigma_ratio",
+            "worst_gamma0_air_rel_diff_pct",
+            "worst_gamma0_air_sigma_ratio",
+        ]
+        transition_rows: list[dict] = []
+        if not report_df.empty:
+            for (gas_type, transition), sub in report_df.groupby(
+                ["gas_type", "transition"], sort=False
+            ):
+                metric_union = sorted({
+                    item
+                    for value in sub["failed_metrics"].astype(str)
+                    for item in value.split(";")
+                    if item and item.lower() != "nan"
+                })
+                bad_pressures = [
+                    str(p) for p in sub["pressure"].astype(str).tolist()
+                    if p and p.lower() != "nan"
+                ]
+                transition_rows.append({
+                    "gas_type": gas_type,
+                    "transition": transition,
+                    "recommend_remeasure": True,
+                    "n_bad_points": int(len(sub)),
+                    "bad_pressures": ";".join(bad_pressures),
+                    "failed_metrics": ";".join(metric_union),
+                    "has_invalid_fit": bool(
+                        (~sub["fit_valid"].map(self._as_bool)).any()
+                    ),
+                    "has_missing_params": False,
+                    "missing_params": "",
+                    "n_missing_params": 0,
+                    "worst_sw_rel_diff_pct": pd.to_numeric(
+                        sub["sw_rel_diff_pct"], errors="coerce").max(),
+                    "worst_sw_sigma_ratio": pd.to_numeric(
+                        sub["sw_sigma_ratio"], errors="coerce").max(),
+                    "worst_gamma0_O2_rel_diff_pct": pd.to_numeric(
+                        sub["gamma0_O2_rel_diff_pct"], errors="coerce").max(),
+                    "worst_gamma0_O2_sigma_ratio": pd.to_numeric(
+                        sub["gamma0_O2_sigma_ratio"], errors="coerce").max(),
+                    "worst_gamma0_air_rel_diff_pct": pd.to_numeric(
+                        sub["gamma0_air_rel_diff_pct"], errors="coerce").max(),
+                    "worst_gamma0_air_sigma_ratio": pd.to_numeric(
+                        sub["gamma0_air_sigma_ratio"], errors="coerce").max(),
+                })
+
+        missing_master_map = self._collect_missing_master_params()
+        transition_index = {
+            (row["gas_type"], row["transition"]): row
+            for row in transition_rows
+        }
+        for key, missing_params in missing_master_map.items():
+            rec = transition_index.get(key)
+            if rec is None:
+                rec = {
+                    "gas_type": key[0],
+                    "transition": key[1],
+                    "recommend_remeasure": True,
+                    "n_bad_points": 0,
+                    "bad_pressures": "",
+                    "failed_metrics": "",
+                    "has_invalid_fit": False,
+                    "has_missing_params": False,
+                    "missing_params": "",
+                    "n_missing_params": 0,
+                    "worst_sw_rel_diff_pct": np.nan,
+                    "worst_sw_sigma_ratio": np.nan,
+                    "worst_gamma0_O2_rel_diff_pct": np.nan,
+                    "worst_gamma0_O2_sigma_ratio": np.nan,
+                    "worst_gamma0_air_rel_diff_pct": np.nan,
+                    "worst_gamma0_air_sigma_ratio": np.nan,
+                }
+                transition_rows.append(rec)
+                transition_index[key] = rec
+
+            rec["recommend_remeasure"] = True
+            rec["has_missing_params"] = True
+            rec["missing_params"] = ";".join(missing_params)
+            rec["n_missing_params"] = len(missing_params)
+
+        if transition_rows:
+            transition_df = pd.DataFrame(transition_rows, columns=transition_columns)
+            transition_df["_transition_num"] = pd.to_numeric(
+                transition_df["transition"], errors="coerce")
+            transition_df = transition_df.sort_values(
+                ["gas_type", "_transition_num", "transition"],
+                na_position="last",
+            ).drop(columns="_transition_num")
+        else:
+            transition_df = pd.DataFrame(columns=transition_columns)
+
+        transition_df.to_csv(transition_out_path, index=False)
+        transition_df[
+            transition_df["gas_type"] == "O2"
+        ].to_csv(transition_o2_out_path, index=False)
+        transition_df[
+            transition_df["gas_type"] == "O2_N2"
+        ].to_csv(transition_o2n2_out_path, index=False)
+
+        logger.info(f"  压力点明细已保存: {point_out_path}")
+        logger.info(f"  跃迁汇总已保存:   {transition_out_path}")
+        logger.info(f"  纯 O2 跃迁清单:   {transition_o2_out_path}")
+        logger.info(f"  O2_N2 跃迁清单:  {transition_o2n2_out_path}")
+        if report_df.empty and transition_df.empty:
+            logger.info("  未发现建议重测点")
+            return
+
+        logger.info(f"  共发现 {len(report_df)} 个建议重测点")
+        for gas_type, sub in report_df.groupby("gas_type"):
+            logger.info(f"    {gas_type}: {len(sub)} 个")
+
+        logger.info(f"  共涉及 {len(transition_df)} 个建议重测跃迁")
+        missing_transition_count = int(
+            transition_df["has_missing_params"].fillna(False).astype(bool).sum()
+        ) if not transition_df.empty else 0
+        if missing_transition_count > 0:
+            logger.info(f"  其中主表参数漏测跃迁: {missing_transition_count} 个")
+        for _, row in transition_df.iterrows():
+            parts: list[str] = []
+            n_bad_points = int(row.get("n_bad_points", 0) or 0)
+            bad_pressures = str(row.get("bad_pressures", "")).strip()
+            if n_bad_points > 0:
+                parts.append(f"{n_bad_points} 个压力点: {bad_pressures}")
+            if self._as_bool(row.get("has_missing_params")):
+                parts.append(f"漏测参数: {row.get('missing_params', '')}")
+
+            metrics = str(row.get("failed_metrics", "")).strip()
+            summary = "  ".join(parts)
+            if metrics and metrics.lower() != "nan":
+                summary += f"  [{metrics}]"
+            logger.info(
+                f"  - {row['gas_type']}/{row['transition']}"
+                + (f"  ({summary})" if summary else "")
+            )
 
     _MASTER_TABLE_NAME = "spectral_parameters.csv"
 
