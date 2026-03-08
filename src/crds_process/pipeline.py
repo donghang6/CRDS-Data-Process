@@ -1813,6 +1813,47 @@ class CRDSPipeline:
         safe = re.sub(r"_+", "_", safe).strip("_")
         return (safe or "pressure") + suffix
 
+    @staticmethod
+    def _build_measurement_groups(
+        transitions: list[str],
+        merge_gap: float = 1.0,
+        margin: float = 2.0,
+    ) -> list[dict]:
+        """将间隔较近的跃迁合并为一次测量，并给出推荐范围。"""
+        parsed: list[tuple[float, str]] = []
+        for text in transitions:
+            try:
+                parsed.append((float(text), str(text).strip()))
+            except (TypeError, ValueError):
+                continue
+
+        if not parsed:
+            return []
+
+        parsed.sort(key=lambda item: item[0])
+        groups: list[list[tuple[float, str]]] = [[parsed[0]]]
+        for item in parsed[1:]:
+            if item[0] - groups[-1][-1][0] < merge_gap:
+                groups[-1].append(item)
+            else:
+                groups.append([item])
+
+        measurement_groups: list[dict] = []
+        for idx, group in enumerate(groups, start=1):
+            left = group[0][0]
+            right = group[-1][0]
+            measurement_groups.append({
+                "index": idx,
+                "transition_label": " + ".join(item[1] for item in group),
+                "transition_count": len(group),
+                "start": left - margin,
+                "end": right + margin,
+                "group_min": left,
+                "group_max": right,
+            })
+
+        return measurement_groups
+
     def _write_pressure_pdf(
         self,
         out_path: Path,
@@ -1826,17 +1867,31 @@ class CRDSPipeline:
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
 
-        lines_per_page = 32
+        measurement_groups = self._build_measurement_groups(transitions)
+        lines_per_page = 28
         if not transitions:
             transitions = ["(empty)"]
+        if not measurement_groups:
+            measurement_groups = [{
+                "index": 1,
+                "transition_label": "(empty)",
+                "transition_count": 0,
+                "start": np.nan,
+                "end": np.nan,
+                "group_min": np.nan,
+                "group_max": np.nan,
+            }]
 
-        total_pages = max(1, (len(transitions) + lines_per_page - 1) // lines_per_page)
+        total_pages = max(
+            1,
+            (len(measurement_groups) + lines_per_page - 1) // lines_per_page,
+        )
 
         with PdfPages(out_path) as pdf:
             for page_idx in range(total_pages):
                 start = page_idx * lines_per_page
                 end = start + lines_per_page
-                page_lines = transitions[start:end]
+                page_groups = measurement_groups[start:end]
 
                 fig = plt.figure(figsize=(8.27, 11.69))
                 ax = fig.add_axes([0.06, 0.05, 0.88, 0.9])
@@ -1878,15 +1933,23 @@ class CRDSPipeline:
                 ax.text(
                     0.0,
                     0.85,
-                    "Recommended window width: 2.000 cm^-1",
+                    f"Measurements: {len(measurement_groups)}",
+                    fontsize=11,
+                    va="top",
+                    ha="left",
+                )
+                ax.text(
+                    0.0,
+                    0.82,
+                    "Rule: gap < 1.000 cm^-1 -> merge; extend 2.000 cm^-1 on both sides",
                     fontsize=11,
                     va="top",
                     ha="left",
                 )
                 ax.text(
                     0.02,
-                    0.81,
-                    "#   Transition    Recommended Range (cm^-1)     Lines",
+                    0.78,
+                    "#   Transition(s)                 Recommended Range (cm^-1)     Lines",
                     fontsize=10,
                     family="monospace",
                     fontweight="bold",
@@ -1894,24 +1957,19 @@ class CRDSPipeline:
                     ha="left",
                 )
 
-                y = 0.78
-                step = 0.022
-                for item_idx, transition in enumerate(page_lines, start=start + 1):
-                    rec = self._recommend_measurement_window(
-                        gas_type,
-                        transition,
-                        width=2.0,
-                    )
-                    if np.isfinite(rec["start"]) and np.isfinite(rec["end"]):
-                        range_text = f"{rec['start']:.3f}-{rec['end']:.3f}"
+                y = 0.74
+                step = 0.024
+                for group in page_groups:
+                    if np.isfinite(group["start"]) and np.isfinite(group["end"]):
+                        range_text = f"{group['start']:.3f}-{group['end']:.3f}"
                     else:
                         range_text = "N/A"
-                    if np.isfinite(rec["n_lines"]):
-                        count_text = f"{int(rec['n_lines']):>2} line(s)"
+                    if np.isfinite(group["transition_count"]):
+                        count_text = f"{int(group['transition_count']):>2} line(s)"
                     else:
                         count_text = "N/A"
                     line_text = (
-                        f"{item_idx:>2}. {transition:<12} "
+                        f"{int(group['index']):>2}. {group['transition_label']:<28} "
                         f"{range_text:<28} {count_text}"
                     )
                     ax.text(
