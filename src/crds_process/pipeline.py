@@ -2135,6 +2135,7 @@ class CRDSPipeline:
                         sw_scale = row.get("sw_scale_factor", 1.0)
                         if sw * sw_scale < 1e-35:
                             continue
+                        issues = self._single_fit_issues_from_row(row, diluents)
                         rec = {
                             "gas_type": gas_type,
                             "transition": transition,
@@ -2146,6 +2147,8 @@ class CRDSPipeline:
                             "x_shift": x_shift,
                             "residual_std": residual_std,
                             "sw_vary": row.get("sw_vary", False),
+                            "fit_valid": len(issues) == 0,
+                            "fit_issue": ";".join(issues),
                         }
                         for dil in diluents:
                             rec[f"gamma0_{dil}"] = row.get(f"gamma0_{dil}", 0)
@@ -2214,6 +2217,7 @@ class CRDSPipeline:
                     fitted = param_df[param_df["sw_vary"] == True]
                     for _, row in fitted.iterrows():
                         scale = row.get("sw_scale_factor", 1.0)
+                        issues = self._single_fit_issues_from_row(row, diluents)
                         rec = {
                             "pressure": pressure_label,
                             "nu_HITRAN": row["nu"],
@@ -2221,6 +2225,8 @@ class CRDSPipeline:
                             "sw_err": row.get("sw_err", 0) * scale,
                             "x_shift": x_shift,
                             "residual_std": residual_std,
+                            "fit_valid": len(issues) == 0,
+                            "fit_issue": ";".join(issues),
                         }
                         for dil in diluents:
                             rec[f"gamma0_{dil}"] = row.get(f"gamma0_{dil}", 0)
@@ -2284,6 +2290,33 @@ class CRDSPipeline:
             except Exception:
                 pass
         return 0.0
+
+    @staticmethod
+    def _single_fit_issues_from_row(
+        row: pd.Series,
+        diluents: list[str],
+    ) -> list[str]:
+        """统一判断单谱目标线是否足够可靠，可进入后续统计/回归。"""
+        issues: list[str] = []
+
+        sw_val = pd.to_numeric(row.get("sw"), errors="coerce")
+        sw_err = pd.to_numeric(row.get("sw_err"), errors="coerce")
+        if not np.isfinite(sw_err) or sw_err <= 0:
+            issues.append("missing_sw_err")
+        if np.isfinite(sw_val) and sw_val <= 1.05:
+            issues.append("sw_near_lower_bound")
+
+        for dil in diluents:
+            gamma_col = f"gamma0_{dil}"
+            gamma_err_col = f"{gamma_col}_err"
+            gamma_val = pd.to_numeric(row.get(gamma_col), errors="coerce")
+            gamma_err = pd.to_numeric(row.get(gamma_err_col), errors="coerce")
+            if not np.isfinite(gamma_err) or gamma_err <= 0:
+                issues.append(f"missing_{gamma_err_col}")
+            if np.isfinite(gamma_val) and gamma_val <= 0.0055:
+                issues.append(f"{gamma_col}_near_lower_bound")
+
+        return sorted(set(issues))
 
 
 # ==================================================================

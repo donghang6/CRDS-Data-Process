@@ -267,6 +267,11 @@ class N2BroadeningExtractor:
                 logger.warning("  指定压力在混合气统计表中均不存在，跳过")
                 return {}
 
+        mix_df = self._filter_invalid_gamma0_rows(mix_df)
+        if mix_df.empty:
+            logger.warning("  没有通过质量检查的混合气点，跳过")
+            return {}
+
         search_rows: list[dict] | None = None
         if optimize_pressures:
             optimized = self._optimize_pressure_combination(
@@ -314,6 +319,46 @@ class N2BroadeningExtractor:
 
         keep_set = set(allowed_pressures)
         return mix_df[mix_df["pressure"].isin(keep_set)].copy()
+
+    def _filter_invalid_gamma0_rows(
+        self,
+        mix_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """移除不可靠的 gamma0 单谱结果，避免坏点进入压力组合搜索。"""
+        mask = pd.Series(True, index=mix_df.index)
+
+        if "fit_valid" in mix_df.columns:
+            fit_valid = mix_df["fit_valid"].map(
+                lambda v: str(v).strip().lower() in {"true", "1", "yes"}
+                if not isinstance(v, (bool, np.bool_)) else bool(v)
+            )
+            mask &= fit_valid
+
+        if "sw_err" in mix_df.columns:
+            sw_err = pd.to_numeric(mix_df["sw_err"], errors="coerce")
+            mask &= np.isfinite(sw_err) & (sw_err > 0)
+
+        if "gamma0_air_err" in mix_df.columns:
+            gamma_err = pd.to_numeric(mix_df["gamma0_air_err"], errors="coerce")
+            mask &= np.isfinite(gamma_err) & (gamma_err > 0)
+
+        if mask.all():
+            return mix_df
+
+        removed = mix_df.loc[~mask].copy()
+        if not removed.empty:
+            removed_rows = []
+            for _, row in removed.iterrows():
+                msg = str(row.get("pressure", ""))
+                issue = str(row.get("fit_issue", "")).strip()
+                if issue and issue.lower() != "nan":
+                    msg += f" [{issue}]"
+                removed_rows.append(msg)
+            logger.warning("  以下混合气点未通过质量检查，已从 Step 5 排除:")
+            for msg in removed_rows:
+                logger.warning(f"    - {msg}")
+
+        return mix_df.loc[mask].copy()
 
     def _parse_mole_fractions(
         self,
@@ -424,7 +469,7 @@ class N2BroadeningExtractor:
                 f"n = {gamma_result.n_points}"
             )
 
-            candidate_key = (-r2_value, -len(combo), err_value,
+            candidate_key = (-r2_value, -gamma_result.n_points, err_value,
                              "+".join(combo))
             if best_key is None or candidate_key < best_key:
                 best_key = candidate_key
@@ -440,7 +485,7 @@ class N2BroadeningExtractor:
             key=lambda item: (
                 -(item[1].R_squared
                   if np.isfinite(item[1].R_squared) else float("-inf")),
-                -len(item[0]),
+                -item[1].n_points,
                 (item[1].uncertainty_N2
                  if np.isfinite(item[1].uncertainty_N2) else float("inf")),
                 "+".join(item[0]),
