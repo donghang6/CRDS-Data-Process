@@ -29,6 +29,10 @@
     python main.py --remeasure-report --remeasure-rel 0.05 --remeasure-sigma 3
     python main.py --remeasure-report --remeasure-rel-o2 0.05 --remeasure-rel-o2n2 0.10
 
+    # Monte Carlo Type A 误差分析 (基于已有纯 O2 多光谱联合拟合结果)
+    python main.py --type-a-mc O2/9398.306147
+    python main.py --type-a-mc O2/9398.306147 --mc-samples 100 --mc-wave-error-khz 10
+
     # 跳过 Step 1, 直接从已有的 ringdown 结果开始执行 Step 2~5
     python main.py --from-ringdown
     python main.py --from-ringdown O2/9386.2076
@@ -66,6 +70,10 @@ def _parse_args(argv: list[str]) -> dict:
     remeasure_rel_o2 = None
     remeasure_rel_o2n2 = None
     remeasure_sigma = 3.0
+    type_a_mc = False
+    mc_samples = 100
+    mc_seed = 12345
+    mc_wave_error_khz = 10.0
 
     i = 0
     while i < len(argv):
@@ -81,6 +89,9 @@ def _parse_args(argv: list[str]) -> dict:
             i += 1
         elif arg == "--remeasure-report":
             remeasure_report = True
+            i += 1
+        elif arg == "--type-a-mc":
+            type_a_mc = True
             i += 1
         elif arg == "--remeasure-rel":
             i += 1
@@ -113,6 +124,30 @@ def _parse_args(argv: list[str]) -> dict:
                     remeasure_sigma = float(argv[i])
                 except ValueError:
                     print(f"警告: --remeasure-sigma 参数无效: {argv[i]}，使用默认值 3")
+            i += 1
+        elif arg == "--mc-samples":
+            i += 1
+            if i < len(argv):
+                try:
+                    mc_samples = max(int(argv[i]), 1)
+                except ValueError:
+                    print(f"警告: --mc-samples 参数无效: {argv[i]}，使用默认值 100")
+            i += 1
+        elif arg == "--mc-seed":
+            i += 1
+            if i < len(argv):
+                try:
+                    mc_seed = int(argv[i])
+                except ValueError:
+                    print(f"警告: --mc-seed 参数无效: {argv[i]}，使用默认值 12345")
+            i += 1
+        elif arg == "--mc-wave-error-khz":
+            i += 1
+            if i < len(argv):
+                try:
+                    mc_wave_error_khz = max(float(argv[i]), 0.0)
+                except ValueError:
+                    print(f"警告: --mc-wave-error-khz 参数无效: {argv[i]}，使用默认值 10")
             i += 1
         elif arg in ("--pressures", "-p"):
             # 后续参数格式: "气体/跃迁=压力1,压力2,..."
@@ -165,10 +200,14 @@ def _parse_args(argv: list[str]) -> dict:
         "remeasure_rel_threshold_o2": remeasure_rel_o2,
         "remeasure_rel_threshold_o2n2": remeasure_rel_o2n2,
         "remeasure_sigma_threshold": remeasure_sigma,
+        "type_a_mc_samples": mc_samples,
+        "type_a_mc_seed": mc_seed,
+        "type_a_mc_wave_error_khz": mc_wave_error_khz,
         "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,
         "_remeasure_report": remeasure_report,
+        "_type_a_mc": type_a_mc,
     }
 
 
@@ -178,13 +217,16 @@ if __name__ == "__main__":
     from_ringdown = kwargs.pop("_from_ringdown")
     from_etalon = kwargs.pop("_from_etalon")
     remeasure_report = kwargs.pop("_remeasure_report")
+    type_a_mc = kwargs.pop("_type_a_mc")
 
     if from_ringdown and from_etalon:
         print("错误: --from-ringdown 与 --from-etalon 不能同时使用")
         sys.exit(2)
 
     pipeline = CRDSPipeline(**kwargs)
-    if remeasure_report:
+    if type_a_mc:
+        pipeline.run_type_a_monte_carlo()
+    elif remeasure_report:
         pipeline.generate_remeasure_report()
     elif n2_only:
         if from_etalon:
