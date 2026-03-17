@@ -31,7 +31,7 @@
 
     # Monte Carlo Type A 误差分析 (基于已有纯 O2 多光谱联合拟合结果)
     python main.py --type-a-mc O2/9398.306147
-    python main.py --type-a-mc O2/9398.306147 --mc-samples 100 --mc-wave-error-khz 10
+    python main.py --type-a-mc O2/9398.306147 --mc-samples 100 --mc-wave-error-mhz 200
 
     # 跳过 Step 1, 直接从已有的 ringdown 结果开始执行 Step 2~5
     python main.py --from-ringdown
@@ -73,7 +73,7 @@ def _parse_args(argv: list[str]) -> dict:
     type_a_mc = False
     mc_samples = 100
     mc_seed = 12345
-    mc_wave_error_khz = 10.0
+    mc_wave_error_khz = 200000.0
 
     i = 0
     while i < len(argv):
@@ -147,7 +147,15 @@ def _parse_args(argv: list[str]) -> dict:
                 try:
                     mc_wave_error_khz = max(float(argv[i]), 0.0)
                 except ValueError:
-                    print(f"警告: --mc-wave-error-khz 参数无效: {argv[i]}，使用默认值 10")
+                    print(f"警告: --mc-wave-error-khz 参数无效: {argv[i]}，使用默认值 200000")
+            i += 1
+        elif arg == "--mc-wave-error-mhz":
+            i += 1
+            if i < len(argv):
+                try:
+                    mc_wave_error_khz = max(float(argv[i]), 0.0) * 1000.0
+                except ValueError:
+                    print(f"警告: --mc-wave-error-mhz 参数无效: {argv[i]}，使用默认值 200")
             i += 1
         elif arg in ("--pressures", "-p"):
             # 后续参数格式: "气体/跃迁=压力1,压力2,..."

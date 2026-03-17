@@ -55,6 +55,7 @@ import copy
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import warnings
@@ -87,6 +88,59 @@ _DEFAULT_PATHS = {
 _O2_REMEASURE_PLAN_CSV = (
     _PROJECT_ROOT / "data" / "reference" / "o2_remeasure_pressure_plan.csv"
 )
+
+
+def _format_progress_time(seconds: float) -> str:
+    """将秒数格式化为便于阅读的时长字符串。"""
+    seconds = max(float(seconds), 0.0)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes, sec = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _print_progress_bar(
+    prefix: str,
+    current: int,
+    total: int,
+    start_time: float,
+    *,
+    finished: bool = False,
+) -> None:
+    """在终端输出简单进度条；非 TTY 环境下降低刷新频率。"""
+    total = max(int(total), 1)
+    current = min(max(int(current), 0), total)
+    fraction = current / total
+    elapsed = max(time.time() - start_time, 0.0)
+    rate = current / elapsed if elapsed > 0 and current > 0 else 0.0
+    eta = (total - current) / rate if rate > 0 else float("inf")
+
+    if not sys.stdout.isatty() and not finished:
+        stride = max(total // 10, 1)
+        if current not in (0, total) and current % stride != 0:
+            return
+
+    bar_width = 24
+    filled = min(int(bar_width * fraction), bar_width)
+    if filled >= bar_width:
+        bar = "=" * bar_width
+    else:
+        head = "=" * filled
+        tail = "." * max(bar_width - filled - 1, 0)
+        bar = f"{head}>{tail}" if current > 0 else "." * bar_width
+
+    line = (
+        f"{prefix} [{bar}] {current}/{total} "
+        f"({fraction * 100:5.1f}%) elapsed {_format_progress_time(elapsed)}"
+    )
+    if current < total and np.isfinite(eta):
+        line += f" eta {_format_progress_time(eta)}"
+
+    end = "\n" if finished or not sys.stdout.isatty() else "\r"
+    print(line, end=end, flush=True)
 
 
 # ==================================================================
@@ -327,7 +381,7 @@ class CRDSPipeline:
     type_a_mc_seed : int
         Monte Carlo Type A 随机种子 (默认 12345)
     type_a_mc_wave_error_khz : float
-        Monte Carlo 中施加的 x 轴频率噪声，单位 kHz (默认 10)
+        Monte Carlo 中施加的 x 轴频率噪声，单位 kHz (默认 200000 = 200 MHz)
     """
 
     # 干空气近似组成，用于由 HITRAN air/self 展宽反推 N2 展宽
@@ -364,7 +418,7 @@ class CRDSPipeline:
         remeasure_sigma_threshold: float = 3.0,
         type_a_mc_samples: int = 100,
         type_a_mc_seed: int = 12345,
-        type_a_mc_wave_error_khz: float = 10.0,
+        type_a_mc_wave_error_khz: float = 200000.0,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -1654,7 +1708,7 @@ class CRDSPipeline:
         logger.info(f"  线形:     {self.lineprofile}")
         logger.info(f"  抽样次数: {self.type_a_mc_samples}")
         logger.info(f"  随机种子: {self.type_a_mc_seed}")
-        logger.info(f"  x 轴噪声: {self.type_a_mc_wave_error_khz:.3f} kHz")
+        logger.info(f"  x 轴噪声: {self.type_a_mc_wave_error_khz / 1000.0:.3f} MHz")
         logger.info(f"  输出目录: {self.type_a_mc_root}")
         if self.targets:
             logger.info(f"  指定目标: {', '.join(self.targets)}")
@@ -1683,13 +1737,24 @@ class CRDSPipeline:
             logger.warning("  非 O2 目标将被忽略")
 
         processed = 0
-        for transition in transitions:
+        transition_progress_t0 = time.time()
+        _print_progress_bar("  跃迁进度", 0, len(transitions), transition_progress_t0)
+        for idx, transition in enumerate(transitions, start=1):
             try:
+                logger.info(f"\n  [{idx}/{len(transitions)}] 开始 O2/{transition}")
                 self._run_transition_type_a_monte_carlo("O2", transition)
                 processed += 1
             except Exception as exc:
                 logger.error(f"  [O2/{transition}] Monte Carlo Type A 失败: {exc}")
                 logger.exception("  详细错误信息:")
+            finally:
+                _print_progress_bar(
+                    "  跃迁进度",
+                    idx,
+                    len(transitions),
+                    transition_progress_t0,
+                    finished=(idx == len(transitions)),
+                )
 
         elapsed = time.time() - t0
         if processed == 0:
@@ -2068,6 +2133,13 @@ class CRDSPipeline:
         settings_df.to_csv(output_dir / "mc_settings.csv", index=False)
 
         sample_rows: list[dict] = []
+        sample_progress_t0 = time.time()
+        _print_progress_bar(
+            f"    样本进度 O2/{transition}",
+            0,
+            self.type_a_mc_samples,
+            sample_progress_t0,
+        )
         for sample_idx in range(self.type_a_mc_samples):
             sample_seed = self.type_a_mc_seed + sample_idx
             np.random.seed(sample_seed)
@@ -2164,6 +2236,15 @@ class CRDSPipeline:
                     "success": False,
                     "error": str(exc),
                 })
+            finally:
+                current = sample_idx + 1
+                _print_progress_bar(
+                    f"    样本进度 O2/{transition}",
+                    current,
+                    self.type_a_mc_samples,
+                    sample_progress_t0,
+                    finished=(current == self.type_a_mc_samples),
+                )
 
         samples_df = pd.DataFrame(sample_rows)
         samples_df.to_csv(output_dir / "mc_samples.csv", index=False)
