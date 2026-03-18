@@ -381,7 +381,7 @@ class CRDSPipeline:
     type_a_mc_seed : int
         Monte Carlo Type A 随机种子 (默认 12345)
     type_a_mc_wave_error_khz : float
-        Monte Carlo 中施加的 x 轴频率噪声，单位 kHz (默认 200000 = 200 MHz)
+        Monte Carlo 中施加的 x 轴频率噪声，单位 kHz (默认 4000 = 4 MHz)
     """
 
     # 干空气近似组成，用于由 HITRAN air/self 展宽反推 N2 展宽
@@ -418,7 +418,7 @@ class CRDSPipeline:
         remeasure_sigma_threshold: float = 3.0,
         type_a_mc_samples: int = 100,
         type_a_mc_seed: int = 12345,
-        type_a_mc_wave_error_khz: float = 200000.0,
+        type_a_mc_wave_error_khz: float = 4000.0,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
