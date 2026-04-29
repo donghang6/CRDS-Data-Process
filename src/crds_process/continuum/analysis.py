@@ -231,7 +231,7 @@ class ContinuumBatchProcessor:
             if "loss_stats_ppm_per_cm" in work.columns:
                 work["alpha_stats_ppm_per_cm"] = work["loss_stats_ppm_per_cm"]
 
-        spectrum_csv = output_dir / "continuum_spectrum.csv"
+        spectrum_csv = output_dir / "continuum_spectrum supplement.csv"
         work.to_csv(spectrum_csv, index=False)
         plot_path = output_dir / "continuum_spectrum.png"
         self._plot_spectrum(work, plot_path, f"{gas_type}/{transition}/{pressure}")
