@@ -22,6 +22,7 @@ MATS 工作流:
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 from dataclasses import dataclass, field
@@ -75,7 +76,7 @@ class MATSSpectrumPreparer:
         - temperature_column: 温度 (°C)
         - frequency_column: 波数 (cm⁻¹)
         - tau_column: 衰荡时间 (μs)
-        - tau_stats_column: tau 标准差 (可选)
+        - tau_stats_column: tau 相对误差百分比 (可选)
     """
 
     MATS_PRESSURE = "Cavity Pressure /Torr"
@@ -124,7 +125,17 @@ class MATSSpectrumPreparer:
         mats_df[self.MATS_FREQUENCY] = df[self.wavenumber_col]
         mats_df[self.MATS_TAU] = df[self.tau_col]
         if self.tau_stats_col and self.tau_stats_col in df.columns:
-            mats_df[self.MATS_TAU_STATS] = df[self.tau_stats_col]
+            tau_vals = pd.to_numeric(df[self.tau_col], errors="coerce").to_numpy(dtype=float)
+            tau_stats = pd.to_numeric(df[self.tau_stats_col], errors="coerce").to_numpy(dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rel_pct = np.abs(tau_stats / tau_vals) * 100.0
+            rel_pct[~np.isfinite(rel_pct)] = np.nan
+            if np.isfinite(rel_pct).any():
+                fallback = float(np.nanmedian(rel_pct[np.isfinite(rel_pct)]))
+                rel_pct = np.nan_to_num(rel_pct, nan=fallback, posinf=fallback, neginf=fallback)
+            else:
+                rel_pct = np.zeros_like(tau_vals, dtype=float)
+            mats_df[self.MATS_TAU_STATS] = rel_pct
 
         parent = Path(csv_path).parent
         if str(parent) != ".":
@@ -200,8 +211,17 @@ class HitranLinelistBuilder:
         return tname
 
     def build(self, wn_min: float, wn_max: float,
-              save_path: Path | str | None = None) -> pd.DataFrame:
-        """构建 MATS 格式 param_linelist"""
+              save_path: Path | str | None = None,
+              allowed_nu: list[float] | None = None,
+              ) -> pd.DataFrame:
+        """构建 MATS 格式 param_linelist
+
+        Parameters
+        ----------
+        allowed_nu : list[float] | None
+            若指定，则仅保留波数与列表中某值差 < 0.01 cm⁻¹ 的谱线，
+            其余谱线从线表中移除，不参与拟合。
+        """
         self._init_hapi()
         table = self._resolve_table(wn_min - 5, wn_max + 5)
         data = self._hapi.LOCAL_TABLE_CACHE[table]["data"]
@@ -222,6 +242,18 @@ class HitranLinelistBuilder:
         })
         margin = 5.0
         df = df[(df["nu"] >= wn_min - margin) & (df["nu"] <= wn_max + margin)]
+        # 仅保留用户指定的跃迁谱线
+        if allowed_nu is not None and len(allowed_nu) > 0:
+            import numpy as np
+            allowed_arr = np.array(allowed_nu)
+            keep_mask = df["nu"].apply(
+                lambda nu: np.min(np.abs(allowed_arr - nu)) < 0.01)
+            n_before = len(df)
+            df = df[keep_mask]
+            n_removed = n_before - len(df)
+            if n_removed > 0:
+                logger.info(f"  [HITRAN] 线表过滤: 保留 {len(df)} 条 "
+                            f"(移除 {n_removed} 条非目标谱线)")
         df["sw_scale_factor"] = 1.0
         # 注意: n_gamma0_O2 已从 HITRAN 赋值，不在此列表中覆盖为 0
         # SD_gamma 设置非零初始值 (SDVP 线形需要)
@@ -352,12 +384,14 @@ class MATSFitter:
         threshold_intensity: float = 1e-35,
         gas_type: str = "O2",
         refit_threshold: float = 0.5,
+        allowed_nu: list[float] | None = None,
     ):
         self.molecule = molecule
         self.isotopologue = isotopologue
         self.molefraction = molefraction or {molecule: 1.0}
         self.diluent = diluent
         self.gas_type = gas_type
+        self.allowed_nu = allowed_nu
         # 显式设置 Diluent (与参考脚本一致)
         # 纯 O₂: Diluent={'O2': {'composition':1, 'm': 31.9988}}
         # O₂+N₂: Diluent={'O2': {'composition': x_O2, 'm': 31.9988},
@@ -449,6 +483,118 @@ class MATSFitter:
 
         return to_fix
 
+    @staticmethod
+    def _collect_target_fit_issues(param_df: pd.DataFrame) -> list[str]:
+        """检查被拟合目标线是否存在明显坏解。
+
+        当前重点拦截两类问题:
+          1. 关键不确定度缺失 / 非正
+          2. 参数贴近物理约束下界，疑似掉入坏局部极小值
+        """
+        issues: list[str] = []
+        if param_df.empty or "sw_vary" not in param_df.columns:
+            return ["missing_target_line"]
+
+        fitted = param_df[param_df["sw_vary"] == True]
+        if fitted.empty:
+            return ["missing_target_line"]
+
+        for idx, row in fitted.iterrows():
+            sw_val = pd.to_numeric(row.get("sw"), errors="coerce")
+            sw_err = pd.to_numeric(row.get("sw_err"), errors="coerce")
+            if not np.isfinite(sw_err) or sw_err <= 0:
+                issues.append(f"line_{idx}:missing_sw_err")
+            if np.isfinite(sw_val) and sw_val <= 1.05:
+                issues.append(f"line_{idx}:sw_near_lower_bound")
+
+            for col in param_df.columns:
+                if not col.startswith("gamma0_"):
+                    continue
+                if col.endswith("_err") or col.endswith("_vary"):
+                    continue
+                if col.startswith("gamma0_n"):
+                    continue
+                vary_col = f"{col}_vary"
+                if vary_col in row.index and not bool(row.get(vary_col, False)):
+                    continue
+                gamma_val = pd.to_numeric(row.get(col), errors="coerce")
+                gamma_err = pd.to_numeric(row.get(f"{col}_err"), errors="coerce")
+                if not np.isfinite(gamma_err) or gamma_err <= 0:
+                    issues.append(f"line_{idx}:missing_{col}_err")
+                if np.isfinite(gamma_val) and gamma_val <= 0.0055:
+                    issues.append(f"line_{idx}:{col}_near_lower_bound")
+
+        return sorted(set(issues))
+
+    @staticmethod
+    def _quality_rank(issues: list[str], residual_std: float) -> tuple[int, float]:
+        """质量排序键: 问题越少越好，其次残差越小越好。"""
+        safe_res = residual_std if np.isfinite(residual_std) else float("inf")
+        return (len(issues), safe_res)
+
+    @staticmethod
+    def _freeze_fallback_params(params) -> None:
+        """约束重拟合: 固定高相关参数，保留 sw/gamma0/基线/x_shift 自由。"""
+        for pname in params:
+            if any(tag in pname for tag in ["delta0_", "SD_gamma_", "SD_delta_"]):
+                params[pname].set(vary=False)
+
+    @staticmethod
+    def _read_fit_outputs(
+        dataset_name: str,
+        param_file: str,
+        base_file: str,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, float]:
+        """读取当前目录下最新的拟合输出。"""
+        summary = pd.read_csv(f"{dataset_name}.csv")
+        res_col = next((c for c in summary.columns if "Residual" in c), None)
+        residuals = summary[res_col].values if res_col else np.array([])
+        res_std = float(np.std(residuals)) if len(residuals) > 0 else 0.0
+        updated_params = pd.read_csv(param_file + ".csv", index_col=0)
+        updated_baseline = pd.read_csv(base_file + ".csv")
+        return summary, updated_params, updated_baseline, res_std
+
+    @staticmethod
+    def _restore_fit_outputs(
+        dataset_name: str,
+        param_file: str,
+        base_file: str,
+        summary_df: pd.DataFrame,
+        param_df: pd.DataFrame,
+        baseline_df: pd.DataFrame,
+    ) -> None:
+        """将被 fallback 覆盖的输出文件恢复为原始结果。"""
+        summary_df.to_csv(f"{dataset_name}.csv", index=False)
+        param_df.to_csv(param_file + ".csv")
+        baseline_df.to_csv(base_file + ".csv", index=False)
+
+    def _run_constrained_single_refit(
+        self,
+        fit,
+        ds,
+        dataset_name: str,
+        param_file: str,
+        base_file: str,
+        params_initial,
+    ) -> tuple[object, pd.DataFrame, pd.DataFrame, pd.DataFrame, float, list[str]]:
+        """坏解兜底: 固定高相关参数后重新拟合一次。"""
+        params_fb = copy.deepcopy(params_initial)
+        self._apply_param_constraints(params_fb)
+        self._freeze_fallback_params(params_fb)
+
+        logger.info("\n  检测到坏局部极小值，执行约束重拟合:")
+        logger.info("    固定参数: delta0 / SD_gamma / SD_delta")
+        result_fb = fit.fit_data(params_fb, wing_cutoff=25)
+        fit.residual_analysis(result_fb, indv_resid_plot=False)
+        fit.update_params(result_fb)
+        summary_fb = ds.generate_summary_file(save_file=True)
+        summary_fb, params_fb_df, baseline_fb_df, res_std_fb = self._read_fit_outputs(
+            dataset_name, param_file, base_file,
+        )
+        issues_fb = self._collect_target_fit_issues(params_fb_df)
+        return (result_fb, summary_fb, params_fb_df,
+                baseline_fb_df, res_std_fb, issues_fb)
+
     def fit(
         self,
         etalon_csv: Path | str,
@@ -481,6 +627,7 @@ class MATSFitter:
             linelist_csv = f"{dataset_name}_linelist.csv"
             param_linelist = self._linelist_builder.build(
                 wn_min, wn_max, save_path=linelist_csv,
+                allowed_nu=self.allowed_nu,
             )
             logger.info(f"  线表: {len(param_linelist)} 条谱线")
             for _, row in param_linelist.iterrows():
@@ -565,6 +712,7 @@ class MATSFitter:
             linelist_csv = f"{dataset_name}_linelist.csv"
             param_linelist = self._linelist_builder.build(
                 wn_global_min, wn_global_max, save_path=linelist_csv,
+                allowed_nu=self.allowed_nu,
             )
 
             # 应用固定参数值 (如纯 O₂ 结果中的 γ₀_O₂)
@@ -679,7 +827,7 @@ class MATSFitter:
             fit = Fit_DataSet(
                 ds, base_file, param_file,
                 minimum_parameter_fit_intensity=self.fit_intensity,
-                weight_spectra=False,
+                weight_spectra=True,
             )
             params = fit.generate_params()
 
@@ -834,12 +982,14 @@ class MATSFitter:
         fit = Fit_DataSet(
             ds, base_file, param_file,
             minimum_parameter_fit_intensity=self.fit_intensity,
-            weight_spectra=False,
+            weight_spectra=True,
         )
         params = fit.generate_params()
+        params_initial = copy.deepcopy(params)
 
         # 参数约束
         self._apply_param_constraints(params)
+        self._apply_param_constraints(params_initial)
 
         # 调试: 打印浮动参数及约束
         for param in params:
@@ -876,14 +1026,47 @@ class MATSFitter:
         # ---- Step 8: 更新参数 & 生成结果 ----
         fit.residual_analysis(result, indv_resid_plot=False)
         fit.update_params(result)
-        summary = ds.generate_summary_file(save_file=True)
+        ds.generate_summary_file(save_file=True)
+        summary, updated_params, updated_baseline, res_std = (
+            self._read_fit_outputs(dataset_name, param_file, base_file)
+        )
 
-        # MATS summary 列名格式: 'Residuals (ppm/cm)', 'Alpha (ppm/cm)', etc.
-        res_col = next((c for c in summary.columns if "Residual" in c), None)
-        residuals = summary[res_col].values if res_col else np.array([])
-        res_std = float(np.std(residuals)) if len(residuals) > 0 else 0.0
-        updated_params = pd.read_csv(param_file + ".csv", index_col=0)
-        updated_baseline = pd.read_csv(base_file + ".csv")
+        issues = self._collect_target_fit_issues(updated_params)
+        if issues:
+            logger.warning("  目标线拟合质量异常: " + ", ".join(issues))
+            original_pack = (
+                result, summary.copy(), updated_params.copy(),
+                updated_baseline.copy(), res_std, issues,
+            )
+
+            (result_fb, summary_fb, params_fb_df,
+             baseline_fb_df, res_std_fb, issues_fb) = (
+                self._run_constrained_single_refit(
+                    fit, ds, dataset_name, param_file, base_file,
+                    params_initial,
+                )
+            )
+
+            if self._quality_rank(issues_fb, res_std_fb) < self._quality_rank(
+                original_pack[5], original_pack[4]
+            ):
+                logger.info("  约束重拟合质量更好，采用重拟合结果")
+                result = result_fb
+                summary = summary_fb
+                updated_params = params_fb_df
+                updated_baseline = baseline_fb_df
+                res_std = res_std_fb
+            else:
+                logger.info("  约束重拟合未改善结果，保留原始拟合输出")
+                self._restore_fit_outputs(
+                    dataset_name, param_file, base_file,
+                    original_pack[1], original_pack[2], original_pack[3],
+                )
+                result = original_pack[0]
+                summary = original_pack[1]
+                updated_params = original_pack[2]
+                updated_baseline = original_pack[3]
+                res_std = original_pack[4]
 
         mats_result = MATSFitResult(
             fit_result=result,
@@ -1298,4 +1481,3 @@ def batch_mats_fitting(
         mats_root=mats_root,
         fitter=fitter,
     ).run()
-

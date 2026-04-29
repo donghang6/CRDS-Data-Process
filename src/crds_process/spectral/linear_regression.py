@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -222,6 +223,9 @@ class N2BroadeningExtractor:
         mix_stats_csv: Path | str,
         o2_multi_csv: Path | str,
         output_dir: Path | str | None = None,
+        allowed_pressures: list[str] | None = None,
+        optimize_pressures: bool = False,
+        min_pressures: int = 3,
     ) -> dict[str, LinearRegressionResult]:
         """执行线性回归提取所有 N₂ 参数
 
@@ -235,6 +239,12 @@ class N2BroadeningExtractor:
             (output/results/final/O2/{transition}/multi_fit_result.csv)
         output_dir : Path, optional
             输出目录 (保存 CSV 和图表)
+        allowed_pressures : list[str], optional
+            若提供，仅使用这些压力标签对应的数据行
+        optimize_pressures : bool
+            是否自动搜索最优压力组合
+        min_pressures : int
+            自动搜索时每个组合的最少压力数
 
         Returns
         -------
@@ -249,27 +259,139 @@ class N2BroadeningExtractor:
             return {}
 
         o2_row = o2_df.iloc[0]
+        mix_df["pressure"] = mix_df["pressure"].astype(str)
 
-        # 解析每个混合气的 O₂/N₂ 摩尔分数
+        if allowed_pressures is not None:
+            mix_df = self._filter_allowed_pressures(mix_df, allowed_pressures)
+            if mix_df.empty:
+                logger.warning("  指定压力在混合气统计表中均不存在，跳过")
+                return {}
+
+        mix_df = self._filter_invalid_gamma0_rows(mix_df)
+        if mix_df.empty:
+            logger.warning("  没有通过质量检查的混合气点，跳过")
+            return {}
+
+        search_rows: list[dict] | None = None
+        if optimize_pressures:
+            optimized = self._optimize_pressure_combination(
+                mix_df=mix_df,
+                o2_row=o2_row,
+                min_pressures=min_pressures,
+            )
+            if optimized is None:
+                return {}
+            mix_df, search_rows = optimized
+
+        results = self._run_regressions(mix_df, o2_row)
+
+        if output_dir:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self.save_csv(results, output_dir / "linear_regression_n2.csv")
+            self.plot_results(results, output_dir)
+            optimization_csv = output_dir / "pressure_optimization_n2.csv"
+            if search_rows is not None:
+                pd.DataFrame(search_rows).to_csv(optimization_csv, index=False)
+                logger.info(f"  压力组合搜索结果已保存: {optimization_csv}")
+            elif optimization_csv.exists():
+                optimization_csv.unlink()
+
+        return results
+
+    @staticmethod
+    def _pressure_labels(mix_df: pd.DataFrame) -> list[str]:
+        """提取去重后的压力标签，保持原有顺序。"""
+        return list(dict.fromkeys(mix_df["pressure"].astype(str).tolist()))
+
+    def _filter_allowed_pressures(
+        self,
+        mix_df: pd.DataFrame,
+        allowed_pressures: list[str],
+    ) -> pd.DataFrame:
+        """按指定压力列表过滤混合气统计表。"""
+        available = self._pressure_labels(mix_df)
+        missing = [p for p in allowed_pressures if p not in available]
+        if missing:
+            logger.warning("  以下指定压力在混合气统计表中未找到: "
+                           + ", ".join(missing))
+            logger.warning("    可用压力: " + ", ".join(available))
+
+        keep_set = set(allowed_pressures)
+        return mix_df[mix_df["pressure"].isin(keep_set)].copy()
+
+    def _filter_invalid_gamma0_rows(
+        self,
+        mix_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """移除不可靠的 gamma0 单谱结果，避免坏点进入压力组合搜索。"""
+        mask = pd.Series(True, index=mix_df.index)
+
+        if "fit_valid" in mix_df.columns:
+            fit_valid = mix_df["fit_valid"].map(
+                lambda v: str(v).strip().lower() in {"true", "1", "yes"}
+                if not isinstance(v, (bool, np.bool_)) else bool(v)
+            )
+            mask &= fit_valid
+
+        if "sw_err" in mix_df.columns:
+            sw_err = pd.to_numeric(mix_df["sw_err"], errors="coerce")
+            mask &= np.isfinite(sw_err) & (sw_err > 0)
+
+        if "gamma0_air_err" in mix_df.columns:
+            gamma_err = pd.to_numeric(mix_df["gamma0_air_err"], errors="coerce")
+            mask &= np.isfinite(gamma_err) & (gamma_err > 0)
+
+        if mask.all():
+            return mix_df
+
+        removed = mix_df.loc[~mask].copy()
+        if not removed.empty:
+            removed_rows = []
+            for _, row in removed.iterrows():
+                msg = str(row.get("pressure", ""))
+                issue = str(row.get("fit_issue", "")).strip()
+                if issue and issue.lower() != "nan":
+                    msg += f" [{issue}]"
+                removed_rows.append(msg)
+            logger.warning("  以下混合气点未通过质量检查，已从 Step 5 排除:")
+            for msg in removed_rows:
+                logger.warning(f"    - {msg}")
+
+        return mix_df.loc[mask].copy()
+
+    def _parse_mole_fractions(
+        self,
+        mix_df: pd.DataFrame,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """解析每个数据点对应的 O₂/N₂ 摩尔分数。"""
         x_O2_arr = []
         x_N2_arr = []
-        for pres_label in mix_df["pressure"]:
+        for pres_label in mix_df["pressure"].astype(str):
             gc = parse_gas_dir(pres_label, "O2_N2")
             x_O2_arr.append(gc.o2_fraction)
             x_N2_arr.append(gc.n2_fraction)
-        x_O2 = np.array(x_O2_arr)
-        x_N2 = np.array(x_N2_arr)
+        return np.array(x_O2_arr), np.array(x_N2_arr)
 
+    def _run_regressions(
+        self,
+        mix_df: pd.DataFrame,
+        o2_row: pd.Series,
+        param_names: set[str] | None = None,
+    ) -> dict[str, LinearRegressionResult]:
+        """对给定混合气子集执行线性回归。"""
+        x_O2, x_N2 = self._parse_mole_fractions(mix_df)
         results: dict[str, LinearRegressionResult] = {}
 
         for (param_base, air_col, o2_col,
              air_err_col, o2_err_col) in _REGRESSION_PARAMS:
+            if param_names is not None and param_base not in param_names:
+                continue
 
-            # 检查列是否存在
             if air_col not in mix_df.columns:
                 logger.warning(f"  {air_col} 列不存在于混合气统计表中，跳过")
                 continue
-            if o2_col not in o2_row:
+            if o2_col not in o2_row.index:
                 logger.warning(f"  {o2_col} 列不存在于纯 O₂ 结果中，跳过")
                 continue
 
@@ -287,14 +409,115 @@ class N2BroadeningExtractor:
             )
             results[param_base] = result
 
-        # 保存结果
-        if output_dir:
-            output_dir = Path(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            self.save_csv(results, output_dir / "linear_regression_n2.csv")
-            self.plot_results(results, output_dir)
-
         return results
+
+    def _optimize_pressure_combination(
+        self,
+        mix_df: pd.DataFrame,
+        o2_row: pd.Series,
+        min_pressures: int,
+    ) -> tuple[pd.DataFrame, list[dict]] | None:
+        """搜索最优压力组合，按 gamma0_N2 的 R² 最大选最终结果。"""
+        all_pressures = self._pressure_labels(mix_df)
+        n_available = len(all_pressures)
+        min_k = max(int(min_pressures), 3)
+
+        if n_available < min_k:
+            logger.warning(f"  可用压力 ({n_available}) < 最少要求 ({min_k})，"
+                           "跳过 N₂ 线性回归")
+            return None
+
+        all_combos: list[tuple[str, ...]] = []
+        for k in range(min_k, n_available + 1):
+            all_combos.extend(combinations(all_pressures, k))
+
+        logger.info("  自动搜索最优 N₂ 线性回归压力组合")
+        logger.info("  可用压力: " + ", ".join(all_pressures))
+        logger.info(f"  组合数: {len(all_combos)} (最少 {min_k} 个, "
+                    f"最多 {n_available} 个)")
+        logger.info("  评价指标: gamma0_N2 的 R²")
+        logger.info(f"  {'─' * 60}")
+
+        pressure_series = mix_df["pressure"].astype(str)
+        results_log: list[tuple[tuple[str, ...], LinearRegressionResult]] = []
+        best_combo: tuple[str, ...] | None = None
+        best_result: LinearRegressionResult | None = None
+        best_key: tuple[float, float, float, str] | None = None
+
+        for idx, combo in enumerate(all_combos, 1):
+            combo_df = mix_df[pressure_series.isin(combo)].copy()
+            gamma_result = self._run_regressions(
+                combo_df, o2_row, param_names={"gamma0"}).get("gamma0")
+            if gamma_result is None:
+                logger.info(f"  [{idx}/{len(all_combos)}] "
+                            f"{', '.join(combo)}  →  gamma0 回归不可用")
+                continue
+
+            results_log.append((combo, gamma_result))
+            r2_value = (float(gamma_result.R_squared)
+                        if np.isfinite(gamma_result.R_squared)
+                        else float("-inf"))
+            err_value = (float(gamma_result.uncertainty_N2)
+                         if np.isfinite(gamma_result.uncertainty_N2)
+                         else float("inf"))
+
+            logger.info(
+                f"  [{idx}/{len(all_combos)}] {', '.join(combo)}  →  "
+                f"R² = {r2_value:.6f}, "
+                f"gamma0_N2 = {gamma_result.value_N2:.6f} ± "
+                f"{gamma_result.uncertainty_N2:.6f}, "
+                f"n = {gamma_result.n_points}"
+            )
+
+            candidate_key = (-r2_value, -gamma_result.n_points, err_value,
+                             "+".join(combo))
+            if best_key is None or candidate_key < best_key:
+                best_key = candidate_key
+                best_combo = combo
+                best_result = gamma_result
+
+        if not results_log or best_combo is None or best_result is None:
+            logger.warning("  未找到可用的 N₂ 线性回归压力组合")
+            return None
+
+        ranked = sorted(
+            results_log,
+            key=lambda item: (
+                -(item[1].R_squared
+                  if np.isfinite(item[1].R_squared) else float("-inf")),
+                -item[1].n_points,
+                (item[1].uncertainty_N2
+                 if np.isfinite(item[1].uncertainty_N2) else float("inf")),
+                "+".join(item[0]),
+            ),
+        )
+
+        logger.info(f"\n  {'═' * 60}")
+        logger.info("  N₂ 压力组合搜索结果 (按 gamma0_N2 的 R² 降序)")
+        logger.info(f"  {'═' * 60}")
+
+        search_rows: list[dict] = []
+        for rank, (combo, result) in enumerate(ranked, 1):
+            marker = " ← 最优" if combo == best_combo else ""
+            logger.info(
+                f"  #{rank:<3d} R²={result.R_squared:<10.6f} "
+                f"n={result.n_points:<3d}  {', '.join(combo)}{marker}"
+            )
+            search_rows.append({
+                "pressures": "+".join(combo),
+                "n_pressures": len(combo),
+                "R_squared": result.R_squared,
+                "gamma0_N2": result.value_N2,
+                "gamma0_N2_err": result.uncertainty_N2,
+                "n_points": result.n_points,
+                "is_best": combo == best_combo,
+            })
+        logger.info(f"  {'═' * 60}")
+        logger.info(f"\n  ★ 最优组合: {', '.join(best_combo)}  "
+                    f"(R² = {best_result.R_squared:.6f})")
+
+        best_df = mix_df[pressure_series.isin(best_combo)].copy()
+        return best_df, search_rows
 
     def _regress_one_param(
         self,
@@ -536,4 +759,3 @@ class N2BroadeningExtractor:
             fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
             plt.close(fig)
             logger.info(f"  汇总图已保存: {save_path}")
-
