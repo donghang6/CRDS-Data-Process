@@ -33,6 +33,14 @@
     python main.py --type-a-mc O2/9398.306147
     python main.py --type-a-mc O2/9398.306147 --mc-samples 100 --mc-wave-error-mhz 4
 
+    # 连续吸收 / continuum absorption (仅处理 CIA 数据；只做 Step 1，跳过标准具/MATS)
+    python main.py --continuum CIA/273K
+    python main.py --continuum "CIA/273K/Ar 500Torr"
+    python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr"
+    python main.py --continuum "CIA/273K/Ar 500Torr" --continuum-tau0-us 102.3
+    python main.py --continuum "CIA/273K/Ar 500Torr" \
+        --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
+
     # 跳过 Step 1, 直接从已有的 ringdown 结果开始执行 Step 2~5
     python main.py --from-ringdown
     python main.py --from-ringdown O2/9386.2076
@@ -44,9 +52,32 @@
     python main.py --from-etalon O2/9386.2076
 """
 
+import os
 import sys
+import tempfile
+from pathlib import Path
 
-from crds_process.pipeline import CRDSPipeline
+_CACHE_ROOT = Path(tempfile.gettempdir()) / "crds-data-process-cache"
+_MPLCONFIGDIR = _CACHE_ROOT / "matplotlib"
+_XDG_CACHE_HOME = _CACHE_ROOT / "xdg"
+_MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+_XDG_CACHE_HOME.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIGDIR))
+os.environ.setdefault("XDG_CACHE_HOME", str(_XDG_CACHE_HOME))
+
+
+def _parse_continuum_window(raw: str) -> tuple[float, float] | None:
+    """Parse continuum window as start,end or start:end."""
+    sep = "," if "," in raw else ":"
+    parts = [p.strip() for p in raw.split(sep) if p.strip()]
+    if len(parts) != 2:
+        print(f"警告: --continuum-window 参数无效: {raw}，格式应为 start,end")
+        return None
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
+        print(f"警告: --continuum-window 参数无效: {raw}，格式应为 start,end")
+        return None
 
 
 def _parse_args(argv: list[str]) -> dict:
@@ -74,6 +105,11 @@ def _parse_args(argv: list[str]) -> dict:
     mc_samples = 100
     mc_seed = 12345
     mc_wave_error_khz = 4000.0
+    continuum = False
+    continuum_reference_csv = None
+    continuum_tau0_us = None
+    continuum_window = None
+    continuum_tau_col = None
 
     i = 0
     while i < len(argv):
@@ -92,6 +128,38 @@ def _parse_args(argv: list[str]) -> dict:
             i += 1
         elif arg == "--type-a-mc":
             type_a_mc = True
+            i += 1
+        elif arg == "--continuum":
+            continuum = True
+            i += 1
+        elif arg in ("--continuum-ref", "--continuum-reference"):
+            i += 1
+            if i < len(argv):
+                continuum_reference_csv = argv[i]
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg == "--continuum-tau0-us":
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_tau0_us = float(argv[i])
+                except ValueError:
+                    print(f"警告: --continuum-tau0-us 参数无效: {argv[i]}，将只输出 loss")
+            i += 1
+        elif arg == "--continuum-window":
+            i += 1
+            if i < len(argv):
+                continuum_window = _parse_continuum_window(argv[i])
+            else:
+                print("警告: --continuum-window 缺少参数，已忽略")
+            i += 1
+        elif arg == "--continuum-tau-col":
+            i += 1
+            if i < len(argv):
+                continuum_tau_col = argv[i]
+            else:
+                print("警告: --continuum-tau-col 缺少参数，已忽略")
             i += 1
         elif arg == "--remeasure-rel":
             i += 1
@@ -169,7 +237,7 @@ def _parse_args(argv: list[str]) -> dict:
                         multi_fit_pressures[key.strip()] = pressures
                 else:
                     print(f"警告: 忽略无效的 --pressures 参数: {spec}")
-                    print(f"  格式应为: 气体类型/跃迁=压力1,压力2,...")
+                    print("  格式应为: 气体类型/跃迁=压力1,压力2,...")
                 i += 1
         elif arg in ("--fit-transitions", "--fit-lines", "--fit-nu"):
             i += 1
@@ -211,31 +279,66 @@ def _parse_args(argv: list[str]) -> dict:
         "type_a_mc_samples": mc_samples,
         "type_a_mc_seed": mc_seed,
         "type_a_mc_wave_error_khz": mc_wave_error_khz,
+        "continuum_reference_csv": continuum_reference_csv,
+        "continuum_tau0_us": continuum_tau0_us,
+        "continuum_window": continuum_window,
+        "continuum_tau_col": continuum_tau_col,
         "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,
         "_remeasure_report": remeasure_report,
         "_type_a_mc": type_a_mc,
+        "_continuum": continuum,
     }
 
 
 if __name__ == "__main__":
+    from crds_process.pipeline import CRDSPipeline
+
     kwargs = _parse_args(sys.argv[1:])
     n2_only = kwargs.pop("_n2_only")
     from_ringdown = kwargs.pop("_from_ringdown")
     from_etalon = kwargs.pop("_from_etalon")
     remeasure_report = kwargs.pop("_remeasure_report")
     type_a_mc = kwargs.pop("_type_a_mc")
+    continuum = kwargs.pop("_continuum")
 
     if from_ringdown and from_etalon:
         print("错误: --from-ringdown 与 --from-etalon 不能同时使用")
         sys.exit(2)
+    if continuum and n2_only:
+        print("错误: --continuum 与 --n2-only 不能同时使用")
+        sys.exit(2)
+    if continuum and from_etalon:
+        print("错误: --continuum 只使用 Step 1 的 ringdown_results.csv，不做标准具去除")
+        print("      请改用 --from-ringdown 复用已有 Step 1 结果")
+        sys.exit(2)
+    if continuum:
+        continuum_targets = kwargs.get("targets")
+        if continuum_targets is None:
+            kwargs["targets"] = ["CIA"]
+        else:
+            bad_targets = [
+                t for t in continuum_targets
+                if (not t.strip("/").split("/")
+                    or t.strip("/").split("/")[0] != "CIA")
+            ]
+            if bad_targets:
+                print("错误: --continuum 只能处理 CIA 目录下的数据")
+                print("      示例: python main.py --continuum 'CIA/273K/Ar 500Torr'")
+                print(f"      无效目标: {', '.join(bad_targets)}")
+                sys.exit(2)
 
     pipeline = CRDSPipeline(**kwargs)
     if type_a_mc:
         pipeline.run_type_a_monte_carlo()
     elif remeasure_report:
         pipeline.generate_remeasure_report()
+    elif continuum:
+        if from_ringdown:
+            pipeline.run_continuum_from_ringdown()
+        else:
+            pipeline.run_continuum()
     elif n2_only:
         if from_etalon:
             pipeline.run_n2_only_from_etalon()

@@ -83,6 +83,7 @@ _DEFAULT_PATHS = {
     "mats": _PROJECT_ROOT / "output" / "results" / "mats",
     "mats_multi": _PROJECT_ROOT / "output" / "results" / "mats_multi",
     "final": _PROJECT_ROOT / "output" / "results" / "final",
+    "continuum": _PROJECT_ROOT / "output" / "results" / "continuum",
 }
 
 _O2_REMEASURE_PLAN_CSV = (
@@ -396,6 +397,7 @@ class CRDSPipeline:
         mats_root: Path | str | None = None,
         mats_multi_root: Path | str | None = None,
         final_root: Path | str | None = None,
+        continuum_root: Path | str | None = None,
         lineprofile: str = "SDVP",
         sw_sigma: float = 2.0,
         molecule: int = 7,
@@ -419,6 +421,10 @@ class CRDSPipeline:
         type_a_mc_samples: int = 100,
         type_a_mc_seed: int = 12345,
         type_a_mc_wave_error_khz: float = 4000.0,
+        continuum_reference_csv: Path | str | None = None,
+        continuum_tau0_us: float | None = None,
+        continuum_window: tuple[float, float] | None = None,
+        continuum_tau_col: str | None = None,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -427,6 +433,7 @@ class CRDSPipeline:
         self.mats_root = Path(mats_root) if mats_root else _DEFAULT_PATHS["mats"]
         self.mats_multi_root = Path(mats_multi_root) if mats_multi_root else _DEFAULT_PATHS["mats_multi"]
         self.final_root = Path(final_root) if final_root else _DEFAULT_PATHS["final"]
+        self.continuum_root = Path(continuum_root) if continuum_root else _DEFAULT_PATHS["continuum"]
         self.type_a_mc_root = self.final_root.parent / "type_a_mc"
 
         # ── 并行 ──
@@ -478,6 +485,16 @@ class CRDSPipeline:
         self.type_a_mc_seed = int(type_a_mc_seed)
         self.type_a_mc_wave_error_khz = max(float(type_a_mc_wave_error_khz), 0.0)
 
+        # ── Continuum absorption ──
+        self.continuum_reference_csv = (
+            Path(continuum_reference_csv) if continuum_reference_csv else None
+        )
+        self.continuum_tau0_us = (
+            float(continuum_tau0_us) if continuum_tau0_us is not None else None
+        )
+        self.continuum_window = continuum_window
+        self.continuum_tau_col = continuum_tau_col
+
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
         self.sw_sigma = sw_sigma
@@ -495,14 +512,20 @@ class CRDSPipeline:
     # 原始数据命名规范检测
     # ==============================================================
     # 已知气体类型
-    _KNOWN_GAS_TYPES = {"O2", "O2_N2"}
+    _KNOWN_GAS_TYPES = {"O2", "O2_N2", "CIA"}
     # 跃迁波数格式: 纯数字或浮点数 (如 9386.2076)
     _RE_TRANSITION = re.compile(r"^\d+(\.\d+)?$")
+    # CIA 温度标签: 273K / 296.0K
+    _RE_CIA_TEMPERATURE = re.compile(r"^\d+(\.\d+)?K$", re.IGNORECASE)
     # 纯 O₂ 压力目录: {数字}Torr
     _RE_PRESSURE_O2 = re.compile(r"^\d+Torr$")
     # O₂+N₂ 压力目录: O2 {数字}Torr N2 {数字}Torr (允许 {数字} 前后有空格)
     _RE_PRESSURE_MIX = re.compile(
         r"^O2\s+\d+\s*Torr\s+N2\s+\d+\s*Torr$", re.IGNORECASE
+    )
+    # CIA 压力目录: Ar 500Torr / N2 300.5Torr
+    _RE_PRESSURE_CIA = re.compile(
+        r"^[A-Za-z0-9_+-]+\s+\d+(\.\d+)?\s*Torr$", re.IGNORECASE
     )
     # 数据文件名: {序号} {波数} {14位时间戳}.txt
     _RE_DATAFILE = re.compile(r"^\s*\d+\s+[\d.]+\s+\d{14}\.txt$")
@@ -511,12 +534,13 @@ class CRDSPipeline:
         """检测 data/raw 下原始数据目录和文件命名是否符合规范。
 
         规范:
-            data/raw/{气体类型}/{跃迁波数}/{压力目录}/
-            - 气体类型: O2, O2_N2
-            - 跃迁波数: 浮点数 (如 9386.2076)
+            data/raw/{气体类型}/{跃迁波数或温度}/{压力目录}/
+            - 气体类型: O2, O2_N2, CIA
+            - 跃迁波数: 浮点数 (如 9386.2076)；CIA 可用温度标签 (如 273K)
             - 压力目录:
                 O2:    "{数字}Torr"   (如 100Torr)
                 O2_N2: "O2 {数字}Torr N2 {数字}Torr"
+                CIA:   "{气体} {数字}Torr" (如 Ar 500Torr)
             - 数据文件: "{序号} {波数} {14位时间戳}.txt"
 
         Returns
@@ -555,12 +579,21 @@ class CRDSPipeline:
                     continue
                 transition = trans_dir.name
 
-                if not self._RE_TRANSITION.match(transition):
+                transition_ok = bool(self._RE_TRANSITION.match(transition))
+                if gas_type == "CIA":
+                    transition_ok = transition_ok or bool(
+                        self._RE_CIA_TEMPERATURE.match(transition)
+                    )
+                if not transition_ok:
                     logger.warning(
-                        f"  ⚠ 跃迁目录名不是有效波数: "
+                        f"  ⚠ 跃迁/温度目录名不规范: "
                         f"{gas_type}/{transition}/")
-                    logger.warning(
-                        f"    应为纯数字或浮点数 (如 9386.2076)")
+                    if gas_type == "CIA":
+                        logger.warning(
+                            "    CIA 应为温度标签 (如 273K) 或纯数字/浮点数")
+                    else:
+                        logger.warning(
+                            f"    应为纯数字或浮点数 (如 9386.2076)")
                     all_ok = False
                     continue
 
@@ -587,6 +620,13 @@ class CRDSPipeline:
                             logger.warning(
                                 f"    O₂+N₂ 应为 "
                                 f"'O2 {{数字}}Torr N2 {{数字}}Torr'")
+                            all_ok = False
+                    elif gas_type == "CIA":
+                        if not self._RE_PRESSURE_CIA.match(pressure):
+                            logger.warning(
+                                f"  ⚠ 压力目录命名不规范: {tag}/")
+                            logger.warning(
+                                "    CIA 应为 '{气体} {数字}Torr' (如 Ar 500Torr)")
                             all_ok = False
 
                     # 检查数据文件命名
@@ -1384,6 +1424,106 @@ class CRDSPipeline:
 
         if n_processed == 0:
             logger.info("  未检测到符合条件的 O₂+N₂ 跃迁，跳过线性回归")
+
+    # ==============================================================
+    # Continuum absorption
+    # ==============================================================
+    def _run_continuum_analysis(self) -> None:
+        """Analyze continuum absorption from Step 1 ringdown spectra."""
+        from crds_process.continuum import ContinuumBatchProcessor
+
+        proc = ContinuumBatchProcessor(
+            input_root=self.ringdown_root,
+            input_csv_name="ringdown_results.csv",
+            output_root=self.continuum_root,
+            reference_csv=self.continuum_reference_csv,
+            tau0_us=self.continuum_tau0_us,
+            window=self.continuum_window,
+            tau_col=self.continuum_tau_col,
+        )
+        tasks = [
+            task for task in proc.discover()
+            if task[0] == "CIA"
+        ]
+        tasks = self._filter_tasks(tasks)
+        if not tasks:
+            logger.error(
+                f"  未在 {self.ringdown_root / 'CIA'} 下找到 continuum 输入数据"
+            )
+            return
+        proc.run(tasks)
+
+    def run_continuum(self) -> None:
+        """Run Step 1, then continuum absorption analysis.
+
+        This branch intentionally skips MATS line-by-line fitting.
+        """
+        log_path = setup_logging()
+        t0 = time.time()
+
+        logger.info("=" * 60)
+        logger.info("  CRDS continuum absorption pipeline")
+        logger.info("  Step 1: 衰荡时间处理")
+        logger.info("  Step 2: Continuum absorption analysis")
+        logger.info("  ── 跳过标准具去除")
+        logger.info("  ── 跳过 MATS 谱线拟合")
+        logger.info("=" * 60)
+        logger.info(f"  原始数据: {self.raw_root}")
+        logger.info(f"  Continuum 输出: {self.continuum_root}")
+        if self.targets:
+            logger.info(f"  指定目标: {', '.join(self.targets)}")
+        else:
+            logger.info("  指定目标: 全部")
+        logger.info(f"  日志文件: {log_path}")
+        logger.info("=" * 60)
+
+        self.validate_raw_data()
+        self.step1_ringdown()
+        self._run_continuum_analysis()
+
+        elapsed = time.time() - t0
+        logger.info(f"\n{'#' * 60}")
+        logger.info(f"  全部完成! 耗时 {elapsed:.1f} s")
+        logger.info(f"{'#' * 60}")
+
+    def run_continuum_from_ringdown(self) -> None:
+        """Run continuum absorption analysis from existing Step 1 output."""
+        log_path = setup_logging()
+        t0 = time.time()
+
+        logger.info("=" * 60)
+        logger.info("  CRDS continuum absorption pipeline (from ringdown)")
+        logger.info("  ── 跳过 Step 1: 衰荡时间处理")
+        logger.info("  Step 2: Continuum absorption analysis")
+        logger.info("  ── 跳过标准具去除")
+        logger.info("  ── 跳过 MATS 谱线拟合")
+        logger.info("=" * 60)
+        logger.info(f"  Ringdown 数据: {self.ringdown_root}")
+        logger.info(f"  Continuum 输出: {self.continuum_root}")
+        if self.targets:
+            logger.info(f"  指定目标: {', '.join(self.targets)}")
+        else:
+            logger.info("  指定目标: 全部")
+        logger.info(f"  日志文件: {log_path}")
+        logger.info("=" * 60)
+
+        if not self.ringdown_root.exists():
+            logger.error(f"  Step 1 结果目录不存在: {self.ringdown_root}")
+            logger.error("  请先运行完整流水线或先执行 Step 1")
+            return
+
+        self._run_continuum_analysis()
+
+        elapsed = time.time() - t0
+        logger.info(f"\n{'#' * 60}")
+        logger.info(f"  全部完成! 耗时 {elapsed:.1f} s")
+        logger.info(f"{'#' * 60}")
+
+    def run_continuum_from_etalon(self) -> None:
+        """Continuum analysis intentionally does not use etalon-corrected data."""
+        setup_logging()
+        logger.error("  Continuum absorption 只使用 Step 1 的 ringdown_results.csv")
+        logger.error("  请改用 run_continuum_from_ringdown() 或命令行 --continuum --from-ringdown")
 
     # ==============================================================
     # 完整五步流水线

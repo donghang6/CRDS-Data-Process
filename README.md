@@ -99,6 +99,14 @@ python main.py --remeasure-report O2/9403.163069 O2_N2/9403.163069
 python main.py --remeasure-report --remeasure-rel 0.05 --remeasure-sigma 3
 python main.py --remeasure-report --remeasure-rel-o2 0.05 --remeasure-rel-o2n2 0.10
 
+# 连续吸收 / continuum absorption（仅处理 CIA 数据；只做 Step 1，跳过标准具/MATS）
+python main.py --continuum CIA/273K
+python main.py --continuum 'CIA/273K/Ar 500Torr'
+python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr'
+python main.py --continuum 'CIA/273K/Ar 500Torr' --continuum-tau0-us 102.3
+python main.py --continuum 'CIA/273K/Ar 500Torr' \
+  --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
+
 # 跳过 Step 1，复用已生成 ringdown 结果，从 Step 2 开始
 python main.py --from-ringdown
 python main.py --from-ringdown O2/9386.2076
@@ -201,6 +209,32 @@ Step 5 线性回归，可使用 `--n2-only`。
 - `--remeasure-rel-o2`：纯 O2 的相对偏差阈值，默认 `0.05`（即 5%）
 - `--remeasure-rel-o2n2`：O2_N2 的相对偏差阈值，默认 `0.10`（即 10%）
 - `--remeasure-sigma`：偏差超过联合不确定度的阈值，默认 `3`
+
+### 连续吸收 / Continuum absorption
+
+若要处理宽而缓的连续吸收背景，可使用 `--continuum`。该模式只处理
+`data/raw/CIA/` 下的数据。原始衰荡数据与线吸收完全使用同一套 Step 1：
+从 `data/raw/CIA/{temperature}/{gas pressure}/*.txt` 读取，进行波数间隔检查
+和 sigma-clip，生成 `ringdown_results.csv`；之后不做标准具去除，直接跳过
+MATS 谱线拟合，输出：
+
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum.csv`
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum.png`
+- `output/results/continuum/continuum_summary.csv`
+- `output/results/continuum/continuum_pressure_fits.csv`
+
+转换关系为 `loss_ppm_per_cm = (1e12 / c) / tau_us`，默认使用
+`ringdown_results.csv` 中的 `tau_mean`。若提供空腔或参考
+τ (`--continuum-tau0-us` 或 `--continuum-ref`)，会额外输出
+`alpha_ppm_per_cm = loss_sample - loss_reference`；若不提供参考，只输出
+cavity loss proxy，`alpha_ppm_per_cm` 保持为空。
+
+可选参数：
+
+- `--continuum-ref PATH` / `--continuum-reference PATH`：参考 τ 光谱 CSV
+- `--continuum-tau0-us VALUE`：标量空腔 τ0，单位 μs
+- `--continuum-window START,END`：只统计指定波数窗口
+- `--continuum-tau-col NAME`：指定用于计算的 τ 列，默认优先使用 `tau_mean`
 
 ## 输出说明
 
