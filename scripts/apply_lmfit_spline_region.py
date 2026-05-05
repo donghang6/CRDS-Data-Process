@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Fit a global cubic B-spline to a processed CRDS CSV using lmfit.
+"""Apply lmfit cubic B-spline fitting to a processed CRDS CSV.
 
 使用说明
 --------
-这个脚本用于对已经处理好的 CSV 做全局三次样条拟合。它不是把每个数据点
-都当作样条节点，而是使用较少的 B-spline 节点，用 lmfit 最小化全局残差。
+这个脚本用于对已经处理好的 CSV 做全局或分区域三次样条拟合。它不是把每个数据点
+都当作样条节点，而是使用较少的 B-spline 节点，用 lmfit 最小化残差。
 这样可以让曲线整体更平滑，同时避免完全追随局部小折点和噪声。
 
 默认只 dry-run 预览，不会修改 CSV；确认无误后加 --apply 才会写回。
-默认不覆盖原列，而是写入新列：{column}_global_spline。
+默认不覆盖原列，而是写入新列：{column}_lmfit_spline。
 
 核心建议
 --------
@@ -19,16 +19,16 @@
       0.01、0.1、1 逐步试。
 
 常用命令:
-    # 预览：全局拟合 tau_fit_us，结果写入新列 tau_fit_us_global_spline
-    conda run -n CRDS-Data-Process python scripts/fit_global_cubic_spline_lmfit.py \
+    # 预览：全局拟合 tau_fit_us，结果写入新列 tau_fit_us_lmfit_spline
+    conda run -n CRDS-Data-Process python scripts/apply_lmfit_spline_region.py \
       output/results/continuum/CIA/273K/Ar\\ 500Torr/continuum_step2_fit.csv \
       --column tau_fit_us \
       --knots-every 40 \
       --smooth-lambda 0.1 \
-      --plot output/results/continuum/CIA/273K/Ar\\ 500Torr/global_spline_preview.png
+      --plot output/results/continuum/CIA/273K/Ar\\ 500Torr/lmfit_spline_preview.png
 
     # 执行：写入新列，不覆盖原 tau_fit_us
-    conda run -n CRDS-Data-Process python scripts/fit_global_cubic_spline_lmfit.py \
+    conda run -n CRDS-Data-Process python scripts/apply_lmfit_spline_region.py \
       output/results/continuum/CIA/273K/Ar\\ 500Torr/continuum_step2_fit.csv \
       --column tau_fit_us \
       --knots-every 40 \
@@ -36,7 +36,7 @@
       --apply
 
     # 执行：直接覆盖 tau_fit_us，并同步更新 loss_fit_ppm_per_cm 和残差列
-    conda run -n CRDS-Data-Process python scripts/fit_global_cubic_spline_lmfit.py \
+    conda run -n CRDS-Data-Process python scripts/apply_lmfit_spline_region.py \
       output/results/continuum/CIA/273K/Ar\\ 500Torr/continuum_step2_fit.csv \
       --column tau_fit_us \
       --knots-every 40 \
@@ -45,16 +45,29 @@
       --update-derived \
       --apply
 
+    # 多区域：每个区域使用不同的 knots_every，独立 lmfit 后拼接到新列
+    conda run -n CRDS-Data-Process python scripts/apply_lmfit_spline_region.py \
+      output/results/continuum/CIA/273K/Ar\\ 500Torr/continuum_step2_fit.csv \
+      --column tau_fit_us \
+      --anchor-width 5 \
+      --smooth-lambda 0.1 \
+      --region 9100 9200 12 \
+      --region 9200 9600 10 \
+      --region 9600 9900 15 \
+      --apply
+
 参数说明:
     csv_path              要处理的 CSV。
     --column NAME         要拟合的列，默认 tau_fit_us。
     --x-column NAME       波数列，默认 wavenumber。
     --knots-every W       内部节点间隔，单位 cm-1，默认 40。
     --n-knots N           内部节点数量；若提供，则覆盖 --knots-every。
+    --region A B K        多区域拟合。A/B 为只写回的目标范围，K 为该区域 knots_every。
+    --anchor-width W      多区域拟合时，每段左右额外用于拟合的缓冲宽度，默认 5 cm-1。
     --smooth-lambda L     平滑惩罚强度，默认 0。
     --fit-range A B       可选，只用指定波数范围参与全局拟合。
     --weights-column NAME 可选，权重列。若为 tau_stats_us，权重约为 1/sigma。
-    --output-column NAME  不覆盖时写入的新列名；默认 {column}_global_spline。
+    --output-column NAME  不覆盖时写入的新列名；默认 {column}_lmfit_spline。
     --overwrite           直接把拟合结果写回 --column。
     --update-derived      覆盖 tau_fit_us 或 loss_fit_ppm_per_cm 时同步更新成对列和残差列。
     --plot PATH           输出拟合对比图。
@@ -92,6 +105,11 @@ class FitResult:
     first_after: float
     success: bool
     message: str
+    start: float | None = None
+    end: float | None = None
+    knots_every: float | None = None
+    fit_start: float | None = None
+    fit_end: float | None = None
 
 
 def prepare_cache_env() -> None:
@@ -117,7 +135,7 @@ def load_dependencies(*, need_plot: bool = False):
             raise SystemExit(
                 "This script needs numpy, pandas, scipy, and lmfit. Run it in the "
                 "project environment, for example: conda run -n CRDS-Data-Process "
-                "python scripts/fit_global_cubic_spline_lmfit.py ..."
+                "python scripts/apply_lmfit_spline_region.py ..."
             ) from exc
         np = numpy_module
         pd = pandas_module
@@ -168,6 +186,23 @@ def parse_args() -> argparse.Namespace:
         help="Number of internal knots. Overrides --knots-every.",
     )
     parser.add_argument(
+        "--region",
+        action="append",
+        nargs=3,
+        metavar=("START", "END", "KNOTS_EVERY"),
+        type=float,
+        help=(
+            "Regional lmfit B-spline fit with per-region knot spacing. "
+            "Repeat this option for multiple regions."
+        ),
+    )
+    parser.add_argument(
+        "--anchor-width",
+        type=float,
+        default=5.0,
+        help="Extra fit width on each side of every --region, in cm-1. Default: 5.",
+    )
+    parser.add_argument(
         "--smooth-lambda",
         type=float,
         default=0.0,
@@ -186,7 +221,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-column",
-        help="New column for fitted values. Default: <column>_global_spline.",
+        help="New column for fitted values. Default: <column>_lmfit_spline.",
     )
     parser.add_argument(
         "--overwrite",
@@ -407,8 +442,88 @@ def fit_global_spline(
     )
 
 
-def update_derived_columns(df, edited_column: str) -> None:
-    mask = np.ones(len(df), dtype=bool)
+def fit_regional_splines(
+    df,
+    x_column: str,
+    y_column: str,
+    output_column: str,
+    regions: list[list[float]],
+    anchor_width: float,
+    smooth_lambda: float,
+    weights_column: str | None,
+) -> tuple[list[FitResult], np.ndarray]:
+    if anchor_width < 0:
+        raise SystemExit("--anchor-width must be >= 0")
+
+    source_df = df.copy(deep=True)
+    if output_column != y_column:
+        df[output_column] = source_df[y_column]
+
+    x = pd.to_numeric(source_df[x_column], errors="coerce").to_numpy(dtype=float)
+    finite_x = x[np.isfinite(x)]
+    if len(finite_x) == 0:
+        raise SystemExit(f"No finite values in x column: {x_column}")
+    data_min = float(np.nanmin(finite_x))
+    data_max = float(np.nanmax(finite_x))
+
+    updated_mask = np.zeros(len(df), dtype=bool)
+    results: list[FitResult] = []
+    for start_raw, end_raw, knots_every in regions:
+        start, end = normalize_range(start_raw, end_raw)
+        target_mask = np.isfinite(x) & (x >= start) & (x <= end)
+        if int(target_mask.sum()) == 0:
+            raise SystemExit(f"No rows found in region: {start:g} ~ {end:g} cm-1")
+
+        fit_start = max(data_min, start - anchor_width)
+        fit_end = min(data_max, end + anchor_width)
+        region_df = source_df.copy(deep=True)
+        region_output = f"{output_column}__region_tmp"
+        raw_result = fit_global_spline(
+            df=region_df,
+            x_column=x_column,
+            y_column=y_column,
+            output_column=region_output,
+            knots_every=float(knots_every),
+            n_knots=None,
+            smooth_lambda=smooth_lambda,
+            fit_range=(fit_start, fit_end),
+            weights_column=weights_column,
+        )
+        df.loc[target_mask, output_column] = region_df.loc[target_mask, region_output]
+        updated_mask |= target_mask
+
+        before = pd.to_numeric(
+            source_df.loc[target_mask, y_column],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        after = pd.to_numeric(
+            region_df.loc[target_mask, region_output],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        results.append(
+            FitResult(
+                output_column=output_column,
+                n_fit_points=raw_result.n_fit_points,
+                n_coefficients=raw_result.n_coefficients,
+                n_internal_knots=raw_result.n_internal_knots,
+                rmse=raw_result.rmse,
+                max_abs_residual=raw_result.max_abs_residual,
+                first_before=float(before[0]),
+                first_after=float(after[0]),
+                success=raw_result.success,
+                message=raw_result.message,
+                start=float(start),
+                end=float(end),
+                knots_every=float(knots_every),
+                fit_start=float(fit_start),
+                fit_end=float(fit_end),
+            )
+        )
+    return results, updated_mask
+
+
+def update_derived_columns(df, edited_column: str, target_mask=None) -> None:
+    mask = np.ones(len(df), dtype=bool) if target_mask is None else np.asarray(target_mask, dtype=bool).copy()
     if edited_column == "tau_fit_us":
         tau = pd.to_numeric(df["tau_fit_us"], errors="coerce").to_numpy(dtype=float)
         mask &= np.isfinite(tau) & (tau != 0)
@@ -475,11 +590,14 @@ def main() -> None:
         raise SystemExit(f"CSV does not exist: {csv_path}")
     if args.update_derived and not args.overwrite:
         raise SystemExit("--update-derived requires --overwrite")
+    if args.region and args.fit_range:
+        raise SystemExit("--region cannot be combined with --fit-range")
+    if args.region and args.n_knots is not None:
+        raise SystemExit("--region uses per-region KNOTS_EVERY; do not use --n-knots")
 
     output_column = (
         args.column
-        if args.overwrite
-        else args.output_column or f"{args.column}_global_spline"
+        if args.overwrite else args.output_column or f"{args.column}_lmfit_spline"
     )
     fit_range = normalize_range(args.fit_range[0], args.fit_range[1]) if args.fit_range else None
 
@@ -487,22 +605,37 @@ def main() -> None:
     ensure_columns(df, [args.x_column, args.column], csv_path)
     source_column_for_plot = args.column
     if args.overwrite and args.plot:
-        source_column_for_plot = f"{args.column}__before_global_spline"
+        source_column_for_plot = f"{args.column}__before_lmfit_spline"
         df[source_column_for_plot] = df[args.column]
 
-    result = fit_global_spline(
-        df=df,
-        x_column=args.x_column,
-        y_column=args.column,
-        output_column=output_column,
-        knots_every=args.knots_every,
-        n_knots=args.n_knots,
-        smooth_lambda=args.smooth_lambda,
-        fit_range=fit_range,
-        weights_column=args.weights_column,
-    )
+    updated_mask = None
+    if args.region:
+        results, updated_mask = fit_regional_splines(
+            df=df,
+            x_column=args.x_column,
+            y_column=args.column,
+            output_column=output_column,
+            regions=args.region,
+            anchor_width=args.anchor_width,
+            smooth_lambda=args.smooth_lambda,
+            weights_column=args.weights_column,
+        )
+    else:
+        results = [
+            fit_global_spline(
+                df=df,
+                x_column=args.x_column,
+                y_column=args.column,
+                output_column=output_column,
+                knots_every=args.knots_every,
+                n_knots=args.n_knots,
+                smooth_lambda=args.smooth_lambda,
+                fit_range=fit_range,
+                weights_column=args.weights_column,
+            )
+        ]
     if args.update_derived:
-        update_derived_columns(df, edited_column=args.column)
+        update_derived_columns(df, edited_column=args.column, target_mask=updated_mask)
     if args.plot:
         save_plot(
             df=df,
@@ -516,20 +649,30 @@ def main() -> None:
 
     print(f"CSV: {csv_path}")
     print(f"Column: {args.column}")
-    print(f"Output column: {result.output_column}")
-    if fit_range is None:
-        print("Fit range: all finite data")
-    else:
-        print(f"Fit range: {fit_range[0]:g} ~ {fit_range[1]:g} cm-1")
-    print(f"Internal knots: {result.n_internal_knots}")
-    print(f"Spline coefficients: {result.n_coefficients}")
-    print(f"Fit points: {result.n_fit_points}")
+    print(f"Output column: {output_column}")
     print(f"Smooth lambda: {args.smooth_lambda:g}")
-    print(f"RMSE: {result.rmse:.10g}")
-    print(f"Max abs residual: {result.max_abs_residual:.10g}")
-    print(f"First value: {result.first_before:.10g} -> {result.first_after:.10g}")
-    print(f"lmfit success: {result.success}")
-    print(f"lmfit message: {result.message}")
+    if args.region:
+        print(f"Anchor width: {args.anchor_width:g} cm-1")
+        print(f"Regions: {len(results)}")
+    else:
+        if fit_range is None:
+            print("Fit range: all finite data")
+        else:
+            print(f"Fit range: {fit_range[0]:g} ~ {fit_range[1]:g} cm-1")
+
+    for idx, result in enumerate(results, start=1):
+        if result.start is not None and result.end is not None:
+            print(f"\nRegion {idx}: {result.start:g} ~ {result.end:g} cm-1")
+            print(f"  Fit range: {result.fit_start:g} ~ {result.fit_end:g} cm-1")
+            print(f"  Knots every: {result.knots_every:g} cm-1")
+        print(f"  Internal knots: {result.n_internal_knots}")
+        print(f"  Spline coefficients: {result.n_coefficients}")
+        print(f"  Fit points: {result.n_fit_points}")
+        print(f"  RMSE: {result.rmse:.10g}")
+        print(f"  Max abs residual: {result.max_abs_residual:.10g}")
+        print(f"  First value: {result.first_before:.10g} -> {result.first_after:.10g}")
+        print(f"  lmfit success: {result.success}")
+        print(f"  lmfit message: {result.message}")
     if args.plot:
         print(f"Plot: {args.plot.expanduser().resolve()}")
 
