@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Adjust all ring-down times in a directory by a constant offset.
+"""Adjust ring-down times in a directory by a constant offset.
 
 使用说明
 --------
-这个脚本用于把指定目录下所有原始衰荡数据 txt 文件中的衰荡时间整体加上
-或减去同一个数。原始数据文件默认第 1 列为衰荡时间 tau，单位 us。
+这个脚本用于把指定目录下原始衰荡数据 txt 文件中的衰荡时间整体加上
+或减去同一个数。也可以用 --range 指定波数范围，只修改该范围内的文件。
+原始数据文件默认第 1 列为衰荡时间 tau，单位 us。
+
+波数范围按文件名判断：
+    - 新格式：9630.00400.txt，直接使用文件名作为波数。
+    - 旧格式：1 9630.00400 20260101183304.txt，使用中间的波数。
 
 默认只 dry-run 预览，不会改文件；确认无误后加 --apply 才会真正写回。
 
@@ -26,6 +31,19 @@
       --offset -0.02 \
       --apply
 
+    # 预览：只把 9280~9290 cm-1 范围内的 tau 增加 0.02 us
+    python scripts/adjust_ringdown_tau_offset.py \
+      '/path/to/Ar 500Torr' \
+      --range 9280 9290 \
+      --offset 0.02
+
+    # 执行：只把 9280~9290 cm-1 范围内的 tau 减少 0.02 us
+    python scripts/adjust_ringdown_tau_offset.py \
+      '/path/to/Ar 500Torr' \
+      --range 9280 9290 \
+      --offset -0.02 \
+      --apply
+
     # 递归处理子目录
     python scripts/adjust_ringdown_tau_offset.py \
       '/path/to/273K' \
@@ -35,6 +53,7 @@
 
 参数说明:
     directory       要处理的目录。
+    --range A B     只处理文件名波数在 A~B cm-1 内的 txt 文件；不加则处理所有 txt。
     --offset X      tau 整体加 X us；X 为负数时表示减少。
     --tau-column N  tau 所在列，默认 1，即第 1 列。
     --decimals N    写回 tau 时保留的小数位数，默认 5。
@@ -53,6 +72,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class FilePlan:
     path: Path
+    wavenumber: Decimal | None
     n_rows: int
     first_before: Decimal | None
     first_after: Decimal | None
@@ -65,6 +85,17 @@ def parse_args() -> argparse.Namespace:
         epilog=__doc__,
     )
     parser.add_argument("directory", type=Path, help="Directory containing txt files.")
+    parser.add_argument(
+        "--range",
+        "--wavenumber-range",
+        nargs=2,
+        metavar=("START", "END"),
+        type=parse_decimal,
+        help=(
+            "Only adjust txt files whose filename wavenumber is within this "
+            "inclusive range. Example: --range 9280 9290."
+        ),
+    )
     parser.add_argument(
         "--offset",
         required=True,
@@ -108,6 +139,51 @@ def iter_txt_files(directory: Path, recursive: bool) -> list[Path]:
     return sorted(p for p in directory.glob(pattern) if p.is_file())
 
 
+def parse_wavenumber(path: Path) -> Decimal | None:
+    """Read wavenumber from either '<wn>.txt' or '<idx> <wn> <time>.txt'."""
+    if path.suffix.lower() != ".txt":
+        return None
+
+    stem = path.stem.strip()
+    try:
+        return Decimal(stem)
+    except InvalidOperation:
+        pass
+
+    parts = stem.split()
+    if len(parts) >= 2:
+        try:
+            return Decimal(parts[1])
+        except InvalidOperation:
+            return None
+    return None
+
+
+def normalize_range(start: Decimal, end: Decimal) -> tuple[Decimal, Decimal]:
+    return (start, end) if start <= end else (end, start)
+
+
+def select_files_by_range(
+    files: list[Path],
+    wave_range: tuple[Decimal, Decimal] | None,
+) -> tuple[list[tuple[Path, Decimal | None]], int]:
+    selected: list[tuple[Path, Decimal | None]] = []
+    skipped_no_wavenumber = 0
+
+    for path in files:
+        wavenumber = parse_wavenumber(path)
+        if wave_range is None:
+            selected.append((path, wavenumber))
+            continue
+        if wavenumber is None:
+            skipped_no_wavenumber += 1
+            continue
+        if wave_range[0] <= wavenumber <= wave_range[1]:
+            selected.append((path, wavenumber))
+
+    return selected, skipped_no_wavenumber
+
+
 def format_decimal(value: Decimal, decimals: int) -> str:
     quant = Decimal("1").scaleb(-decimals)
     rounded = value.quantize(quant, rounding=ROUND_HALF_UP)
@@ -116,6 +192,7 @@ def format_decimal(value: Decimal, decimals: int) -> str:
 
 def adjust_file_content(
     path: Path,
+    wavenumber: Decimal | None,
     offset: Decimal,
     tau_column: int,
     decimals: int,
@@ -158,6 +235,7 @@ def adjust_file_content(
 
     return content, FilePlan(
         path=path,
+        wavenumber=wavenumber,
         n_rows=n_rows,
         first_before=first_before,
         first_after=first_after,
@@ -177,13 +255,26 @@ def main() -> None:
     files = iter_txt_files(directory, recursive=args.recursive)
     if not files:
         raise SystemExit(f"No .txt files found in: {directory}")
+    wave_range = normalize_range(args.range[0], args.range[1]) if args.range else None
+    selected_files, skipped_no_wavenumber = select_files_by_range(
+        files=files,
+        wave_range=wave_range,
+    )
+    if not selected_files:
+        if wave_range is None:
+            raise SystemExit(f"No .txt files found in: {directory}")
+        raise SystemExit(
+            "No .txt files found in requested wavenumber range: "
+            f"{wave_range[0]} ~ {wave_range[1]} cm-1"
+        )
 
     plans: list[FilePlan] = []
     adjusted_contents: list[tuple[Path, str]] = []
-    for path in files:
+    for path, wavenumber in selected_files:
         try:
             content, plan = adjust_file_content(
                 path=path,
+                wavenumber=wavenumber,
                 offset=args.offset,
                 tau_column=args.tau_column,
                 decimals=args.decimals,
@@ -195,6 +286,12 @@ def main() -> None:
 
     print(f"Directory: {directory}")
     print(f"Files scanned: {len(files)}")
+    if wave_range is None:
+        print("Wavenumber range: all files")
+    else:
+        print(f"Wavenumber range: {wave_range[0]} ~ {wave_range[1]} cm-1")
+        print(f"Files skipped without parseable wavenumber: {skipped_no_wavenumber}")
+    print(f"Files selected: {len(selected_files)}")
     print(f"Tau column: {args.tau_column}")
     print(f"Offset: {args.offset} us")
     print(f"Decimals: {args.decimals}")
@@ -206,7 +303,11 @@ def main() -> None:
             preview = "empty/no data rows"
         else:
             preview = f"{plan.first_before} -> {plan.first_after}"
-        print(f"{plan.path.name}: rows={plan.n_rows}, first tau {preview}")
+        wave_text = "unknown" if plan.wavenumber is None else f"{plan.wavenumber} cm-1"
+        print(
+            f"{plan.path.name}: wavenumber={wave_text}, "
+            f"rows={plan.n_rows}, first tau {preview}"
+        )
     if len(plans) > 10:
         print(f"... {len(plans) - 10} more files")
 
