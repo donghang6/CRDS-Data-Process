@@ -99,7 +99,7 @@ python main.py --remeasure-report O2/9403.163069 O2_N2/9403.163069
 python main.py --remeasure-report --remeasure-rel 0.05 --remeasure-sigma 3
 python main.py --remeasure-report --remeasure-rel-o2 0.05 --remeasure-rel-o2n2 0.10
 
-# 连续吸收 / continuum absorption（仅处理 CIA 数据；只做 Step 1，跳过标准具/MATS）
+# 连续吸收 / continuum absorption（仅处理 CIA 数据；Step 1 后做 loss 域 Step 2 拟合）
 python main.py --continuum CIA/273K
 python main.py --continuum 'CIA/273K/Ar 500Torr'
 python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr'
@@ -108,6 +108,13 @@ python main.py --continuum 'CIA/273K/Ar 500Torr' \
   --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
 python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
   --cia-fit-window 20 --cia-fit-step 5 --cia-fit-order 2
+python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
+  --cia-fit-window 30 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 12
+
+# 本机 conda 环境中的完整运行命令示例
+conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
+  --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
+  --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
 
 # 仅对一个指定目录运行 Step 1
 # 支持文件名只保留波数，例如 9630.00400.txt
@@ -223,26 +230,72 @@ Step 5 线性回归，可使用 `--n2-only`。
 若要处理宽而缓的连续吸收背景，可使用 `--continuum`。该模式只处理
 `data/raw/CIA/` 下的数据。原始衰荡数据与线吸收完全使用同一套 Step 1：
 从 `data/raw/CIA/{temperature}/{gas pressure}/*.txt` 读取，进行波数间隔检查
-和 sigma-clip，生成 `ringdown_results.csv`；之后不做标准具去除，直接跳过
-MATS 谱线拟合，输出：
+和 sigma-clip，生成 `ringdown_results.csv`。
 
-- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum.csv`
-- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum.png`
-- `output/results/continuum/continuum_summary.csv`
-- `output/results/continuum/continuum_pressure_fits.csv`
+CIA 流程的 Step 2 不做标准具去除，也不做 MATS 谱线拟合，而是从
+`ringdown_results.csv` 出发，在 loss 域进行滑动窗口拟合。转换关系为：
 
-转换关系为 `loss_ppm_per_cm = (1e12 / c) / tau_us`，默认使用
-`ringdown_results.csv` 中的 `tau_mean`。若提供空腔或参考
-τ (`--continuum-tau0-us` 或 `--continuum-ref`)，会额外输出
-`alpha_ppm_per_cm = loss_sample - loss_reference`；若不提供参考，只输出
-cavity loss proxy，`alpha_ppm_per_cm` 保持为空。
+```text
+loss_ppm_per_cm = (1e12 / c) / tau_us
+```
 
-可选参数：
+默认使用 `ringdown_results.csv` 中的 `tau_mean`。输出图中上面板为
+处理后的衰荡时间和 Step 2 反算出的 tau 拟合线，下面板为 loss 和 Step 2
+loss 拟合线。
 
-- `--continuum-ref PATH` / `--continuum-reference PATH`：参考 τ 光谱 CSV
-- `--continuum-tau0-us VALUE`：标量空腔 τ0，单位 μs
-- `--continuum-window START,END`：只统计指定波数窗口
-- `--continuum-tau-col NAME`：指定用于计算的 τ 列，默认优先使用 `tau_mean`
+常用命令：
+
+```bash
+# 已有 Step 1 结果时，只重新运行 CIA Step 2
+conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
+  --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
+  --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
+```
+
+这条命令中每一项的含义：
+
+| 参数 | 含义 |
+|------|------|
+| `conda run -n CRDS-Data-Process` | 使用 `CRDS-Data-Process` conda 环境运行。 |
+| `env PYTHONPATH=src` | 让 Python 从本仓库的 `src/` 目录导入当前代码；若已 `pip install -e .`，可省略。 |
+| `python main.py` | 运行项目主入口。 |
+| `--continuum` | 进入 CIA 连续吸收流程；只允许处理 `CIA/...` 目标。 |
+| `--from-ringdown` | 跳过原始 txt 的 Step 1，直接使用已有 `output/results/ringdown/.../ringdown_results.csv`。 |
+| `'CIA/273K/Ar 500Torr'` | 处理目标，格式为 `CIA/{温度}/{气体 压力}`。 |
+| `--cia-fit-window 40` | Step 2 在 loss 域滑动拟合的窗口宽度，单位 `cm-1`。数值越大越平滑；默认 `20`。 |
+| `--cia-fit-step 5` | 相邻窗口中心间隔，单位 `cm-1`。数值越小重叠越多、拼接更平顺；默认 `5`。 |
+| `--cia-fit-order 2` | 每个窗口内的多项式阶数。推荐 `2`；局部曲率复杂可试 `3`；默认 `2`。 |
+| `--cia-fit-smooth 20` | 对 Step 2 拟合线再做一次平滑的宽度，单位 `cm-1`。默认 `0` 表示不额外平滑。 |
+
+CIA 连续吸收相关参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--continuum` | 关闭 | 开启 CIA 连续吸收流程。 |
+| `--from-ringdown` | 关闭 | 跳过 Step 1，从已有 `ringdown_results.csv` 开始。 |
+| `--continuum-ref PATH` / `--continuum-reference PATH` | 无 | 参考 τ 光谱 CSV；提供后计算 `alpha_ppm_per_cm = loss_sample - loss_reference`。 |
+| `--continuum-tau0-us VALUE` | 无 | 标量空腔 τ0，单位 `us`；与 `--continuum-ref` 互斥。 |
+| `--continuum-window START,END` | 全波段 | 只处理指定波数窗口；也支持 `START:END`。 |
+| `--continuum-tau-col NAME` | `tau_mean` | 指定用于计算 loss 的 τ 列。 |
+| `--cia-fit-window VALUE` / `--continuum-fit-window VALUE` | `20` | Step 2 滑动拟合窗口宽度，单位 `cm-1`。 |
+| `--cia-fit-step VALUE` / `--continuum-fit-step VALUE` | `5` | Step 2 滑动窗口步长，单位 `cm-1`。 |
+| `--cia-fit-order VALUE` / `--continuum-fit-order VALUE` | `2` | 每个窗口内的多项式阶数。 |
+| `--cia-fit-sigma VALUE` / `--continuum-fit-sigma VALUE` | `4` | 每个窗口内 robust 拟合的离群点阈值。 |
+| `--cia-fit-smooth VALUE` / `--continuum-fit-smooth VALUE` | `0` | 对 Step 2 拟合线额外平滑的宽度，单位 `cm-1`。 |
+
+推荐调参：
+
+- 想让拟合线更平滑：增大 `--cia-fit-window` 或 `--cia-fit-smooth`。
+- 想让拟合线更贴近局部结构：减小 `--cia-fit-window` 或 `--cia-fit-smooth`。
+- 当前 Ar 500Torr 数据比较推荐：`--cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20`。
+
+主要输出：
+
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum supplement.csv`：Step 1 tau 转换出的原始 loss 表。
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_fit.csv`：Step 2 拟合结果，含 `loss_fit_ppm_per_cm`、`tau_fit_us` 和残差列。
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum.png`：上 tau、下 loss 的拟合图。
+- `output/results/continuum/continuum_summary.csv`：汇总表，包含 Step 2 拟合参数和残差统计。
+- `output/results/continuum/continuum_pressure_fits.csv`：多压力数据存在时的压力依赖拟合结果。
 
 ## 输出说明
 

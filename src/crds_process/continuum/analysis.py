@@ -108,6 +108,7 @@ class ContinuumBatchProcessor:
         fit_step_cm1: float = 5.0,
         fit_order: int = 2,
         fit_sigma: float = 4.0,
+        fit_smooth_cm1: float = 0.0,
     ):
         if reference_csv and tau0_us is not None:
             raise ValueError("reference_csv and tau0_us are mutually exclusive")
@@ -126,6 +127,7 @@ class ContinuumBatchProcessor:
         self.fit_step_cm1 = float(fit_step_cm1)
         self.fit_order = int(fit_order)
         self.fit_sigma = float(fit_sigma)
+        self.fit_smooth_cm1 = float(fit_smooth_cm1)
         self._reference = self._load_reference()
 
     def discover(self) -> list[tuple[str, str, str, Path]]:
@@ -157,6 +159,7 @@ class ContinuumBatchProcessor:
             f"window={self.fit_window_cm1:g} cm-1, "
             f"step={self.fit_step_cm1:g} cm-1, "
             f"order={self.fit_order}, sigma={self.fit_sigma:g}"
+            f", smooth={self.fit_smooth_cm1:g} cm-1"
         )
 
         for gas_type, transition, pressure, csv_path in tasks:
@@ -254,6 +257,7 @@ class ContinuumBatchProcessor:
             step_cm1=self.fit_step_cm1,
             order=self.fit_order,
             sigma=self.fit_sigma,
+            smooth_cm1=self.fit_smooth_cm1,
         )
         fit_csv = output_dir / "continuum_step2_fit.csv"
         work.to_csv(fit_csv, index=False)
@@ -361,6 +365,7 @@ class ContinuumBatchProcessor:
             "fit_step_cm1": self.fit_step_cm1,
             "fit_order": self.fit_order,
             "fit_sigma": self.fit_sigma,
+            "fit_smooth_cm1": self.fit_smooth_cm1,
             "loss_fit_resid_std_ppm_per_cm": _nanstd(
                 work["loss_residual_ppm_per_cm"]
             ) if "loss_residual_ppm_per_cm" in work.columns else np.nan,
@@ -464,6 +469,7 @@ def _add_sliding_loss_fit(
     step_cm1: float,
     order: int,
     sigma: float,
+    smooth_cm1: float,
 ) -> pd.DataFrame:
     """Fit the continuum trend in loss domain using overlapping windows."""
     if window_cm1 <= 0:
@@ -523,12 +529,61 @@ def _add_sliding_loss_fit(
             wn[good],
             fitted[good],
         )
+    if smooth_cm1 > 0:
+        fitted = _smooth_fit_by_width(
+            x=wn,
+            y=fitted,
+            smooth_cm1=smooth_cm1,
+            order=min(max(order, 1), 3),
+        )
 
     tau_fit = TAU_US_TO_PPM_PER_CM / fitted
     out["loss_fit_ppm_per_cm"] = fitted
     out["loss_residual_ppm_per_cm"] = out["loss_ppm_per_cm"] - fitted
     out["tau_fit_us"] = tau_fit
     out["tau_residual_us"] = out["tau_us"] - tau_fit
+    return out
+
+
+def _smooth_fit_by_width(
+    x: np.ndarray,
+    y: np.ndarray,
+    smooth_cm1: float,
+    order: int,
+) -> np.ndarray:
+    mask = np.isfinite(x) & np.isfinite(y)
+    if smooth_cm1 <= 0 or int(mask.sum()) < 5:
+        return y
+
+    spacing = np.diff(np.sort(x[mask]))
+    spacing = spacing[np.isfinite(spacing) & (spacing > 0)]
+    if len(spacing) == 0:
+        return y
+
+    median_spacing = float(np.median(spacing))
+    window_points = max(int(round(smooth_cm1 / median_spacing)), 5)
+    if window_points % 2 == 0:
+        window_points += 1
+    if window_points >= int(mask.sum()):
+        window_points = int(mask.sum()) - 1
+        if window_points % 2 == 0:
+            window_points -= 1
+    if window_points <= order + 2:
+        window_points = order + 3
+        if window_points % 2 == 0:
+            window_points += 1
+    if window_points >= int(mask.sum()) or window_points < 5:
+        return y
+
+    from scipy.signal import savgol_filter
+
+    out = y.copy()
+    out[mask] = savgol_filter(
+        y[mask],
+        window_length=window_points,
+        polyorder=min(order, window_points - 2),
+        mode="interp",
+    )
     return out
 
 

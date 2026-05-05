@@ -429,6 +429,7 @@ class CRDSPipeline:
         continuum_fit_step_cm1: float = 5.0,
         continuum_fit_order: int = 2,
         continuum_fit_sigma: float = 4.0,
+        continuum_fit_smooth_cm1: float = 0.0,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -502,6 +503,7 @@ class CRDSPipeline:
         self.continuum_fit_step_cm1 = float(continuum_fit_step_cm1)
         self.continuum_fit_order = int(continuum_fit_order)
         self.continuum_fit_sigma = float(continuum_fit_sigma)
+        self.continuum_fit_smooth_cm1 = float(continuum_fit_smooth_cm1)
 
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
@@ -1491,6 +1493,7 @@ class CRDSPipeline:
             fit_step_cm1=self.continuum_fit_step_cm1,
             fit_order=self.continuum_fit_order,
             fit_sigma=self.continuum_fit_sigma,
+            fit_smooth_cm1=self.continuum_fit_smooth_cm1,
         )
         tasks = [
             task for task in proc.discover()

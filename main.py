@@ -33,7 +33,7 @@
     python main.py --type-a-mc O2/9398.306147
     python main.py --type-a-mc O2/9398.306147 --mc-samples 100 --mc-wave-error-mhz 4
 
-    # 连续吸收 / continuum absorption (仅处理 CIA 数据；只做 Step 1，跳过标准具/MATS)
+    # 连续吸收 / continuum absorption (仅处理 CIA 数据；Step 1 后做 loss 域 Step 2 拟合)
     python main.py --continuum CIA/273K
     python main.py --continuum "CIA/273K/Ar 500Torr"
     python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr"
@@ -42,6 +42,38 @@
         --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
     python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
         --cia-fit-window 20 --cia-fit-step 5 --cia-fit-order 2
+    python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
+        --cia-fit-window 30 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 12
+    python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
+        --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
+
+    # CIA 连续吸收 Step 2 参数说明:
+    #   --continuum
+    #       进入 CIA 连续吸收流程。只允许处理 CIA/... 目标。
+    #   --from-ringdown
+    #       跳过原始 txt 的 Step 1，直接使用已有 ringdown_results.csv。
+    #   CIA/273K/Ar 500Torr
+    #       处理目标，格式为 CIA/{温度}/{气体 压力}。
+    #   --cia-fit-window VALUE
+    #       Step 2 在 loss 域进行滑动窗口拟合的窗口宽度，单位 cm-1。
+    #       默认 20；数值越大，拟合线越平滑。
+    #   --cia-fit-step VALUE
+    #       相邻滑动窗口中心间隔，单位 cm-1。默认 5。
+    #       数值越小，窗口重叠越多，拼接更平顺但计算略慢。
+    #   --cia-fit-order VALUE
+    #       每个窗口内多项式阶数。默认 2。
+    #       推荐 2；若局部曲率复杂可试 3，不建议过高。
+    #   --cia-fit-sigma VALUE
+    #       每个窗口内 robust 拟合的离群点阈值，单位为 robust sigma。默认 4。
+    #   --cia-fit-smooth VALUE
+    #       对 Step 2 拟合线再平滑的宽度，单位 cm-1。默认 0 表示不额外平滑。
+    #       推荐 10~20；数值越大越平滑，但可能压掉真实缓慢结构。
+    #   --continuum-window START,END
+    #       可选，只处理指定波数范围。
+    #   --continuum-tau-col NAME
+    #       可选，指定 ringdown_results.csv 中用于计算 loss 的 tau 列，默认 tau_mean。
+    #   --continuum-ref PATH / --continuum-tau0-us VALUE
+    #       可选，提供参考 tau 后可额外计算 alpha；不提供时只输出 tau 和 loss。
 
     # 仅对一个指定目录运行 Step 1（支持文件名只有波数，如 9630.00400.txt）
     python main.py --step1-dir '/path/to/Ar 500Torr'
@@ -121,6 +153,7 @@ def _parse_args(argv: list[str]) -> dict:
     continuum_fit_step_cm1 = 5.0
     continuum_fit_order = 2
     continuum_fit_sigma = 4.0
+    continuum_fit_smooth_cm1 = 0.0
     step1_dir = None
     step1_output = None
 
@@ -211,6 +244,16 @@ def _parse_args(argv: list[str]) -> dict:
                     continuum_fit_sigma = float(argv[i])
                 except ValueError:
                     print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 4")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--cia-fit-smooth", "--continuum-fit-smooth"):
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_fit_smooth_cm1 = float(argv[i])
+                except ValueError:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 0")
             else:
                 print(f"警告: {arg} 缺少参数，已忽略")
             i += 1
@@ -354,6 +397,7 @@ def _parse_args(argv: list[str]) -> dict:
         "continuum_fit_step_cm1": continuum_fit_step_cm1,
         "continuum_fit_order": continuum_fit_order,
         "continuum_fit_sigma": continuum_fit_sigma,
+        "continuum_fit_smooth_cm1": continuum_fit_smooth_cm1,
         "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,
