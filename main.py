@@ -40,14 +40,17 @@
     python main.py --continuum "CIA/273K/Ar 500Torr" --continuum-tau0-us 102.3
     python main.py --continuum "CIA/273K/Ar 500Torr" \
         --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
+    # Ar 500Torr 示例：基础 CIA Step 2 拟合参数
     python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
         --cia-fit-window 20 --cia-fit-step 5 --cia-fit-order 2
+    # Ar 500Torr 示例：更平滑的 CIA Step 2 拟合参数
     python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
         --cia-fit-window 30 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 12
+    # Ar 500Torr 当前推荐参数；O2 数据不要直接套用，应单独调参
     python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
         --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
 
-    # CIA 连续吸收 Step 2 参数说明:
+    # CIA 连续吸收 Step 2 参数说明（不同气体/压力需要分别调参）:
     #   --continuum
     #       进入 CIA 连续吸收流程。只允许处理 CIA/... 目标。
     #   --from-ringdown
@@ -67,7 +70,8 @@
     #       每个窗口内 robust 拟合的离群点阈值，单位为 robust sigma。默认 4。
     #   --cia-fit-smooth VALUE
     #       对 Step 2 拟合线再平滑的宽度，单位 cm-1。默认 0 表示不额外平滑。
-    #       推荐 10~20；数值越大越平滑，但可能压掉真实缓慢结构。
+    #       Ar 500Torr 可试 10~20；O2 数据需根据其自身结构重新选择。
+    #       数值越大越平滑，但可能压掉真实缓慢结构。
     #   --continuum-window START,END
     #       可选，只处理指定波数范围。
     #   --continuum-tau-col NAME

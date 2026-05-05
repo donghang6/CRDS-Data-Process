@@ -106,12 +106,14 @@ python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr'
 python main.py --continuum 'CIA/273K/Ar 500Torr' --continuum-tau0-us 102.3
 python main.py --continuum 'CIA/273K/Ar 500Torr' \
   --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
+# Ar 500Torr 示例：基础 CIA Step 2 拟合参数
 python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
   --cia-fit-window 20 --cia-fit-step 5 --cia-fit-order 2
+# Ar 500Torr 示例：更平滑的 CIA Step 2 拟合参数
 python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
   --cia-fit-window 30 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 12
 
-# 本机 conda 环境中的完整运行命令示例
+# 本机 conda 环境中的完整运行命令示例；这是 Ar 500Torr 当前推荐参数
 conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
   --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
   --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
@@ -243,10 +245,16 @@ loss_ppm_per_cm = (1e12 / c) / tau_us
 处理后的衰荡时间和 Step 2 反算出的 tau 拟合线，下面板为 loss 和 Step 2
 loss 拟合线。
 
+注意：Step 2 拟合参数需要按数据类型单独设置。下面给出的
+`--cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20`
+是当前 `Ar 500Torr` 数据的推荐参数，不代表 O2 数据也应使用同一组参数。
+O2 数据应根据自身谱形、吸收结构和噪声水平另行选择参数。
+
 常用命令：
 
 ```bash
 # 已有 Step 1 结果时，只重新运行 CIA Step 2
+# 下面这组参数只作为 Ar 500Torr 示例
 conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
   --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
   --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
@@ -262,10 +270,10 @@ conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
 | `--continuum` | 进入 CIA 连续吸收流程；只允许处理 `CIA/...` 目标。 |
 | `--from-ringdown` | 跳过原始 txt 的 Step 1，直接使用已有 `output/results/ringdown/.../ringdown_results.csv`。 |
 | `'CIA/273K/Ar 500Torr'` | 处理目标，格式为 `CIA/{温度}/{气体 压力}`。 |
-| `--cia-fit-window 40` | Step 2 在 loss 域滑动拟合的窗口宽度，单位 `cm-1`。数值越大越平滑；默认 `20`。 |
+| `--cia-fit-window 40` | Step 2 在 loss 域滑动拟合的窗口宽度，单位 `cm-1`。数值越大越平滑；默认 `20`。这里的 `40` 是 Ar 示例值。 |
 | `--cia-fit-step 5` | 相邻窗口中心间隔，单位 `cm-1`。数值越小重叠越多、拼接更平顺；默认 `5`。 |
 | `--cia-fit-order 2` | 每个窗口内的多项式阶数。推荐 `2`；局部曲率复杂可试 `3`；默认 `2`。 |
-| `--cia-fit-smooth 20` | 对 Step 2 拟合线再做一次平滑的宽度，单位 `cm-1`。默认 `0` 表示不额外平滑。 |
+| `--cia-fit-smooth 20` | 对 Step 2 拟合线再做一次平滑的宽度，单位 `cm-1`。默认 `0` 表示不额外平滑。这里的 `20` 是 Ar 示例值。 |
 
 CIA 连续吸收相关参数：
 
@@ -288,6 +296,7 @@ CIA 连续吸收相关参数：
 - 想让拟合线更平滑：增大 `--cia-fit-window` 或 `--cia-fit-smooth`。
 - 想让拟合线更贴近局部结构：减小 `--cia-fit-window` 或 `--cia-fit-smooth`。
 - 当前 Ar 500Torr 数据比较推荐：`--cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20`。
+- O2 数据不要直接套用 Ar 参数；应根据 O2 的实际谱形和需要保留的结构单独调 `window`、`order` 和 `smooth`。
 
 主要输出：
 
