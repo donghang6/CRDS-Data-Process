@@ -235,7 +235,9 @@ Step 5 线性回归，可使用 `--n2-only`。
 和 sigma-clip，生成 `ringdown_results.csv`。
 
 CIA 流程的 Step 2 不做标准具去除，也不做 MATS 谱线拟合，而是从
-`ringdown_results.csv` 出发，在 loss 域进行滑动窗口拟合。转换关系为：
+`ringdown_results.csv` 出发，在 loss 域进行滑动窗口拟合。每个窗口只生成
+一个局部拟合锚点，最后用 PCHIP 连续插值贯穿全波段，避免分段连接处的小跳跃。
+转换关系为：
 
 ```text
 loss_ppm_per_cm = (1e12 / c) / tau_us
@@ -271,9 +273,9 @@ conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
 | `--from-ringdown` | 跳过原始 txt 的 Step 1，直接使用已有 `output/results/ringdown/.../ringdown_results.csv`。 |
 | `'CIA/273K/Ar 500Torr'` | 处理目标，格式为 `CIA/{温度}/{气体 压力}`。 |
 | `--cia-fit-window 40` | Step 2 在 loss 域滑动拟合的窗口宽度，单位 `cm-1`。数值越大越平滑；默认 `20`。这里的 `40` 是 Ar 示例值。 |
-| `--cia-fit-step 5` | 相邻窗口中心间隔，单位 `cm-1`。数值越小重叠越多、拼接更平顺；默认 `5`。 |
+| `--cia-fit-step 5` | 连续拟合锚点间隔，单位 `cm-1`。数值越小锚点越密、越贴近局部结构；默认 `5`。 |
 | `--cia-fit-order 2` | 每个窗口内的多项式阶数。推荐 `2`；局部曲率复杂可试 `3`；默认 `2`。 |
-| `--cia-fit-smooth 20` | 对 Step 2 拟合线再做一次平滑的宽度，单位 `cm-1`。默认 `0` 表示不额外平滑。这里的 `20` 是 Ar 示例值。 |
+| `--cia-fit-smooth 20` | 对 Step 2 拟合线再做一次局部平滑的宽度，单位 `cm-1`。默认 `0` 表示不额外平滑。这里的 `20` 是 Ar 示例值。 |
 
 CIA 连续吸收相关参数：
 
@@ -286,7 +288,7 @@ CIA 连续吸收相关参数：
 | `--continuum-window START,END` | 全波段 | 只处理指定波数窗口；也支持 `START:END`。 |
 | `--continuum-tau-col NAME` | `tau_mean` | 指定用于计算 loss 的 τ 列。 |
 | `--cia-fit-window VALUE` / `--continuum-fit-window VALUE` | `20` | Step 2 滑动拟合窗口宽度，单位 `cm-1`。 |
-| `--cia-fit-step VALUE` / `--continuum-fit-step VALUE` | `5` | Step 2 滑动窗口步长，单位 `cm-1`。 |
+| `--cia-fit-step VALUE` / `--continuum-fit-step VALUE` | `5` | Step 2 连续拟合锚点间隔，单位 `cm-1`。 |
 | `--cia-fit-order VALUE` / `--continuum-fit-order VALUE` | `2` | 每个窗口内的多项式阶数。 |
 | `--cia-fit-sigma VALUE` / `--continuum-fit-sigma VALUE` | `4` | 每个窗口内 robust 拟合的离群点阈值。 |
 | `--cia-fit-smooth VALUE` / `--continuum-fit-smooth VALUE` | `0` | 对 Step 2 拟合线额外平滑的宽度，单位 `cm-1`。 |

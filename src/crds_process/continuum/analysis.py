@@ -486,49 +486,21 @@ def _add_sliding_loss_fit(
     if int(mask.sum()) < max(order + 1, 2):
         raise ValueError("not enough finite points for CIA Step 2 fit")
 
-    fit_sum = np.zeros_like(loss, dtype=float)
-    weight_sum = np.zeros_like(loss, dtype=float)
     x_min = float(np.nanmin(wn[mask]))
     x_max = float(np.nanmax(wn[mask]))
     half_window = window_cm1 / 2.0
 
-    centers = list(np.arange(x_min, x_max + step_cm1, step_cm1, dtype=float))
-    edge_centers = [x_min + half_window, x_max - half_window]
-    for center in edge_centers:
-        if np.isfinite(center):
-            centers.append(float(center))
-    centers = sorted({round(c, 10) for c in centers if x_min <= c <= x_max})
-
-    min_points = max(order + 2, 8)
-    for center in centers:
-        local = mask & (np.abs(wn - center) <= half_window)
-        if int(local.sum()) < min_points:
-            continue
-
-        x_local = wn[local]
-        y_local = loss[local]
-        y_fit = _robust_polyfit_eval(
-            x_fit=x_local,
-            y_fit=y_local,
-            x_eval=x_local,
-            order=min(order, int(local.sum()) - 1),
-            sigma=sigma,
-        )
-        weights = _window_weights(x_local, center=center, half_width=half_window)
-        fit_sum[local] += y_fit * weights
-        weight_sum[local] += weights
-
-    fitted = np.full_like(loss, np.nan, dtype=float)
-    covered = weight_sum > 0
-    fitted[covered] = fit_sum[covered] / weight_sum[covered]
-
-    if np.isfinite(fitted).sum() >= 2 and np.any(~np.isfinite(fitted) & mask):
-        good = np.isfinite(fitted) & mask
-        fitted[~np.isfinite(fitted) & mask] = np.interp(
-            wn[~np.isfinite(fitted) & mask],
-            wn[good],
-            fitted[good],
-        )
+    fitted = _continuous_anchor_loss_fit(
+        x=wn,
+        y=loss,
+        mask=mask,
+        x_min=x_min,
+        x_max=x_max,
+        half_window=half_window,
+        step_cm1=step_cm1,
+        order=order,
+        sigma=sigma,
+    )
     if smooth_cm1 > 0:
         fitted = _smooth_fit_by_width(
             x=wn,
@@ -543,6 +515,85 @@ def _add_sliding_loss_fit(
     out["tau_fit_us"] = tau_fit
     out["tau_residual_us"] = out["tau_us"] - tau_fit
     return out
+
+
+def _continuous_anchor_loss_fit(
+    x: np.ndarray,
+    y: np.ndarray,
+    mask: np.ndarray,
+    x_min: float,
+    x_max: float,
+    half_window: float,
+    step_cm1: float,
+    order: int,
+    sigma: float,
+) -> np.ndarray:
+    centers = _fit_centers(x_min=x_min, x_max=x_max, step_cm1=step_cm1)
+    min_points = max(order + 2, 8)
+    anchor_x: list[float] = []
+    anchor_y: list[float] = []
+
+    for center in centers:
+        local = mask & (np.abs(x - center) <= half_window)
+        if int(local.sum()) < min_points:
+            continue
+        fit_order = min(order, int(local.sum()) - 1)
+        y_center = _robust_polyfit_eval(
+            x_fit=x[local],
+            y_fit=y[local],
+            x_eval=np.array([center], dtype=float),
+            order=fit_order,
+            sigma=sigma,
+        )[0]
+        if np.isfinite(y_center):
+            anchor_x.append(center)
+            anchor_y.append(float(y_center))
+
+    if len(anchor_x) < 2:
+        return _robust_polyfit_eval(
+            x_fit=x[mask],
+            y_fit=y[mask],
+            x_eval=x,
+            order=min(order, int(mask.sum()) - 1),
+            sigma=sigma,
+        )
+
+    anchors = (
+        pd.DataFrame({"x": anchor_x, "y": anchor_y})
+        .groupby("x", as_index=False)["y"].mean()
+        .sort_values("x")
+    )
+    x_anchor = anchors["x"].to_numpy(dtype=float)
+    y_anchor = anchors["y"].to_numpy(dtype=float)
+
+    if x_anchor[0] > x_min:
+        x_anchor = np.insert(x_anchor, 0, x_min)
+        y_anchor = np.insert(y_anchor, 0, _nearest_finite_y(x, y, x_min, mask))
+    if x_anchor[-1] < x_max:
+        x_anchor = np.append(x_anchor, x_max)
+        y_anchor = np.append(y_anchor, _nearest_finite_y(x, y, x_max, mask))
+
+    from scipy.interpolate import PchipInterpolator
+
+    interpolator = PchipInterpolator(x_anchor, y_anchor, extrapolate=True)
+    return interpolator(x)
+
+
+def _fit_centers(x_min: float, x_max: float, step_cm1: float) -> list[float]:
+    centers = list(np.arange(x_min, x_max + step_cm1, step_cm1, dtype=float))
+    centers.extend([x_min, x_max])
+    return sorted({round(c, 10) for c in centers if x_min <= c <= x_max})
+
+
+def _nearest_finite_y(
+    x: np.ndarray,
+    y: np.ndarray,
+    target: float,
+    mask: np.ndarray,
+) -> float:
+    valid_idx = np.where(mask)[0]
+    idx = valid_idx[int(np.argmin(np.abs(x[valid_idx] - target)))]
+    return float(y[idx])
 
 
 def _smooth_fit_by_width(
@@ -610,7 +661,7 @@ def _robust_polyfit_eval(
         coeff = np.polyfit(x_scaled[active], y_fit[active], deg=fit_order)
         residual = y_fit - np.polyval(coeff, x_scaled)
         resid_active = residual[active]
-        scale_resid = 1.4826 * np.nanmedian(np.abs(resid_active - np.nanmedian(resid_active)))
+        scale_resid = _robust_scale(resid_active)
         if not np.isfinite(scale_resid) or scale_resid <= 0 or sigma <= 0:
             break
         next_active = active & (np.abs(residual) <= sigma * scale_resid)
@@ -622,11 +673,12 @@ def _robust_polyfit_eval(
     return np.polyval(coeff, eval_scaled)
 
 
-def _window_weights(x: np.ndarray, center: float, half_width: float) -> np.ndarray:
-    if half_width <= 0:
-        return np.ones_like(x, dtype=float)
-    distance = np.abs(x - center) / half_width
-    return np.clip(1.0 - 0.9 * distance, 0.1, 1.0)
+def _robust_scale(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan
+    return 1.4826 * float(np.nanmedian(np.abs(values - np.nanmedian(values))))
 
 
 def _trapezoid(y: np.ndarray, x: np.ndarray) -> float:
