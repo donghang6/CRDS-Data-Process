@@ -40,6 +40,8 @@
     python main.py --continuum "CIA/273K/Ar 500Torr" --continuum-tau0-us 102.3
     python main.py --continuum "CIA/273K/Ar 500Torr" \
         --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
+    python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
+        --cia-fit-window 20 --cia-fit-step 5 --cia-fit-order 2
 
     # 仅对一个指定目录运行 Step 1（支持文件名只有波数，如 9630.00400.txt）
     python main.py --step1-dir '/path/to/Ar 500Torr'
@@ -115,6 +117,10 @@ def _parse_args(argv: list[str]) -> dict:
     continuum_tau0_us = None
     continuum_window = None
     continuum_tau_col = None
+    continuum_fit_window_cm1 = 20.0
+    continuum_fit_step_cm1 = 5.0
+    continuum_fit_order = 2
+    continuum_fit_sigma = 4.0
     step1_dir = None
     step1_output = None
 
@@ -167,6 +173,46 @@ def _parse_args(argv: list[str]) -> dict:
                 continuum_tau_col = argv[i]
             else:
                 print("警告: --continuum-tau-col 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--cia-fit-window", "--continuum-fit-window"):
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_fit_window_cm1 = float(argv[i])
+                except ValueError:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 20")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--cia-fit-step", "--continuum-fit-step"):
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_fit_step_cm1 = float(argv[i])
+                except ValueError:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 5")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--cia-fit-order", "--continuum-fit-order"):
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_fit_order = int(argv[i])
+                except ValueError:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 2")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--cia-fit-sigma", "--continuum-fit-sigma"):
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_fit_sigma = float(argv[i])
+                except ValueError:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 4")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
             i += 1
         elif arg == "--step1-dir":
             i += 1
@@ -304,6 +350,10 @@ def _parse_args(argv: list[str]) -> dict:
         "continuum_tau0_us": continuum_tau0_us,
         "continuum_window": continuum_window,
         "continuum_tau_col": continuum_tau_col,
+        "continuum_fit_window_cm1": continuum_fit_window_cm1,
+        "continuum_fit_step_cm1": continuum_fit_step_cm1,
+        "continuum_fit_order": continuum_fit_order,
+        "continuum_fit_sigma": continuum_fit_sigma,
         "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,

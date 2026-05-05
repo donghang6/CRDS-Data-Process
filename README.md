@@ -106,6 +106,8 @@ python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr'
 python main.py --continuum 'CIA/273K/Ar 500Torr' --continuum-tau0-us 102.3
 python main.py --continuum 'CIA/273K/Ar 500Torr' \
   --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
+python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
+  --cia-fit-window 20 --cia-fit-step 5 --cia-fit-order 2
 
 # 仅对一个指定目录运行 Step 1
 # 支持文件名只保留波数，例如 9630.00400.txt

@@ -425,6 +425,10 @@ class CRDSPipeline:
         continuum_tau0_us: float | None = None,
         continuum_window: tuple[float, float] | None = None,
         continuum_tau_col: str | None = None,
+        continuum_fit_window_cm1: float = 20.0,
+        continuum_fit_step_cm1: float = 5.0,
+        continuum_fit_order: int = 2,
+        continuum_fit_sigma: float = 4.0,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -494,6 +498,10 @@ class CRDSPipeline:
         )
         self.continuum_window = continuum_window
         self.continuum_tau_col = continuum_tau_col
+        self.continuum_fit_window_cm1 = float(continuum_fit_window_cm1)
+        self.continuum_fit_step_cm1 = float(continuum_fit_step_cm1)
+        self.continuum_fit_order = int(continuum_fit_order)
+        self.continuum_fit_sigma = float(continuum_fit_sigma)
 
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
@@ -1479,6 +1487,10 @@ class CRDSPipeline:
             tau0_us=self.continuum_tau0_us,
             window=self.continuum_window,
             tau_col=self.continuum_tau_col,
+            fit_window_cm1=self.continuum_fit_window_cm1,
+            fit_step_cm1=self.continuum_fit_step_cm1,
+            fit_order=self.continuum_fit_order,
+            fit_sigma=self.continuum_fit_sigma,
         )
         tasks = [
             task for task in proc.discover()
@@ -1503,7 +1515,7 @@ class CRDSPipeline:
         logger.info("=" * 60)
         logger.info("  CRDS continuum absorption pipeline")
         logger.info("  Step 1: 衰荡时间处理")
-        logger.info("  Step 2: Continuum absorption analysis")
+        logger.info("  Step 2: CIA loss-domain sliding-window fit")
         logger.info("  ── 跳过标准具去除")
         logger.info("  ── 跳过 MATS 谱线拟合")
         logger.info("=" * 60)
@@ -1533,7 +1545,7 @@ class CRDSPipeline:
         logger.info("=" * 60)
         logger.info("  CRDS continuum absorption pipeline (from ringdown)")
         logger.info("  ── 跳过 Step 1: 衰荡时间处理")
-        logger.info("  Step 2: Continuum absorption analysis")
+        logger.info("  Step 2: CIA loss-domain sliding-window fit")
         logger.info("  ── 跳过标准具去除")
         logger.info("  ── 跳过 MATS 谱线拟合")
         logger.info("=" * 60)

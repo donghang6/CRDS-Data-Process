@@ -60,6 +60,7 @@ class ContinuumResult:
     source_csv: Path
     spectrum_csv: Path
     plot_path: Path
+    fit_csv: Path
     summary: dict
 
 
@@ -103,6 +104,10 @@ class ContinuumBatchProcessor:
         tau_stats_col: str | None = None,
         wavenumber_col: str | None = None,
         min_points: int = 5,
+        fit_window_cm1: float = 20.0,
+        fit_step_cm1: float = 5.0,
+        fit_order: int = 2,
+        fit_sigma: float = 4.0,
     ):
         if reference_csv and tau0_us is not None:
             raise ValueError("reference_csv and tau0_us are mutually exclusive")
@@ -117,6 +122,10 @@ class ContinuumBatchProcessor:
         self.tau_stats_col = tau_stats_col
         self.wavenumber_col = wavenumber_col
         self.min_points = min_points
+        self.fit_window_cm1 = float(fit_window_cm1)
+        self.fit_step_cm1 = float(fit_step_cm1)
+        self.fit_order = int(fit_order)
+        self.fit_sigma = float(fit_sigma)
         self._reference = self._load_reference()
 
     def discover(self) -> list[tuple[str, str, str, Path]]:
@@ -143,6 +152,12 @@ class ContinuumBatchProcessor:
         logger.info(f"  Output: {self.output_root}")
         logger.info(f"  Datasets: {len(tasks)}")
         logger.info(f"  Reference: {self._reference_label()}")
+        logger.info(
+            "  Step 2 fit: "
+            f"window={self.fit_window_cm1:g} cm-1, "
+            f"step={self.fit_step_cm1:g} cm-1, "
+            f"order={self.fit_order}, sigma={self.fit_sigma:g}"
+        )
 
         for gas_type, transition, pressure, csv_path in tasks:
             output_dir = self.output_root / gas_type / transition / pressure
@@ -233,6 +248,15 @@ class ContinuumBatchProcessor:
 
         spectrum_csv = output_dir / "continuum_spectrum supplement.csv"
         work.to_csv(spectrum_csv, index=False)
+        work = _add_sliding_loss_fit(
+            work,
+            window_cm1=self.fit_window_cm1,
+            step_cm1=self.fit_step_cm1,
+            order=self.fit_order,
+            sigma=self.fit_sigma,
+        )
+        fit_csv = output_dir / "continuum_step2_fit.csv"
+        work.to_csv(fit_csv, index=False)
         plot_path = output_dir / "continuum_spectrum.png"
         self._plot_spectrum(work, plot_path, f"{gas_type}/{transition}/{pressure}")
 
@@ -244,6 +268,7 @@ class ContinuumBatchProcessor:
             source_csv=csv_path,
             spectrum_csv=spectrum_csv,
             plot_path=plot_path,
+            fit_csv=fit_csv,
             summary=summary,
         )
 
@@ -332,6 +357,16 @@ class ContinuumBatchProcessor:
             "loss_std_ppm_per_cm": _nanstd(work["loss_ppm_per_cm"]),
             "loss_min_ppm_per_cm": _nanmin(work["loss_ppm_per_cm"]),
             "loss_max_ppm_per_cm": _nanmax(work["loss_ppm_per_cm"]),
+            "fit_window_cm1": self.fit_window_cm1,
+            "fit_step_cm1": self.fit_step_cm1,
+            "fit_order": self.fit_order,
+            "fit_sigma": self.fit_sigma,
+            "loss_fit_resid_std_ppm_per_cm": _nanstd(
+                work["loss_residual_ppm_per_cm"]
+            ) if "loss_residual_ppm_per_cm" in work.columns else np.nan,
+            "tau_fit_resid_std_us": _nanstd(
+                work["tau_residual_us"]
+            ) if "tau_residual_us" in work.columns else np.nan,
             "alpha_mean_ppm_per_cm": _nanmean(alpha) if has_alpha else np.nan,
             "alpha_median_ppm_per_cm": _nanmedian(alpha) if has_alpha else np.nan,
             "alpha_std_ppm_per_cm": _nanstd(alpha) if has_alpha else np.nan,
@@ -352,14 +387,32 @@ class ContinuumBatchProcessor:
         fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
         wn = work["wavenumber"].to_numpy(dtype=float)
 
-        axes[0].plot(wn, work["tau_us"], ".", ms=2, color="steelblue")
+        axes[0].plot(
+            wn, work["tau_us"], ".", ms=2, color="steelblue", alpha=0.65,
+            label="Step 1 tau"
+        )
+        if "tau_fit_us" in work.columns:
+            axes[0].plot(
+                wn, work["tau_fit_us"], "-", lw=1.8, color="black",
+                label="Step 2 fit"
+            )
         axes[0].set_ylabel("Ring-down time (us)")
         axes[0].set_title(title)
+        axes[0].legend(loc="best")
         axes[0].grid(True, alpha=0.3)
 
-        axes[1].plot(wn, work["loss_ppm_per_cm"], ".", ms=2, color="tomato")
+        axes[1].plot(
+            wn, work["loss_ppm_per_cm"], ".", ms=2, color="tomato", alpha=0.65,
+            label="Loss"
+        )
+        if "loss_fit_ppm_per_cm" in work.columns:
+            axes[1].plot(
+                wn, work["loss_fit_ppm_per_cm"], "-", lw=1.8, color="black",
+                label="Step 2 fit"
+            )
         axes[1].set_xlabel("Wavenumber (cm-1)")
         axes[1].set_ylabel("Loss (ppm/cm)")
+        axes[1].legend(loc="best")
         axes[1].grid(True, alpha=0.3)
 
         fig.tight_layout()
@@ -403,6 +456,122 @@ def _normalize_window(window: tuple[float, float] | None) -> tuple[float, float]
 
 def _loss_from_tau_us(tau_us: np.ndarray) -> np.ndarray:
     return TAU_US_TO_PPM_PER_CM / tau_us
+
+
+def _add_sliding_loss_fit(
+    work: pd.DataFrame,
+    window_cm1: float,
+    step_cm1: float,
+    order: int,
+    sigma: float,
+) -> pd.DataFrame:
+    """Fit the continuum trend in loss domain using overlapping windows."""
+    if window_cm1 <= 0:
+        raise ValueError("fit_window_cm1 must be positive")
+    if step_cm1 <= 0:
+        raise ValueError("fit_step_cm1 must be positive")
+    if order < 0:
+        raise ValueError("fit_order must be >= 0")
+
+    out = work.copy()
+    wn = out["wavenumber"].to_numpy(dtype=float)
+    loss = out["loss_ppm_per_cm"].to_numpy(dtype=float)
+    mask = np.isfinite(wn) & np.isfinite(loss)
+    if int(mask.sum()) < max(order + 1, 2):
+        raise ValueError("not enough finite points for CIA Step 2 fit")
+
+    fit_sum = np.zeros_like(loss, dtype=float)
+    weight_sum = np.zeros_like(loss, dtype=float)
+    x_min = float(np.nanmin(wn[mask]))
+    x_max = float(np.nanmax(wn[mask]))
+    half_window = window_cm1 / 2.0
+
+    centers = list(np.arange(x_min, x_max + step_cm1, step_cm1, dtype=float))
+    edge_centers = [x_min + half_window, x_max - half_window]
+    for center in edge_centers:
+        if np.isfinite(center):
+            centers.append(float(center))
+    centers = sorted({round(c, 10) for c in centers if x_min <= c <= x_max})
+
+    min_points = max(order + 2, 8)
+    for center in centers:
+        local = mask & (np.abs(wn - center) <= half_window)
+        if int(local.sum()) < min_points:
+            continue
+
+        x_local = wn[local]
+        y_local = loss[local]
+        y_fit = _robust_polyfit_eval(
+            x_fit=x_local,
+            y_fit=y_local,
+            x_eval=x_local,
+            order=min(order, int(local.sum()) - 1),
+            sigma=sigma,
+        )
+        weights = _window_weights(x_local, center=center, half_width=half_window)
+        fit_sum[local] += y_fit * weights
+        weight_sum[local] += weights
+
+    fitted = np.full_like(loss, np.nan, dtype=float)
+    covered = weight_sum > 0
+    fitted[covered] = fit_sum[covered] / weight_sum[covered]
+
+    if np.isfinite(fitted).sum() >= 2 and np.any(~np.isfinite(fitted) & mask):
+        good = np.isfinite(fitted) & mask
+        fitted[~np.isfinite(fitted) & mask] = np.interp(
+            wn[~np.isfinite(fitted) & mask],
+            wn[good],
+            fitted[good],
+        )
+
+    tau_fit = TAU_US_TO_PPM_PER_CM / fitted
+    out["loss_fit_ppm_per_cm"] = fitted
+    out["loss_residual_ppm_per_cm"] = out["loss_ppm_per_cm"] - fitted
+    out["tau_fit_us"] = tau_fit
+    out["tau_residual_us"] = out["tau_us"] - tau_fit
+    return out
+
+
+def _robust_polyfit_eval(
+    x_fit: np.ndarray,
+    y_fit: np.ndarray,
+    x_eval: np.ndarray,
+    order: int,
+    sigma: float,
+) -> np.ndarray:
+    x0 = float(np.nanmean(x_fit))
+    scale = float(np.nanmax(np.abs(x_fit - x0)))
+    if not np.isfinite(scale) or scale == 0:
+        scale = 1.0
+
+    x_scaled = (x_fit - x0) / scale
+    eval_scaled = (x_eval - x0) / scale
+    active = np.isfinite(x_scaled) & np.isfinite(y_fit)
+    fit_order = min(order, max(int(active.sum()) - 1, 0))
+
+    for _ in range(4):
+        if int(active.sum()) <= fit_order:
+            break
+        coeff = np.polyfit(x_scaled[active], y_fit[active], deg=fit_order)
+        residual = y_fit - np.polyval(coeff, x_scaled)
+        resid_active = residual[active]
+        scale_resid = 1.4826 * np.nanmedian(np.abs(resid_active - np.nanmedian(resid_active)))
+        if not np.isfinite(scale_resid) or scale_resid <= 0 or sigma <= 0:
+            break
+        next_active = active & (np.abs(residual) <= sigma * scale_resid)
+        if np.array_equal(next_active, active) or int(next_active.sum()) <= fit_order:
+            break
+        active = next_active
+
+    coeff = np.polyfit(x_scaled[active], y_fit[active], deg=fit_order)
+    return np.polyval(coeff, eval_scaled)
+
+
+def _window_weights(x: np.ndarray, center: float, half_width: float) -> np.ndarray:
+    if half_width <= 0:
+        return np.ones_like(x, dtype=float)
+    distance = np.abs(x - center) / half_width
+    return np.clip(1.0 - 0.9 * distance, 0.1, 1.0)
 
 
 def _trapezoid(y: np.ndarray, x: np.ndarray) -> float:
