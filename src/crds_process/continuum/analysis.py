@@ -352,19 +352,14 @@ class ContinuumBatchProcessor:
         fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
         wn = work["wavenumber"].to_numpy(dtype=float)
 
-        axes[0].plot(wn, work["loss_ppm_per_cm"], ".", ms=2, color="steelblue")
-        axes[0].set_ylabel("Loss (ppm/cm)")
+        axes[0].plot(wn, work["tau_us"], ".", ms=2, color="steelblue")
+        axes[0].set_ylabel("Ring-down time (us)")
         axes[0].set_title(title)
         axes[0].grid(True, alpha=0.3)
 
-        alpha = work["alpha_ppm_per_cm"].to_numpy(dtype=float)
-        if np.isfinite(alpha).any():
-            axes[1].plot(wn, alpha, ".", ms=2, color="tomato")
-        else:
-            axes[1].text(0.5, 0.5, "No reference tau: alpha not computed",
-                         transform=axes[1].transAxes, ha="center", va="center")
+        axes[1].plot(wn, work["loss_ppm_per_cm"], ".", ms=2, color="tomato")
         axes[1].set_xlabel("Wavenumber (cm-1)")
-        axes[1].set_ylabel("Alpha (ppm/cm)")
+        axes[1].set_ylabel("Loss (ppm/cm)")
         axes[1].grid(True, alpha=0.3)
 
         fig.tight_layout()

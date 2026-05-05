@@ -41,6 +41,11 @@
     python main.py --continuum "CIA/273K/Ar 500Torr" \
         --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
 
+    # 仅对一个指定目录运行 Step 1（支持文件名只有波数，如 9630.00400.txt）
+    python main.py --step1-dir '/path/to/Ar 500Torr'
+    python main.py --step1-dir '/path/to/Ar 500Torr' \
+        --step1-output 'output/results/ringdown/CIA/273K/Ar 500Torr'
+
     # 跳过 Step 1, 直接从已有的 ringdown 结果开始执行 Step 2~5
     python main.py --from-ringdown
     python main.py --from-ringdown O2/9386.2076
@@ -110,6 +115,8 @@ def _parse_args(argv: list[str]) -> dict:
     continuum_tau0_us = None
     continuum_window = None
     continuum_tau_col = None
+    step1_dir = None
+    step1_output = None
 
     i = 0
     while i < len(argv):
@@ -160,6 +167,20 @@ def _parse_args(argv: list[str]) -> dict:
                 continuum_tau_col = argv[i]
             else:
                 print("警告: --continuum-tau-col 缺少参数，已忽略")
+            i += 1
+        elif arg == "--step1-dir":
+            i += 1
+            if i < len(argv):
+                step1_dir = argv[i]
+            else:
+                print("警告: --step1-dir 缺少参数，已忽略")
+            i += 1
+        elif arg == "--step1-output":
+            i += 1
+            if i < len(argv):
+                step1_output = argv[i]
+            else:
+                print("警告: --step1-output 缺少参数，已忽略")
             i += 1
         elif arg == "--remeasure-rel":
             i += 1
@@ -289,6 +310,8 @@ def _parse_args(argv: list[str]) -> dict:
         "_remeasure_report": remeasure_report,
         "_type_a_mc": type_a_mc,
         "_continuum": continuum,
+        "_step1_dir": step1_dir,
+        "_step1_output": step1_output,
     }
 
 
@@ -302,9 +325,14 @@ if __name__ == "__main__":
     remeasure_report = kwargs.pop("_remeasure_report")
     type_a_mc = kwargs.pop("_type_a_mc")
     continuum = kwargs.pop("_continuum")
+    step1_dir = kwargs.pop("_step1_dir")
+    step1_output = kwargs.pop("_step1_output")
 
     if from_ringdown and from_etalon:
         print("错误: --from-ringdown 与 --from-etalon 不能同时使用")
+        sys.exit(2)
+    if step1_dir and any([from_ringdown, from_etalon, n2_only, remeasure_report, type_a_mc, continuum]):
+        print("错误: --step1-dir 是单独的 Step 1 入口，不能与其他运行模式同时使用")
         sys.exit(2)
     if continuum and n2_only:
         print("错误: --continuum 与 --n2-only 不能同时使用")
@@ -330,7 +358,9 @@ if __name__ == "__main__":
                 sys.exit(2)
 
     pipeline = CRDSPipeline(**kwargs)
-    if type_a_mc:
+    if step1_dir:
+        pipeline.run_step1_directory(step1_dir, output_dir=step1_output)
+    elif type_a_mc:
         pipeline.run_type_a_monte_carlo()
     elif remeasure_report:
         pipeline.generate_remeasure_report()

@@ -527,8 +527,10 @@ class CRDSPipeline:
     _RE_PRESSURE_CIA = re.compile(
         r"^[A-Za-z0-9_+-]+\s+\d+(\.\d+)?\s*Torr$", re.IGNORECASE
     )
-    # 数据文件名: {序号} {波数} {14位时间戳}.txt
-    _RE_DATAFILE = re.compile(r"^\s*\d+\s+[\d.]+\s+\d{14}\.txt$")
+    # 数据文件名: {序号} {波数} {14位时间戳}.txt 或 {波数}.txt
+    _RE_DATAFILE = re.compile(
+        r"^(?:\s*\d+\s+[\d.]+\s+\d{14}|[\d]+(?:\.\d+)?)\.txt$"
+    )
 
     def validate_raw_data(self) -> bool:
         """检测 data/raw 下原始数据目录和文件命名是否符合规范。
@@ -541,7 +543,7 @@ class CRDSPipeline:
                 O2:    "{数字}Torr"   (如 100Torr)
                 O2_N2: "O2 {数字}Torr N2 {数字}Torr"
                 CIA:   "{气体} {数字}Torr" (如 Ar 500Torr)
-            - 数据文件: "{序号} {波数} {14位时间戳}.txt"
+            - 数据文件: "{序号} {波数} {14位时间戳}.txt" 或 "{波数}.txt"
 
         Returns
         -------
@@ -644,7 +646,7 @@ class CRDSPipeline:
                                     f"  ⚠ 文件名不规范: {tag}/{f.name}")
                                 logger.warning(
                                     f"    应为 '{{序号}} {{波数}} "
-                                    f"{{YYYYMMDDHHmmss}}.txt'")
+                                    f"{{YYYYMMDDHHmmss}}.txt' 或 '{{波数}}.txt'")
                             bad_files += 1
                             all_ok = False
 
@@ -829,6 +831,43 @@ class CRDSPipeline:
     # ==============================================================
     # Step 1: 衰荡时间处理
     # ==============================================================
+    def run_step1_directory(
+        self,
+        data_dir: Path | str,
+        output_dir: Path | str | None = None,
+    ) -> None:
+        """Run Step 1 for one explicitly specified raw-data directory."""
+        from crds_process.preprocessing import RawDataProcessor
+
+        data_dir = Path(data_dir).expanduser().resolve()
+        if output_dir is None:
+            output_dir = self.ringdown_root / "manual" / data_dir.name
+        else:
+            output_dir = Path(output_dir).expanduser().resolve()
+
+        logger.info("\n" + "=" * 60)
+        logger.info("  Step 1 — 指定目录衰荡时间处理")
+        logger.info("=" * 60)
+        logger.info(f"  原始数据目录: {data_dir}")
+        logger.info(f"  输出目录: {output_dir}")
+
+        if not data_dir.is_dir():
+            logger.error(f"  指定目录不存在: {data_dir}")
+            return
+
+        proc = RawDataProcessor(
+            data_dir=data_dir,
+            output_dir=output_dir,
+            filter_method="sigma_clip",
+            sigma=3.0,
+            min_events=5,
+            verbose=True,
+        )
+        result = proc.run()
+        logger.info("\nRingdown preview (first 5):")
+        logger.info(result.ringdown_df.head().to_string(index=False))
+        logger.info(f"\n  Step 1 输出: {output_dir}")
+
     def step1_ringdown(
         self,
         allowed_gas_types: set[str] | None = None,

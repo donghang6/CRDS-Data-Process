@@ -1,10 +1,13 @@
 """原始数据读取模块
 
 解析 CRDS 原始数据文件名和内容。
-文件名格式: "  1 9290.08204 20260121100904.txt"
-    - 字段1: 扫描序号
-    - 字段2: 波数 (cm⁻¹)
-    - 字段3: 时间戳 (YYYYMMDDHHmmss)
+支持两种文件名格式:
+    1. "  1 9290.08204 20260121100904.txt"
+        - 字段1: 扫描序号
+        - 字段2: 波数 (cm⁻¹)
+        - 字段3: 时间戳 (YYYYMMDDHHmmss)
+    2. "9290.08204.txt"
+        - 文件名只保留波数 (cm⁻¹)
 
 文件内容: 4列空格分隔
     - 列1: 衰荡时间 (μs)
@@ -24,7 +27,6 @@ import numpy as np
 import pandas as pd
 
 from crds_process.log import logger
-
 
 # ============================================================
 # 数据结构
@@ -53,9 +55,10 @@ class ScanData:
 # 文件名解析
 # ============================================================
 
-_FILENAME_PATTERN = re.compile(
+_LEGACY_FILENAME_PATTERN = re.compile(
     r"^\s*(\d+)\s+([\d.]+)\s+(\d{14})\.txt$"
 )
+_WAVENUMBER_FILENAME_PATTERN = re.compile(r"^(\d+(?:\.\d+)?)\.txt$")
 
 
 def parse_filename(filepath: str | Path) -> ScanMeta:
@@ -77,13 +80,18 @@ def parse_filename(filepath: str | Path) -> ScanMeta:
         文件名格式不符合预期
     """
     filepath = Path(filepath)
-    match = _FILENAME_PATTERN.match(filepath.name)
-    if not match:
-        raise ValueError(f"无法解析文件名: {filepath.name}")
-
-    index = int(match.group(1))
-    wavenumber = float(match.group(2))
-    timestamp = datetime.strptime(match.group(3), "%Y%m%d%H%M%S")
+    legacy_match = _LEGACY_FILENAME_PATTERN.match(filepath.name)
+    if legacy_match:
+        index = int(legacy_match.group(1))
+        wavenumber = float(legacy_match.group(2))
+        timestamp = datetime.strptime(legacy_match.group(3), "%Y%m%d%H%M%S")
+    else:
+        wavenumber_match = _WAVENUMBER_FILENAME_PATTERN.match(filepath.name)
+        if not wavenumber_match:
+            raise ValueError(f"无法解析文件名: {filepath.name}")
+        index = 0
+        wavenumber = float(wavenumber_match.group(1))
+        timestamp = datetime.fromtimestamp(filepath.stat().st_mtime)
 
     return ScanMeta(
         index=index,
@@ -183,4 +191,3 @@ def scans_to_dataframe(scans: list[ScanData]) -> pd.DataFrame:
         })
 
     return pd.DataFrame(records)
-

@@ -107,6 +107,12 @@ python main.py --continuum 'CIA/273K/Ar 500Torr' --continuum-tau0-us 102.3
 python main.py --continuum 'CIA/273K/Ar 500Torr' \
   --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
 
+# 仅对一个指定目录运行 Step 1
+# 支持文件名只保留波数，例如 9630.00400.txt
+python main.py --step1-dir '/Users/donghang/科研/实验数据/氧气连续吸收温度/原始数据初步处理/273K/Ar 500Torr'
+python main.py --step1-dir '/Users/donghang/科研/实验数据/氧气连续吸收温度/原始数据初步处理/273K/Ar 500Torr' \
+  --step1-output 'output/results/ringdown/CIA/273K/Ar 500Torr'
+
 # 跳过 Step 1，复用已生成 ringdown 结果，从 Step 2 开始
 python main.py --from-ringdown
 python main.py --from-ringdown O2/9386.2076
