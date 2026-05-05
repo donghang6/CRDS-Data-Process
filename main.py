@@ -49,6 +49,13 @@
     # Ar 500Torr 当前推荐参数；O2 数据不要直接套用，应单独调参
     python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
         --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
+    # O2 连续吸收示例：Step 2 用 HITRAN2024 定位并剔除吸收区，只拟合 CIA 基线
+    python main.py --continuum --from-ringdown "CIA/273K/O2 500Torr" \
+        --continuum-step2-mode o2 --cia-fit-window 8 --cia-fit-step 1 \
+        --cia-fit-order 2 --cia-fit-sigma 2 --cia-fit-smooth 2
+    # O2 连续吸收示例：只输出总损耗减 HITRAN2024 仿真，不做拟合
+    python main.py --continuum --from-ringdown "CIA/273K/O2 500Torr" \
+        --continuum-step2-mode o2-hitran
 
     # CIA 连续吸收 Step 2 参数说明（不同气体/压力需要分别调参）:
     #   --continuum
@@ -73,6 +80,11 @@
     #       对 Step 2 拟合线再平滑的宽度，单位 cm-1。默认 0 表示不额外平滑。
     #       Ar 500Torr 可试 10~20；O2 数据需根据其自身结构重新选择。
     #       数值越大越平滑，但可能压掉真实缓慢结构。
+    #   --continuum-step2-mode auto|ar|o2|o2-hitran
+    #       Step 2 拟合模式。默认 auto，会根据压力名自动识别 O2。
+    #       ar: loss 域连续背景拟合，适合 Ar 等无窄吸收的背景气。
+    #       o2: 用 HITRAN2024 O2 仿真定位吸收区，剔除后只用非吸收区 loss 拟合 CIA 基线。
+    #       o2-hitran: 只计算 loss - HITRAN2024 O2 仿真结果，先不拟合。
     #   --continuum-window START,END
     #       可选，只处理指定波数范围。
     #   --continuum-tau-col NAME
@@ -159,6 +171,7 @@ def _parse_args(argv: list[str]) -> dict:
     continuum_fit_order = 2
     continuum_fit_sigma = 4.0
     continuum_fit_smooth_cm1 = 0.0
+    continuum_step2_mode = "auto"
     step1_dir = None
     step1_output = None
 
@@ -259,6 +272,19 @@ def _parse_args(argv: list[str]) -> dict:
                     continuum_fit_smooth_cm1 = float(argv[i])
                 except ValueError:
                     print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 0")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--cia-step2-mode", "--continuum-step2-mode"):
+            i += 1
+            if i < len(argv):
+                mode = argv[i].strip().lower().replace("_", "-")
+                if mode in {"auto", "ar", "o2", "o2-hitran", "hitran"}:
+                    if mode == "hitran":
+                        mode = "o2-hitran"
+                    continuum_step2_mode = mode
+                else:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 auto")
             else:
                 print(f"警告: {arg} 缺少参数，已忽略")
             i += 1
@@ -403,6 +429,7 @@ def _parse_args(argv: list[str]) -> dict:
         "continuum_fit_order": continuum_fit_order,
         "continuum_fit_sigma": continuum_fit_sigma,
         "continuum_fit_smooth_cm1": continuum_fit_smooth_cm1,
+        "continuum_step2_mode": continuum_step2_mode,
         "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,

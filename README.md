@@ -99,7 +99,7 @@ python main.py --remeasure-report O2/9403.163069 O2_N2/9403.163069
 python main.py --remeasure-report --remeasure-rel 0.05 --remeasure-sigma 3
 python main.py --remeasure-report --remeasure-rel-o2 0.05 --remeasure-rel-o2n2 0.10
 
-# 连续吸收 / continuum absorption（仅处理 CIA 数据；Step 1 后做 loss 域 Step 2 拟合）
+# 连续吸收 / continuum absorption（仅处理 CIA 数据；Step 1 后做气体区分的 Step 2 拟合）
 python main.py --continuum CIA/273K
 python main.py --continuum 'CIA/273K/Ar 500Torr'
 python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr'
@@ -117,6 +117,18 @@ python main.py --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
 conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
   --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
   --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
+
+# O2 示例：Step 2 用 HITRAN2024 定位并剔除吸收区，只拟合缓慢 CIA 基线
+conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
+  --continuum --from-ringdown 'CIA/273K/O2 500Torr' \
+  --continuum-step2-mode o2 \
+  --cia-fit-window 8 --cia-fit-step 1 --cia-fit-order 2 \
+  --cia-fit-sigma 2 --cia-fit-smooth 2
+
+# O2 示例：先只输出总损耗扣 HITRAN2024 仿真结果，不做拟合
+conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
+  --continuum --from-ringdown 'CIA/273K/O2 500Torr' \
+  --continuum-step2-mode o2-hitran
 
 # 仅对一个指定目录运行 Step 1
 # 支持文件名只保留波数，例如 9630.00400.txt
@@ -235,7 +247,10 @@ Step 5 线性回归，可使用 `--n2-only`。
 和 sigma-clip，生成 `ringdown_results.csv`。
 
 CIA 流程的 Step 2 不做标准具去除，也不做 MATS 谱线拟合，而是从
-`ringdown_results.csv` 出发，在 loss 域进行滑动窗口拟合。每个窗口只生成
+`ringdown_results.csv` 出发，按气体类型选择不同的连续背景拟合方式。
+Ar 等无窄吸收的数据使用 loss 域连续背景拟合；O2 数据含有真实吸收峰，
+先用相同温度/压力下的 HITRAN2024 仿真定位吸收区，把这些点从拟合中
+剔除，只对非吸收区的 `loss_ppm_per_cm` 做分段 CIA 基线拟合。每个窗口只生成
 一个局部拟合锚点，最后用 PCHIP 连续插值贯穿全波段，避免分段连接处的小跳跃。
 转换关系为：
 
@@ -244,7 +259,7 @@ loss_ppm_per_cm = (1e12 / c) / tau_us
 ```
 
 默认使用 `ringdown_results.csv` 中的 `tau_mean`。输出图中上面板为
-处理后的衰荡时间和 Step 2 反算出的 tau 拟合线，下面板为 loss 和 Step 2
+处理后的衰荡时间和 Step 2 的 tau 拟合线，下面板为 loss 和 Step 2
 loss 拟合线。
 
 注意：Step 2 拟合参数需要按数据类型单独设置。下面给出的
@@ -260,6 +275,19 @@ O2 数据应根据自身谱形、吸收结构和噪声水平另行选择参数�
 conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
   --continuum --from-ringdown 'CIA/273K/Ar 500Torr' \
   --cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20
+
+# 已有 Step 1 结果时，只重新运行 O2 的 CIA Step 2
+# 下面这组参数只作为 O2 500Torr 起点
+conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
+  --continuum --from-ringdown 'CIA/273K/O2 500Torr' \
+  --continuum-step2-mode o2 \
+  --cia-fit-window 8 --cia-fit-step 1 --cia-fit-order 2 \
+  --cia-fit-sigma 2 --cia-fit-smooth 2
+
+# O2 专用：先只输出总损耗减 HITRAN2024 仿真结果，不做拟合
+conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
+  --continuum --from-ringdown 'CIA/273K/O2 500Torr' \
+  --continuum-step2-mode o2-hitran
 ```
 
 这条命令中每一项的含义：
@@ -272,6 +300,8 @@ conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
 | `--continuum` | 进入 CIA 连续吸收流程；只允许处理 `CIA/...` 目标。 |
 | `--from-ringdown` | 跳过原始 txt 的 Step 1，直接使用已有 `output/results/ringdown/.../ringdown_results.csv`。 |
 | `'CIA/273K/Ar 500Torr'` | 处理目标，格式为 `CIA/{温度}/{气体 压力}`。 |
+| `--continuum-step2-mode o2` | 指定 O2 的 Step 2 模式；用相同温度/压力下的 HITRAN2024 O2 仿真定位吸收区，剔除这些点后只拟合缓慢变化的 CIA baseline。Ar 示例可不加，默认 `auto` 会识别。 |
+| `--continuum-step2-mode o2-hitran` | O2 专用中间输出模式；计算 `loss_ppm_per_cm - hitran_o2_loss_ppm_per_cm`，不做 Step 2 拟合，用于先检查扣除 HITRAN2024 后的背景。 |
 | `--cia-fit-window 40` | Step 2 在 loss 域滑动拟合的窗口宽度，单位 `cm-1`。数值越大越平滑；默认 `20`。这里的 `40` 是 Ar 示例值。 |
 | `--cia-fit-step 5` | 连续拟合锚点间隔，单位 `cm-1`。数值越小锚点越密、越贴近局部结构；默认 `5`。 |
 | `--cia-fit-order 2` | 每个窗口内的多项式阶数。推荐 `2`；局部曲率复杂可试 `3`；默认 `2`。 |
@@ -287,6 +317,7 @@ CIA 连续吸收相关参数：
 | `--continuum-tau0-us VALUE` | 无 | 标量空腔 τ0，单位 `us`；与 `--continuum-ref` 互斥。 |
 | `--continuum-window START,END` | 全波段 | 只处理指定波数窗口；也支持 `START:END`。 |
 | `--continuum-tau-col NAME` | `tau_mean` | 指定用于计算 loss 的 τ 列。 |
+| `--continuum-step2-mode auto` / `--cia-step2-mode auto` | `auto` | Step 2 模式。`auto` 根据压力名识别 O2；`ar` 使用 loss 域连续背景拟合；`o2` 用 HITRAN2024 定位吸收区并剔除，只拟合 CIA baseline；`o2-hitran` 只输出总损耗扣 HITRAN2024 后的中间结果，不拟合。O2 的 HITRAN 仿真使用 Step 1 表中温度/压力的中位数作为条件，HITRAN 网格步长写入输出列 `hitran_step_cm1`。 |
 | `--cia-fit-window VALUE` / `--continuum-fit-window VALUE` | `20` | Step 2 滑动拟合窗口宽度，单位 `cm-1`。 |
 | `--cia-fit-step VALUE` / `--continuum-fit-step VALUE` | `5` | Step 2 连续拟合锚点间隔，单位 `cm-1`。 |
 | `--cia-fit-order VALUE` / `--continuum-fit-order VALUE` | `2` | 每个窗口内的多项式阶数。 |
@@ -298,12 +329,16 @@ CIA 连续吸收相关参数：
 - 想让拟合线更平滑：增大 `--cia-fit-window` 或 `--cia-fit-smooth`。
 - 想让拟合线更贴近局部结构：减小 `--cia-fit-window` 或 `--cia-fit-smooth`。
 - 当前 Ar 500Torr 数据比较推荐：`--cia-fit-window 40 --cia-fit-step 5 --cia-fit-order 2 --cia-fit-smooth 20`。
-- O2 数据不要直接套用 Ar 参数；应根据 O2 的实际谱形和需要保留的结构单独调 `window`、`order` 和 `smooth`。
+- O2 数据不要直接套用 Ar 参数；建议使用 `--continuum-step2-mode o2`，从
+  `--cia-fit-window 8 --cia-fit-step 1 --cia-fit-sigma 2 --cia-fit-smooth 2`
+  开始试，再根据吸收峰密度和背景弯曲程度调整。
 
 主要输出：
 
 - `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum supplement.csv`：Step 1 tau 转换出的原始 loss 表。
-- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_fit.csv`：Step 2 拟合结果，含 `loss_fit_ppm_per_cm`、`tau_fit_us` 和残差列。
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_fit.csv`：Step 2 拟合结果。Ar 模式含 `loss_fit_ppm_per_cm`、`tau_fit_us` 和残差列；O2 模式额外含 `hitran_o2_loss_ppm_per_cm`、`o2_absorption_mask`、`o2_fit_used`、`cia_baseline_loss_ppm_per_cm`。
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_cia_baseline.csv`：O2 模式额外输出的纯 CIA 基线表，只保留 `wavenumber`、`cia_baseline_loss_ppm_per_cm`、`tau_fit_us` 和 mask/HITRAN 条件列。
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_hitran_subtracted.csv`：O2 `o2-hitran` 模式输出，含 `hitran_o2_loss_ppm_per_cm`、`loss_minus_hitran_ppm_per_cm` 和 HITRAN 使用的温度/压力列。
 - `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum.png`：上 tau、下 loss 的拟合图。
 - `output/results/continuum/continuum_summary.csv`：汇总表，包含 Step 2 拟合参数和残差统计。
 - `output/results/continuum/continuum_pressure_fits.csv`：多压力数据存在时的压力依赖拟合结果。

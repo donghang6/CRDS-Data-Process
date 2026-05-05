@@ -430,6 +430,7 @@ class CRDSPipeline:
         continuum_fit_order: int = 2,
         continuum_fit_sigma: float = 4.0,
         continuum_fit_smooth_cm1: float = 0.0,
+        continuum_step2_mode: str = "auto",
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -504,6 +505,7 @@ class CRDSPipeline:
         self.continuum_fit_order = int(continuum_fit_order)
         self.continuum_fit_sigma = float(continuum_fit_sigma)
         self.continuum_fit_smooth_cm1 = float(continuum_fit_smooth_cm1)
+        self.continuum_step2_mode = continuum_step2_mode
 
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
@@ -1494,6 +1496,7 @@ class CRDSPipeline:
             fit_order=self.continuum_fit_order,
             fit_sigma=self.continuum_fit_sigma,
             fit_smooth_cm1=self.continuum_fit_smooth_cm1,
+            fit_mode=self.continuum_step2_mode,
         )
         tasks = [
             task for task in proc.discover()
@@ -1518,7 +1521,7 @@ class CRDSPipeline:
         logger.info("=" * 60)
         logger.info("  CRDS continuum absorption pipeline")
         logger.info("  Step 1: 衰荡时间处理")
-        logger.info("  Step 2: CIA loss-domain sliding-window fit")
+        logger.info(f"  Step 2: {self._continuum_step2_label()}")
         logger.info("  ── 跳过标准具去除")
         logger.info("  ── 跳过 MATS 谱线拟合")
         logger.info("=" * 60)
@@ -1548,7 +1551,7 @@ class CRDSPipeline:
         logger.info("=" * 60)
         logger.info("  CRDS continuum absorption pipeline (from ringdown)")
         logger.info("  ── 跳过 Step 1: 衰荡时间处理")
-        logger.info("  Step 2: CIA loss-domain sliding-window fit")
+        logger.info(f"  Step 2: {self._continuum_step2_label()}")
         logger.info("  ── 跳过标准具去除")
         logger.info("  ── 跳过 MATS 谱线拟合")
         logger.info("=" * 60)
@@ -1572,6 +1575,16 @@ class CRDSPipeline:
         logger.info(f"\n{'#' * 60}")
         logger.info(f"  全部完成! 耗时 {elapsed:.1f} s")
         logger.info(f"{'#' * 60}")
+
+    def _continuum_step2_label(self) -> str:
+        mode = str(self.continuum_step2_mode or "auto").strip().lower().replace("_", "-")
+        if mode == "o2-hitran":
+            return "O2 total loss minus HITRAN2024 simulation"
+        if mode == "o2":
+            return "O2 HITRAN-masked CIA baseline fit"
+        if mode == "ar":
+            return "Ar/loss-domain sliding-window fit"
+        return "CIA gas-specific Step 2"
 
     def run_continuum_from_etalon(self) -> None:
         """Continuum analysis intentionally does not use etalon-corrected data."""

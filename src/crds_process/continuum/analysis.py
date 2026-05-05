@@ -12,7 +12,10 @@ to produce the absorption coefficient ``alpha_ppm_per_cm``.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +41,14 @@ matplotlib.use("Agg")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 RINGDOWN_ROOT = PROJECT_ROOT / "output" / "results" / "ringdown"
 CONTINUUM_ROOT = PROJECT_ROOT / "output" / "results" / "continuum"
+HITRAN_DIR = PROJECT_ROOT / "data" / "hitran"
 RINGDOWN_CSV_NAME = "ringdown_results.csv"
 
 C_CM_PER_S = 2.99792458e10
 TAU_US_TO_PPM_PER_CM = 1e12 / C_CM_PER_S
+HITRAN_O2_STEP_CM1 = 0.002
+HITRAN_O2_MASK_RATIO = 0.01
+HITRAN_O2_MASK_MARGIN_CM1 = 0.05
 
 WAVENUMBER_COLUMNS = ("wavenumber", "Wavenumber", "nu", "Total Frequency /MHz")
 TAU_COLUMNS = ("tau_mean", "Mean tau/us")
@@ -109,6 +116,7 @@ class ContinuumBatchProcessor:
         fit_order: int = 2,
         fit_sigma: float = 4.0,
         fit_smooth_cm1: float = 0.0,
+        fit_mode: str = "auto",
     ):
         if reference_csv and tau0_us is not None:
             raise ValueError("reference_csv and tau0_us are mutually exclusive")
@@ -128,6 +136,7 @@ class ContinuumBatchProcessor:
         self.fit_order = int(fit_order)
         self.fit_sigma = float(fit_sigma)
         self.fit_smooth_cm1 = float(fit_smooth_cm1)
+        self.fit_mode = _normalize_fit_mode(fit_mode)
         self._reference = self._load_reference()
 
     def discover(self) -> list[tuple[str, str, str, Path]]:
@@ -154,13 +163,30 @@ class ContinuumBatchProcessor:
         logger.info(f"  Output: {self.output_root}")
         logger.info(f"  Datasets: {len(tasks)}")
         logger.info(f"  Reference: {self._reference_label()}")
-        logger.info(
-            "  Step 2 fit: "
-            f"window={self.fit_window_cm1:g} cm-1, "
-            f"step={self.fit_step_cm1:g} cm-1, "
-            f"order={self.fit_order}, sigma={self.fit_sigma:g}"
-            f", smooth={self.fit_smooth_cm1:g} cm-1"
-        )
+        if self.fit_mode == "o2-hitran":
+            logger.info(
+                "  Step 2: O2 HITRAN subtraction only; "
+                f"HITRAN grid step={HITRAN_O2_STEP_CM1:g} cm-1"
+            )
+        elif self.fit_mode == "o2":
+            logger.info(
+                "  Step 2 fit: O2 HITRAN-masked CIA baseline fit; "
+                f"window={self.fit_window_cm1:g} cm-1, "
+                f"step={self.fit_step_cm1:g} cm-1, "
+                f"order={self.fit_order}, sigma={self.fit_sigma:g}"
+                f", smooth={self.fit_smooth_cm1:g} cm-1, "
+                f"mask_ratio={HITRAN_O2_MASK_RATIO:g}, "
+                f"mask_margin={HITRAN_O2_MASK_MARGIN_CM1:g} cm-1"
+            )
+        else:
+            logger.info(
+                "  Step 2 fit: "
+                f"window={self.fit_window_cm1:g} cm-1, "
+                f"step={self.fit_step_cm1:g} cm-1, "
+                f"order={self.fit_order}, sigma={self.fit_sigma:g}"
+                f", smooth={self.fit_smooth_cm1:g} cm-1, "
+                f"mode={self.fit_mode}"
+            )
 
         for gas_type, transition, pressure, csv_path in tasks:
             output_dir = self.output_root / gas_type / transition / pressure
@@ -251,20 +277,38 @@ class ContinuumBatchProcessor:
 
         spectrum_csv = output_dir / "continuum_spectrum supplement.csv"
         work.to_csv(spectrum_csv, index=False)
-        work = _add_sliding_loss_fit(
-            work,
-            window_cm1=self.fit_window_cm1,
-            step_cm1=self.fit_step_cm1,
-            order=self.fit_order,
-            sigma=self.fit_sigma,
-            smooth_cm1=self.fit_smooth_cm1,
-        )
-        fit_csv = output_dir / "continuum_step2_fit.csv"
+        active_fit_mode = _resolve_fit_mode(self.fit_mode, pressure)
+        if active_fit_mode == "o2-hitran":
+            work = _add_o2_hitran_subtraction(work, pressure_label=pressure)
+            fit_csv = output_dir / "continuum_step2_hitran_subtracted.csv"
+        else:
+            work = _add_step2_fit(
+                work,
+                fit_mode=active_fit_mode,
+                pressure_label=pressure,
+                window_cm1=self.fit_window_cm1,
+                step_cm1=self.fit_step_cm1,
+                order=self.fit_order,
+                sigma=self.fit_sigma,
+                smooth_cm1=self.fit_smooth_cm1,
+            )
+            fit_csv = output_dir / "continuum_step2_fit.csv"
         work.to_csv(fit_csv, index=False)
+        if "cia_baseline_loss_ppm_per_cm" in work.columns:
+            _write_o2_baseline_csv(work, output_dir / "continuum_step2_cia_baseline.csv")
         plot_path = output_dir / "continuum_spectrum.png"
         self._plot_spectrum(work, plot_path, f"{gas_type}/{transition}/{pressure}")
 
-        summary = self._summarize(work, gas_type, transition, pressure, csv_path, tau_col, tau_stats_col)
+        summary = self._summarize(
+            work,
+            gas_type,
+            transition,
+            pressure,
+            csv_path,
+            tau_col,
+            tau_stats_col,
+            active_fit_mode,
+        )
         return ContinuumResult(
             gas_type=gas_type,
             transition=transition,
@@ -332,12 +376,15 @@ class ContinuumBatchProcessor:
         source_csv: Path,
         tau_col: str,
         tau_stats_col: str | None,
+        active_fit_mode: str,
     ) -> dict:
         wn = work["wavenumber"].to_numpy(dtype=float)
         alpha = work["alpha_ppm_per_cm"].to_numpy(dtype=float)
         has_alpha = np.isfinite(alpha).any()
         pressure_mean = _nanmean(work["pressure_torr"]) if "pressure_torr" in work.columns else np.nan
         temperature_mean = _nanmean(work["temperature_c"]) if "temperature_c" in work.columns else np.nan
+        pressure_median = _nanmedian_positive(work["pressure_torr"]) if "pressure_torr" in work.columns else np.nan
+        temperature_median = _nanmedian(work["temperature_c"]) if "temperature_c" in work.columns else np.nan
 
         summary = {
             "gas_type": gas_type,
@@ -354,6 +401,8 @@ class ContinuumBatchProcessor:
             "window_max": self.window[1] if self.window else np.nan,
             "pressure_mean_torr": pressure_mean,
             "temperature_mean_c": temperature_mean,
+            "pressure_median_torr": pressure_median,
+            "temperature_median_c": temperature_median,
             "tau_mean_us": _nanmean(work["tau_us"]),
             "tau_std_us": _nanstd(work["tau_us"]),
             "loss_mean_ppm_per_cm": _nanmean(work["loss_ppm_per_cm"]),
@@ -366,6 +415,7 @@ class ContinuumBatchProcessor:
             "fit_order": self.fit_order,
             "fit_sigma": self.fit_sigma,
             "fit_smooth_cm1": self.fit_smooth_cm1,
+            "fit_mode": active_fit_mode,
             "loss_fit_resid_std_ppm_per_cm": _nanstd(
                 work["loss_residual_ppm_per_cm"]
             ) if "loss_residual_ppm_per_cm" in work.columns else np.nan,
@@ -383,6 +433,40 @@ class ContinuumBatchProcessor:
             summary["loss_stats_median_ppm_per_cm"] = _nanmedian(work["loss_stats_ppm_per_cm"])
         if "alpha_stats_ppm_per_cm" in work.columns:
             summary["alpha_stats_median_ppm_per_cm"] = _nanmedian(work["alpha_stats_ppm_per_cm"])
+        if "hitran_o2_loss_ppm_per_cm" in work.columns:
+            summary["hitran_o2_loss_mean_ppm_per_cm"] = _nanmean(work["hitran_o2_loss_ppm_per_cm"])
+        if "hitran_temperature_c" in work.columns:
+            summary["hitran_temperature_c"] = _nanmedian(work["hitran_temperature_c"])
+        if "hitran_pressure_torr" in work.columns:
+            summary["hitran_pressure_torr"] = _nanmedian(work["hitran_pressure_torr"])
+        if "loss_minus_hitran_ppm_per_cm" in work.columns:
+            summary["loss_minus_hitran_mean_ppm_per_cm"] = _nanmean(
+                work["loss_minus_hitran_ppm_per_cm"]
+            )
+            summary["loss_minus_hitran_std_ppm_per_cm"] = _nanstd(
+                work["loss_minus_hitran_ppm_per_cm"]
+            )
+        if "cia_baseline_loss_ppm_per_cm" in work.columns:
+            summary["cia_baseline_mean_ppm_per_cm"] = _nanmean(
+                work["cia_baseline_loss_ppm_per_cm"]
+            )
+        if "o2_fit_used" in work.columns:
+            fit_used = work["o2_fit_used"].astype(bool).to_numpy()
+            absorption_mask = work["o2_absorption_mask"].astype(bool).to_numpy()
+            summary["o2_fit_used_points"] = int(fit_used.sum())
+            summary["o2_absorption_masked_points"] = int(absorption_mask.sum())
+            summary["o2_absorption_masked_fraction"] = (
+                float(absorption_mask.sum() / len(work)) if len(work) else np.nan
+            )
+            if "loss_residual_ppm_per_cm" in work.columns:
+                residual = work["loss_residual_ppm_per_cm"].to_numpy(dtype=float)
+                summary["o2_fit_used_loss_resid_std_ppm_per_cm"] = _nanstd(
+                    residual[fit_used]
+                )
+        if "hitran_subtracted_residual_ppm_per_cm" in work.columns:
+            summary["hitran_subtracted_fit_resid_std_ppm_per_cm"] = _nanstd(
+                work["hitran_subtracted_residual_ppm_per_cm"]
+            )
         return summary
 
     @staticmethod
@@ -406,14 +490,67 @@ class ContinuumBatchProcessor:
         axes[0].legend(loc="best")
         axes[0].grid(True, alpha=0.3)
 
-        axes[1].plot(
-            wn, work["loss_ppm_per_cm"], ".", ms=2, color="tomato", alpha=0.65,
-            label="Loss"
-        )
+        loss = work["loss_ppm_per_cm"].to_numpy(dtype=float)
+        if "o2_absorption_mask" in work.columns:
+            fit_used = work["o2_fit_used"].astype(bool).to_numpy()
+            absorption_mask = work["o2_absorption_mask"].astype(bool).to_numpy()
+            axes[1].plot(
+                wn[fit_used],
+                loss[fit_used],
+                ".",
+                ms=2,
+                color="slategray",
+                alpha=0.55,
+                label="Baseline fit points",
+            )
+            axes[1].plot(
+                wn[absorption_mask],
+                loss[absorption_mask],
+                ".",
+                ms=2,
+                color="tomato",
+                alpha=0.75,
+                label="Masked O2 absorption",
+            )
+        else:
+            axes[1].plot(
+                wn, work["loss_ppm_per_cm"], ".", ms=2, color="tomato", alpha=0.65,
+                label="Loss"
+            )
+        if "hitran_o2_loss_ppm_per_cm" in work.columns:
+            axes[1].plot(
+                wn,
+                work["hitran_o2_loss_ppm_per_cm"],
+                "-",
+                lw=1.1,
+                color="royalblue",
+                alpha=0.9,
+                label="HITRAN O2",
+            )
+        if "loss_minus_hitran_ppm_per_cm" in work.columns and "o2_absorption_mask" not in work.columns:
+            axes[1].plot(
+                wn,
+                work["loss_minus_hitran_ppm_per_cm"],
+                ".",
+                ms=2,
+                color="black",
+                alpha=0.65,
+                label="Loss - HITRAN",
+            )
+        if "hitran_subtracted_fit_ppm_per_cm" in work.columns:
+            axes[1].plot(
+                wn,
+                work["hitran_subtracted_fit_ppm_per_cm"],
+                "-",
+                lw=1.8,
+                color="darkgreen",
+                label="Fit(loss - HITRAN)",
+            )
         if "loss_fit_ppm_per_cm" in work.columns:
+            label = "CIA baseline" if "cia_baseline_loss_ppm_per_cm" in work.columns else "Step 2 fit"
             axes[1].plot(
                 wn, work["loss_fit_ppm_per_cm"], "-", lw=1.8, color="black",
-                label="Step 2 fit"
+                alpha=0.9, label=label
             )
         axes[1].set_xlabel("Wavenumber (cm-1)")
         axes[1].set_ylabel("Loss (ppm/cm)")
@@ -452,6 +589,25 @@ def _find_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str:
     return col
 
 
+def _write_o2_baseline_csv(work: pd.DataFrame, csv_path: Path) -> None:
+    columns = [
+        "wavenumber",
+        "cia_baseline_loss_ppm_per_cm",
+        "tau_fit_us",
+        "o2_absorption_mask",
+        "o2_fit_used",
+        "hitran_o2_loss_ppm_per_cm",
+        "hitran_mask_threshold_ppm_per_cm",
+        "hitran_mask_ratio",
+        "hitran_mask_margin_cm1",
+        "hitran_temperature_c",
+        "hitran_pressure_torr",
+        "hitran_step_cm1",
+    ]
+    existing = [col for col in columns if col in work.columns]
+    work[existing].to_csv(csv_path, index=False)
+
+
 def _normalize_window(window: tuple[float, float] | None) -> tuple[float, float] | None:
     if window is None:
         return None
@@ -459,8 +615,170 @@ def _normalize_window(window: tuple[float, float] | None) -> tuple[float, float]
     return (lo, hi) if lo <= hi else (hi, lo)
 
 
+def _normalize_fit_mode(fit_mode: str) -> str:
+    mode = str(fit_mode or "auto").strip().lower().replace("_", "-")
+    aliases = {
+        "argon": "ar",
+        "loss": "ar",
+        "loss-domain": "ar",
+        "oxygen": "o2",
+        "tau-envelope": "o2",
+        "envelope": "o2",
+        "hitran": "o2-hitran",
+        "o2hitran": "o2-hitran",
+        "o2-subtract": "o2-hitran",
+        "hitran-subtract": "o2-hitran",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"auto", "ar", "o2", "o2-hitran"}:
+        raise ValueError("fit_mode must be one of: auto, ar, o2, o2-hitran")
+    return mode
+
+
+def _resolve_fit_mode(fit_mode: str, pressure: str) -> str:
+    mode = _normalize_fit_mode(fit_mode)
+    if mode != "auto":
+        return mode
+
+    label = str(pressure).upper()
+    if "O2" in label or "O₂" in label:
+        return "o2"
+    return "ar"
+
+
 def _loss_from_tau_us(tau_us: np.ndarray) -> np.ndarray:
     return TAU_US_TO_PPM_PER_CM / tau_us
+
+
+def _add_step2_fit(
+    work: pd.DataFrame,
+    fit_mode: str,
+    pressure_label: str,
+    window_cm1: float,
+    step_cm1: float,
+    order: int,
+    sigma: float,
+    smooth_cm1: float,
+) -> pd.DataFrame:
+    if _normalize_fit_mode(fit_mode) == "o2":
+        return _add_o2_hitran_masked_baseline_fit(
+            work=work,
+            pressure_label=pressure_label,
+            window_cm1=window_cm1,
+            step_cm1=step_cm1,
+            order=order,
+            sigma=sigma,
+            smooth_cm1=smooth_cm1,
+        )
+    return _add_sliding_loss_fit(
+        work=work,
+        window_cm1=window_cm1,
+        step_cm1=step_cm1,
+        order=order,
+        sigma=sigma,
+        smooth_cm1=smooth_cm1,
+    )
+
+
+def _add_o2_hitran_subtraction(
+    work: pd.DataFrame,
+    pressure_label: str,
+) -> pd.DataFrame:
+    """Subtract the HITRAN O2 simulation from measured total cavity loss."""
+    out = work.copy()
+    wn = out["wavenumber"].to_numpy(dtype=float)
+    loss = out["loss_ppm_per_cm"].to_numpy(dtype=float)
+    mask = np.isfinite(wn) & np.isfinite(loss)
+    if int(mask.sum()) < 2:
+        raise ValueError("not enough finite points for O2 HITRAN subtraction")
+
+    temperature_c = (
+        _nanmedian(out["temperature_c"])
+        if "temperature_c" in out.columns else np.nan
+    )
+    pressure_torr = (
+        _nanmedian_positive(out["pressure_torr"])
+        if "pressure_torr" in out.columns else np.nan
+    )
+    if not np.isfinite(pressure_torr):
+        pressure_torr = _pressure_torr_from_label(pressure_label)
+    if not np.isfinite(temperature_c):
+        raise ValueError("O2 HITRAN subtraction requires temperature_c in the Step 1 CSV")
+    if not np.isfinite(pressure_torr) or pressure_torr <= 0:
+        raise ValueError("O2 HITRAN subtraction requires pressure_torr in the Step 1 CSV or pressure label")
+
+    hitran_loss = _simulate_o2_hitran_loss_ppm_per_cm(
+        wavenumber=wn,
+        temperature_c=float(temperature_c),
+        pressure_torr=float(pressure_torr),
+    )
+    residual = loss - hitran_loss
+    tau_equiv = np.full_like(residual, np.nan, dtype=float)
+    positive = np.isfinite(residual) & (residual > 0)
+    tau_equiv[positive] = TAU_US_TO_PPM_PER_CM / residual[positive]
+
+    out["hitran_o2_loss_ppm_per_cm"] = hitran_loss
+    out["hitran_o2_absorption_cm_inv"] = hitran_loss / 1e6
+    out["loss_minus_hitran_ppm_per_cm"] = residual
+    out["tau_equiv_after_hitran_us"] = tau_equiv
+    out["hitran_temperature_c"] = float(temperature_c)
+    out["hitran_temperature_k"] = float(temperature_c) + 273.15
+    out["hitran_pressure_torr"] = float(pressure_torr)
+    out["hitran_pressure_atm"] = float(pressure_torr) / 760.0
+    out["hitran_step_cm1"] = HITRAN_O2_STEP_CM1
+    out["step2_fit_mode"] = "o2-hitran"
+    return out
+
+
+def _add_o2_hitran_masked_baseline_fit(
+    work: pd.DataFrame,
+    pressure_label: str,
+    window_cm1: float,
+    step_cm1: float,
+    order: int,
+    sigma: float,
+    smooth_cm1: float,
+) -> pd.DataFrame:
+    """Mask HITRAN O2 absorption points, then fit the slow CIA baseline."""
+    out = _add_o2_hitran_subtraction(work, pressure_label=pressure_label)
+    wn = out["wavenumber"].to_numpy(dtype=float)
+    loss = out["loss_ppm_per_cm"].to_numpy(dtype=float)
+    hitran_loss = out["hitran_o2_loss_ppm_per_cm"].to_numpy(dtype=float)
+    absorption_mask, mask_threshold = _hitran_absorption_mask(
+        wavenumber=wn,
+        hitran_loss=hitran_loss,
+    )
+    finite = np.isfinite(wn) & np.isfinite(loss)
+    fit_used = finite & ~absorption_mask
+
+    baseline = _fit_loss_values(
+        wn=wn,
+        loss=loss,
+        fit_mask=fit_used,
+        window_cm1=window_cm1,
+        step_cm1=step_cm1,
+        order=order,
+        sigma=sigma,
+        smooth_cm1=smooth_cm1,
+        error_label="O2 HITRAN-masked CIA baseline fit",
+    )
+    tau_fit = np.full_like(baseline, np.nan, dtype=float)
+    positive = np.isfinite(baseline) & (baseline > 0)
+    tau_fit[positive] = TAU_US_TO_PPM_PER_CM / baseline[positive]
+
+    out["o2_absorption_mask"] = absorption_mask
+    out["o2_fit_used"] = fit_used
+    out["hitran_mask_threshold_ppm_per_cm"] = mask_threshold
+    out["hitran_mask_ratio"] = HITRAN_O2_MASK_RATIO
+    out["hitran_mask_margin_cm1"] = HITRAN_O2_MASK_MARGIN_CM1
+    out["cia_baseline_loss_ppm_per_cm"] = baseline
+    out["cia_baseline_residual_ppm_per_cm"] = out["loss_ppm_per_cm"] - baseline
+    out["loss_fit_ppm_per_cm"] = baseline
+    out["loss_residual_ppm_per_cm"] = out["loss_ppm_per_cm"] - baseline
+    out["tau_fit_us"] = tau_fit
+    out["tau_residual_us"] = out["tau_us"] - tau_fit
+    out["step2_fit_mode"] = "o2"
+    return out
 
 
 def _add_sliding_loss_fit(
@@ -482,9 +800,52 @@ def _add_sliding_loss_fit(
     out = work.copy()
     wn = out["wavenumber"].to_numpy(dtype=float)
     loss = out["loss_ppm_per_cm"].to_numpy(dtype=float)
+    fitted = _fit_loss_values(
+        wn=wn,
+        loss=loss,
+        fit_mask=None,
+        window_cm1=window_cm1,
+        step_cm1=step_cm1,
+        order=order,
+        sigma=sigma,
+        smooth_cm1=smooth_cm1,
+        error_label="CIA Step 2 fit",
+    )
+    tau_fit = TAU_US_TO_PPM_PER_CM / fitted
+    out["loss_fit_ppm_per_cm"] = fitted
+    out["loss_residual_ppm_per_cm"] = out["loss_ppm_per_cm"] - fitted
+    out["tau_fit_us"] = tau_fit
+    out["tau_residual_us"] = out["tau_us"] - tau_fit
+    out["step2_fit_mode"] = "ar"
+    return out
+
+
+def _fit_loss_values(
+    wn: np.ndarray,
+    loss: np.ndarray,
+    fit_mask: np.ndarray | None,
+    window_cm1: float,
+    step_cm1: float,
+    order: int,
+    sigma: float,
+    smooth_cm1: float,
+    error_label: str,
+) -> np.ndarray:
+    if window_cm1 <= 0:
+        raise ValueError("fit_window_cm1 must be positive")
+    if step_cm1 <= 0:
+        raise ValueError("fit_step_cm1 must be positive")
+    if order < 0:
+        raise ValueError("fit_order must be >= 0")
+
     mask = np.isfinite(wn) & np.isfinite(loss)
+    if fit_mask is not None:
+        fit_mask = np.asarray(fit_mask, dtype=bool)
+        if fit_mask.shape != mask.shape:
+            raise ValueError("fit_mask must have the same shape as wn")
+        mask &= fit_mask
     if int(mask.sum()) < max(order + 1, 2):
-        raise ValueError("not enough finite points for CIA Step 2 fit")
+        raise ValueError(f"not enough finite points for {error_label}")
 
     x_min = float(np.nanmin(wn[mask]))
     x_max = float(np.nanmax(wn[mask]))
@@ -508,12 +869,65 @@ def _add_sliding_loss_fit(
             smooth_cm1=smooth_cm1,
             order=min(max(order, 1), 3),
         )
+    return fitted
 
-    tau_fit = TAU_US_TO_PPM_PER_CM / fitted
-    out["loss_fit_ppm_per_cm"] = fitted
-    out["loss_residual_ppm_per_cm"] = out["loss_ppm_per_cm"] - fitted
+
+def _add_o2_tau_envelope_fit(
+    work: pd.DataFrame,
+    window_cm1: float,
+    step_cm1: float,
+    order: int,
+    sigma: float,
+    smooth_cm1: float,
+) -> pd.DataFrame:
+    """Fit an absorption-aware O2 baseline in tau domain.
+
+    O2 narrow absorption increases loss and therefore pushes tau downward.
+    The background tau should therefore be estimated from the upper envelope,
+    not from all points as in Ar.
+    """
+    if window_cm1 <= 0:
+        raise ValueError("fit_window_cm1 must be positive")
+    if step_cm1 <= 0:
+        raise ValueError("fit_step_cm1 must be positive")
+    if order < 0:
+        raise ValueError("fit_order must be >= 0")
+
+    out = work.copy()
+    wn = out["wavenumber"].to_numpy(dtype=float)
+    tau = out["tau_us"].to_numpy(dtype=float)
+    mask = np.isfinite(wn) & np.isfinite(tau) & (tau > 0)
+    if int(mask.sum()) < max(order + 1, 2):
+        raise ValueError("not enough finite points for O2 Step 2 fit")
+
+    x_min = float(np.nanmin(wn[mask]))
+    x_max = float(np.nanmax(wn[mask]))
+    half_window = window_cm1 / 2.0
+    tau_fit = _continuous_anchor_tau_envelope_fit(
+        x=wn,
+        y=tau,
+        mask=mask,
+        x_min=x_min,
+        x_max=x_max,
+        half_window=half_window,
+        step_cm1=step_cm1,
+        order=order,
+        sigma=sigma,
+    )
+    if smooth_cm1 > 0:
+        tau_fit = _smooth_fit_by_width(
+            x=wn,
+            y=tau_fit,
+            smooth_cm1=smooth_cm1,
+            order=min(max(order, 1), 3),
+        )
+
+    loss_fit = TAU_US_TO_PPM_PER_CM / tau_fit
     out["tau_fit_us"] = tau_fit
     out["tau_residual_us"] = out["tau_us"] - tau_fit
+    out["loss_fit_ppm_per_cm"] = loss_fit
+    out["loss_residual_ppm_per_cm"] = out["loss_ppm_per_cm"] - loss_fit
+    out["step2_fit_mode"] = "o2"
     return out
 
 
@@ -551,6 +965,117 @@ def _continuous_anchor_loss_fit(
 
     if len(anchor_x) < 2:
         return _robust_polyfit_eval(
+            x_fit=x[mask],
+            y_fit=y[mask],
+            x_eval=x,
+            order=min(order, int(mask.sum()) - 1),
+            sigma=sigma,
+        )
+
+    anchors = (
+        pd.DataFrame({"x": anchor_x, "y": anchor_y})
+        .groupby("x", as_index=False)["y"].mean()
+        .sort_values("x")
+    )
+    x_anchor = anchors["x"].to_numpy(dtype=float)
+    y_anchor = anchors["y"].to_numpy(dtype=float)
+
+    if x_anchor[0] > x_min:
+        x_anchor = np.insert(x_anchor, 0, x_min)
+        y_anchor = np.insert(y_anchor, 0, _nearest_finite_y(x, y, x_min, mask))
+    if x_anchor[-1] < x_max:
+        x_anchor = np.append(x_anchor, x_max)
+        y_anchor = np.append(y_anchor, _nearest_finite_y(x, y, x_max, mask))
+
+    from scipy.interpolate import PchipInterpolator
+
+    interpolator = PchipInterpolator(x_anchor, y_anchor, extrapolate=True)
+    return interpolator(x)
+
+
+def _hitran_absorption_mask(
+    wavenumber: np.ndarray,
+    hitran_loss: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Return points excluded from O2 CIA baseline fitting."""
+    wn = np.asarray(wavenumber, dtype=float)
+    loss = np.asarray(hitran_loss, dtype=float)
+    valid = np.isfinite(wn) & np.isfinite(loss)
+    mask = np.zeros_like(wn, dtype=bool)
+    if int(valid.sum()) < 2:
+        return mask, np.nan
+
+    peak = float(np.nanmax(loss[valid]))
+    if not np.isfinite(peak) or peak <= 0:
+        return mask, np.nan
+
+    threshold = peak * HITRAN_O2_MASK_RATIO
+    mask = valid & (loss >= threshold)
+    if HITRAN_O2_MASK_MARGIN_CM1 > 0 and mask.any():
+        mask = _expand_mask_by_wavenumber_margin(
+            wavenumber=wn,
+            mask=mask,
+            margin_cm1=HITRAN_O2_MASK_MARGIN_CM1,
+        )
+    return mask, threshold
+
+
+def _expand_mask_by_wavenumber_margin(
+    wavenumber: np.ndarray,
+    mask: np.ndarray,
+    margin_cm1: float,
+) -> np.ndarray:
+    out = np.asarray(mask, dtype=bool).copy()
+    if margin_cm1 <= 0 or not out.any():
+        return out
+
+    wn = np.asarray(wavenumber, dtype=float)
+    finite = np.isfinite(wn)
+    idx = np.where(out & finite)[0]
+    if len(idx) == 0:
+        return out
+
+    for center in wn[idx]:
+        lo = center - margin_cm1
+        hi = center + margin_cm1
+        out |= finite & (wn >= lo) & (wn <= hi)
+    return out
+
+
+def _continuous_anchor_tau_envelope_fit(
+    x: np.ndarray,
+    y: np.ndarray,
+    mask: np.ndarray,
+    x_min: float,
+    x_max: float,
+    half_window: float,
+    step_cm1: float,
+    order: int,
+    sigma: float,
+) -> np.ndarray:
+    centers = _fit_centers(x_min=x_min, x_max=x_max, step_cm1=step_cm1)
+    min_points = max(order + 2, 8)
+    anchor_x: list[float] = []
+    anchor_y: list[float] = []
+
+    for center in centers:
+        local = mask & (np.abs(x - center) <= half_window)
+        if int(local.sum()) < min_points:
+            continue
+        fit_order = min(order, int(local.sum()) - 1)
+        y_center = _upper_envelope_polyfit_eval(
+            x_fit=x[local],
+            y_fit=y[local],
+            x_eval=np.array([center], dtype=float),
+            order=fit_order,
+            sigma=sigma,
+        )[0]
+        if np.isfinite(y_center) and y_center > 0:
+            anchor_x.append(center)
+            anchor_y.append(float(y_center))
+
+    if len(anchor_x) < 2:
+        return _upper_envelope_polyfit_eval(
             x_fit=x[mask],
             y_fit=y[mask],
             x_eval=x,
@@ -673,6 +1198,85 @@ def _robust_polyfit_eval(
     return np.polyval(coeff, eval_scaled)
 
 
+def _upper_envelope_polyfit_eval(
+    x_fit: np.ndarray,
+    y_fit: np.ndarray,
+    x_eval: np.ndarray,
+    order: int,
+    sigma: float,
+) -> np.ndarray:
+    """Robust local polynomial fit biased toward the upper tau envelope."""
+    x0 = float(np.nanmean(x_fit))
+    scale = float(np.nanmax(np.abs(x_fit - x0)))
+    if not np.isfinite(scale) or scale == 0:
+        scale = 1.0
+
+    x_scaled = (x_fit - x0) / scale
+    eval_scaled = (x_eval - x0) / scale
+    finite = np.isfinite(x_scaled) & np.isfinite(y_fit)
+    fit_order = min(order, max(int(finite.sum()) - 1, 0))
+    if int(finite.sum()) <= fit_order:
+        coeff = np.polyfit(x_scaled[finite], y_fit[finite], deg=max(int(finite.sum()) - 1, 0))
+        return np.polyval(coeff, eval_scaled)
+
+    preliminary = _robust_polyfit_eval(
+        x_fit=x_fit[finite],
+        y_fit=y_fit[finite],
+        x_eval=x_fit[finite],
+        order=fit_order,
+        sigma=sigma,
+    )
+    residual = y_fit[finite] - preliminary
+    residual_cut = np.nanquantile(residual, 0.55)
+    active = finite.copy()
+    active_indices = np.where(finite)[0]
+    active[active_indices] = residual >= residual_cut
+    if int(active.sum()) <= fit_order:
+        residual_cut = np.nanquantile(residual, 0.40)
+        active = finite.copy()
+        active[active_indices] = residual >= residual_cut
+    if int(active.sum()) <= fit_order:
+        active = finite.copy()
+
+    active = _iterative_lower_clip_active(
+        x_scaled=x_scaled,
+        y_fit=y_fit,
+        active=active,
+        fit_order=fit_order,
+        sigma=sigma,
+    )
+    coeff = np.polyfit(x_scaled[active], y_fit[active], deg=fit_order)
+    return np.polyval(coeff, eval_scaled)
+
+
+def _iterative_lower_clip_active(
+    x_scaled: np.ndarray,
+    y_fit: np.ndarray,
+    active: np.ndarray,
+    fit_order: int,
+    sigma: float,
+) -> np.ndarray:
+    finite = np.isfinite(x_scaled) & np.isfinite(y_fit)
+    sigma = max(float(sigma), 0.0)
+    for _ in range(6):
+        if int(active.sum()) <= fit_order:
+            break
+        coeff = np.polyfit(x_scaled[active], y_fit[active], deg=fit_order)
+        residual = y_fit - np.polyval(coeff, x_scaled)
+        active_resid = residual[active]
+        negative_resid = active_resid[active_resid < 0]
+        scale_resid = _robust_scale(negative_resid)
+        if not np.isfinite(scale_resid) or scale_resid <= 0:
+            scale_resid = _robust_scale(active_resid)
+        if not np.isfinite(scale_resid) or scale_resid <= 0 or sigma <= 0:
+            break
+        next_active = finite & (residual >= -sigma * scale_resid)
+        if np.array_equal(next_active, active) or int(next_active.sum()) <= fit_order:
+            break
+        active = next_active
+    return active
+
+
 def _robust_scale(values: np.ndarray) -> float:
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
@@ -691,6 +1295,80 @@ def _trapezoid(y: np.ndarray, x: np.ndarray) -> float:
         return float(np.trapezoid(y_valid, x_valid))
     dx = np.diff(x_valid)
     return float(np.sum(dx * (y_valid[:-1] + y_valid[1:]) * 0.5))
+
+
+def _simulate_o2_hitran_loss_ppm_per_cm(
+    wavenumber: np.ndarray,
+    temperature_c: float,
+    pressure_torr: float,
+) -> np.ndarray:
+    """Simulate O2 absorption loss with the local HITRAN/HAPI table."""
+    wn = np.asarray(wavenumber, dtype=float)
+    valid = np.isfinite(wn)
+    if int(valid.sum()) < 2:
+        return np.full_like(wn, np.nan, dtype=float)
+
+    hitran_dir = HITRAN_DIR
+    if not hitran_dir.exists():
+        raise FileNotFoundError(f"HITRAN data directory not found: {hitran_dir}")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        import hapi  # type: ignore
+
+    saved_dir = os.getcwd()
+    os.chdir(hitran_dir)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            hapi.db_begin(str(hitran_dir))
+        table = _resolve_o2_hitran_table(hapi)
+
+        wn_min = float(np.nanmin(wn[valid])) - 0.5
+        wn_max = float(np.nanmax(wn[valid])) + 0.5
+        temperature_k = float(temperature_c) + 273.15
+        pressure_atm = float(pressure_torr) / 760.0
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            nu_sim, alpha_cm_inv = hapi.absorptionCoefficient_Voigt(
+                SourceTables=table,
+                Environment={"T": temperature_k, "p": pressure_atm},
+                WavenumberRange=[wn_min, wn_max],
+                WavenumberStep=HITRAN_O2_STEP_CM1,
+                HITRAN_units=False,
+            )
+    finally:
+        os.chdir(saved_dir)
+
+    nu_sim = np.asarray(nu_sim, dtype=float)
+    alpha_cm_inv = np.asarray(alpha_cm_inv, dtype=float).reshape(-1)
+    sim_mask = np.isfinite(nu_sim) & np.isfinite(alpha_cm_inv)
+    if int(sim_mask.sum()) < 2:
+        return np.full_like(wn, np.nan, dtype=float)
+
+    hitran_loss = np.interp(
+        wn,
+        nu_sim[sim_mask],
+        alpha_cm_inv[sim_mask],
+        left=np.nan,
+        right=np.nan,
+    )
+    return hitran_loss * 1e6
+
+
+def _resolve_o2_hitran_table(hapi) -> str:
+    for tname in hapi.LOCAL_TABLE_CACHE:
+        if str(tname).startswith("O2"):
+            return str(tname)
+    raise FileNotFoundError(
+        f"No local O2 HITRAN table found in {HITRAN_DIR}. "
+        "Run the HITRAN download step first."
+    )
+
+
+def _pressure_torr_from_label(label: str) -> float:
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*Torr", str(label), flags=re.IGNORECASE)
+    if not match:
+        return np.nan
+    return float(match.group(1))
 
 
 def _fit_pressure_dependence(x: np.ndarray, y: np.ndarray) -> dict:
@@ -734,6 +1412,12 @@ def _nanmean(values) -> float:
 def _nanmedian(values) -> float:
     arr = np.asarray(values, dtype=float)
     return float(np.nanmedian(arr)) if np.isfinite(arr).any() else np.nan
+
+
+def _nanmedian_positive(values) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr) & (arr > 0)]
+    return float(np.nanmedian(arr)) if len(arr) else np.nan
 
 
 def _nanstd(values) -> float:
