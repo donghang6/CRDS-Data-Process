@@ -78,7 +78,7 @@ def target_for(path: Path) -> Path | None:
 
 
 def build_plan(
-    files: list[Path], conflict: str
+        files: list[Path], conflict: str
 ) -> tuple[list[RenamePlan], list[DeletePlan], list[Path]]:
     unmatched: list[Path] = []
     raw_targets: list[Path] = []
@@ -130,7 +130,7 @@ def build_plan(
 
 
 def build_keep_first_plan(
-    matched: list[tuple[Path, Path]]
+        matched: list[tuple[Path, Path]]
 ) -> tuple[list[RenamePlan], list[DeletePlan]]:
     by_target: dict[Path, list[Path]] = defaultdict(list)
     for source, target in matched:
