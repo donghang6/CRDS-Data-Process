@@ -560,7 +560,8 @@ class CRDSPipeline:
         Returns
         -------
         bool
-            True 表示全部通过, False 表示有警告或错误
+            True 表示目录结构可继续处理。文件名不规范的数据文件会在
+            Step 1 自动跳过，不参与后续处理。
         """
         raw = self.raw_root
         if not raw.exists():
@@ -607,7 +608,7 @@ class CRDSPipeline:
                             "    CIA 应为温度标签 (如 273K) 或纯数字/浮点数")
                     else:
                         logger.warning(
-                            f"    应为纯数字或浮点数 (如 9386.2076)")
+                            "    应为纯数字或浮点数 (如 9386.2076)")
                     all_ok = False
                     continue
 
@@ -624,16 +625,16 @@ class CRDSPipeline:
                             logger.warning(
                                 f"  ⚠ 压力目录命名不规范: {tag}/")
                             logger.warning(
-                                f"    纯 O₂ 应为 '{{数字}}Torr' "
-                                f"(如 100Torr)")
+                                "    纯 O₂ 应为 '{数字}Torr' "
+                                "(如 100Torr)")
                             all_ok = False
                     elif gas_type == "O2_N2":
                         if not self._RE_PRESSURE_MIX.match(pressure):
                             logger.warning(
                                 f"  ⚠ 压力目录命名不规范: {tag}/")
                             logger.warning(
-                                f"    O₂+N₂ 应为 "
-                                f"'O2 {{数字}}Torr N2 {{数字}}Torr'")
+                                "    O₂+N₂ 应为 "
+                                "'O2 {数字}Torr N2 {数字}Torr'")
                             all_ok = False
                     elif gas_type == "CIA":
                         if not self._RE_PRESSURE_CIA.match(pressure):
@@ -657,24 +658,31 @@ class CRDSPipeline:
                                 logger.warning(
                                     f"  ⚠ 文件名不规范: {tag}/{f.name}")
                                 logger.warning(
-                                    f"    应为 '{{序号}} {{波数}} "
-                                    f"{{YYYYMMDDHHmmss}}.txt' 或 '{{波数}}.txt'")
+                                    "    应为 '{序号} {波数} "
+                                    "{YYYYMMDDHHmmss}.txt' 或 '{波数}.txt'")
                             bad_files += 1
-                            all_ok = False
 
         if bad_files > 10:
             logger.warning(
                 f"  ... 还有 {bad_files - 10} 个文件名不规范 (已省略)")
 
         # 汇总
-        if all_ok:
+        if all_ok and bad_files == 0:
             logger.info(f"  ✓ 全部通过! 共 {total_files} 个数据文件")
+        elif all_ok:
+            logger.warning(
+                f"  ⚠ 目录结构通过；发现 {bad_files} 个文件名不规范")
+            logger.warning(
+                "  这些文件将在 Step 1 自动跳过，不参与后续处理")
+            logger.warning(
+                "  如需保留这些点，请修正文件名后重新运行")
         else:
             logger.warning(
                 f"  ✗ 发现命名问题 "
                 f"(共 {total_files} 个文件, {bad_files} 个文件名不规范)")
             logger.warning(
-                f"  提示: 命名不规范可能导致解析失败, 建议修正后再运行流水线")
+                "  文件名不规范的数据文件将在 Step 1 自动跳过，不参与处理；"
+                "目录结构问题仍建议修正")
 
         logger.info("─" * 60)
         return all_ok

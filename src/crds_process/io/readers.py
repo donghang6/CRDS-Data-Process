@@ -151,11 +151,16 @@ def load_scan_directory(directory: str | Path) -> list[ScanData]:
     scan_files = sorted(directory.glob("*.txt"))
 
     scans = []
+    skipped = 0
     for f in scan_files:
         try:
             scans.append(read_ringdown_file(f))
         except (ValueError, Exception) as e:
-            logger.warning(f"跳过文件 {f.name}: {e}")
+            skipped += 1
+            logger.warning(f"跳过文件 {f.name}: {e}；该点不参与处理")
+
+    if skipped:
+        logger.warning(f"已跳过 {skipped} 个不合规或无法读取的文件")
 
     # 按波数排序
     scans.sort(key=lambda s: s.meta.wavenumber)
