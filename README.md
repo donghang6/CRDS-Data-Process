@@ -317,6 +317,7 @@ CIA 连续吸收相关参数：
 | `--continuum-tau0-us VALUE` | 无 | 标量空腔 τ0，单位 `us`；与 `--continuum-ref` 互斥。 |
 | `--continuum-window START,END` | 全波段 | 只处理指定波数窗口；也支持 `START:END`。 |
 | `--continuum-tau-col NAME` | `tau_mean` | 指定用于计算 loss 的 τ 列。 |
+| `--continuum-tau-file PATH` / `--cia-tau-file PATH` | 无 | 指定一个两列文件直接作为 Continuum Step 2 输入；第一列为波数，第二列为衰荡时间 `tau_us`。使用时需要且只能指定一个 `CIA/{温度}/{气体 压力}` 目标。 |
 | `--continuum-step2-mode auto` / `--cia-step2-mode auto` | `auto` | Step 2 模式。`auto` 根据压力名识别 O2；`ar` 使用 loss 域连续背景拟合；`o2` 用 HITRAN2024 定位吸收区并剔除，只拟合 CIA baseline；`o2-hitran` 只输出总损耗扣 HITRAN2024 后的中间结果，不拟合。O2 的 HITRAN 仿真使用 Step 1 表中温度/压力的中位数作为条件，HITRAN 网格步长写入输出列 `hitran_step_cm1`。 |
 | `--cia-fit-window VALUE` / `--continuum-fit-window VALUE` | `20` | Step 2 滑动拟合窗口宽度，单位 `cm-1`。 |
 | `--cia-fit-step VALUE` / `--continuum-fit-step VALUE` | `5` | Step 2 连续拟合锚点间隔，单位 `cm-1`。 |

@@ -51,7 +51,7 @@ HITRAN_O2_MASK_RATIO = 0.01
 HITRAN_O2_MASK_MARGIN_CM1 = 0.05
 
 WAVENUMBER_COLUMNS = ("wavenumber", "Wavenumber", "nu", "Total Frequency /MHz")
-TAU_COLUMNS = ("tau_mean", "Mean tau/us")
+TAU_COLUMNS = ("tau_mean", "tau_us", "Mean tau/us")
 TAU_STATS_COLUMNS = ("tau_sem", "tau_std", "Tau_stats")
 PRESSURE_COLUMNS = ("pressure", "pressure_mean", "Cavity Pressure /Torr")
 TEMPERATURE_COLUMNS = ("temperature", "temperature_mean", "Cavity Temperature Side 2 /C")
@@ -94,6 +94,21 @@ def discover_continuum_tasks(
                 if csv_path.exists():
                     tasks.append((gas_dir.name, transition_dir.name, pressure_dir.name, csv_path))
     return tasks
+
+
+def _read_continuum_input_table(path: Path) -> pd.DataFrame:
+    """Read either Step 1 CSV or a simple two-column wavenumber/tau table."""
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+        if _find_column(df, WAVENUMBER_COLUMNS) and _find_column(df, TAU_COLUMNS):
+            return df
+
+    df = pd.read_csv(path, sep=r"[,\t\s]+", engine="python", header=None, comment="#")
+    if df.shape[1] < 2:
+        raise ValueError("input table must contain at least two columns: wavenumber and tau")
+    out = df.iloc[:, :2].copy()
+    out.columns = ["wavenumber", "tau_us"]
+    return out
 
 
 class ContinuumBatchProcessor:
@@ -224,7 +239,7 @@ class ContinuumBatchProcessor:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        df = pd.read_csv(csv_path)
+        df = _read_continuum_input_table(csv_path)
         wn_col = self.wavenumber_col or _find_column(df, WAVENUMBER_COLUMNS)
         tau_col = self.tau_col or _find_column(df, TAU_COLUMNS)
         tau_stats_col = self._resolve_optional_column(df, self.tau_stats_col, TAU_STATS_COLUMNS)

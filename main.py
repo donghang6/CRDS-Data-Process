@@ -40,6 +40,11 @@
     python main.py --continuum "CIA/273K/Ar 500Torr" --continuum-tau0-us 102.3
     python main.py --continuum "CIA/273K/Ar 500Torr" \
         --continuum-ref 'output/results/ringdown/CIA/273K/Ar 500Torr/ringdown_results.csv'
+    # 使用指定的两列波数/衰荡时间文件生成 continuum_step2_fit.csv
+    python main.py --continuum --from-ringdown "CIA/333K/Ar 500Torr" \
+        --continuum-tau-file 'output/results/continuum/CIA/333K/Ar 500Torr/O2 500Torr 333K.txt' \
+        --continuum-step2-mode ar --cia-fit-window 40 --cia-fit-step 5 \
+        --cia-fit-order 2 --cia-fit-sigma 4 --cia-fit-smooth 20
     # Ar 500Torr 示例：基础 CIA Step 2 拟合参数
     python main.py --continuum --from-ringdown "CIA/273K/Ar 500Torr" \
         --cia-fit-window 20 --cia-fit-step 5 --cia-fit-order 2
@@ -89,6 +94,9 @@
     #       可选，只处理指定波数范围。
     #   --continuum-tau-col NAME
     #       可选，指定 ringdown_results.csv 中用于计算 loss 的 tau 列，默认 tau_mean。
+    #   --continuum-tau-file PATH
+    #       可选，指定一个两列文件作为 continuum Step 2 输入。
+    #       第一列为波数，第二列为衰荡时间 tau_us；此时需要只指定一个 CIA 目标。
     #   --continuum-ref PATH / --continuum-tau0-us VALUE
     #       可选，提供参考 tau 后可额外计算 alpha；不提供时只输出 tau 和 loss。
 
@@ -166,6 +174,7 @@ def _parse_args(argv: list[str]) -> dict:
     continuum_tau0_us = None
     continuum_window = None
     continuum_tau_col = None
+    continuum_tau_file = None
     continuum_fit_window_cm1 = 20.0
     continuum_fit_step_cm1 = 5.0
     continuum_fit_order = 2
@@ -224,6 +233,13 @@ def _parse_args(argv: list[str]) -> dict:
                 continuum_tau_col = argv[i]
             else:
                 print("警告: --continuum-tau-col 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--continuum-tau-file", "--cia-tau-file"):
+            i += 1
+            if i < len(argv):
+                continuum_tau_file = argv[i]
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
             i += 1
         elif arg in ("--cia-fit-window", "--continuum-fit-window"):
             i += 1
@@ -424,6 +440,7 @@ def _parse_args(argv: list[str]) -> dict:
         "continuum_tau0_us": continuum_tau0_us,
         "continuum_window": continuum_window,
         "continuum_tau_col": continuum_tau_col,
+        "continuum_tau_file": continuum_tau_file,
         "continuum_fit_window_cm1": continuum_fit_window_cm1,
         "continuum_fit_step_cm1": continuum_fit_step_cm1,
         "continuum_fit_order": continuum_fit_order,

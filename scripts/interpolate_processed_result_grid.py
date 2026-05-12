@@ -249,12 +249,17 @@ def read_input_table(args: argparse.Namespace):
         for index, col in enumerate(df.columns[2:], start=3):
             rename[col] = f"col_{index}"
         df = df.rename(columns=rename)
+        for col in (args.x_column, args.y_column):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if args.two_column:
         if len(df.columns) < 2:
             raise SystemExit("--two-column needs at least two input columns.")
         df = df.iloc[:, :2].copy()
         df.columns = [args.x_column, args.y_column]
+        df[args.x_column] = pd.to_numeric(df[args.x_column], errors="coerce")
+        df[args.y_column] = pd.to_numeric(df[args.y_column], errors="coerce")
         if not args.columns:
             args.columns = [args.y_column]
 

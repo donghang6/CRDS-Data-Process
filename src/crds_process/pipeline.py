@@ -425,6 +425,7 @@ class CRDSPipeline:
         continuum_tau0_us: float | None = None,
         continuum_window: tuple[float, float] | None = None,
         continuum_tau_col: str | None = None,
+        continuum_tau_file: Path | str | None = None,
         continuum_fit_window_cm1: float = 20.0,
         continuum_fit_step_cm1: float = 5.0,
         continuum_fit_order: int = 2,
@@ -500,6 +501,7 @@ class CRDSPipeline:
         )
         self.continuum_window = continuum_window
         self.continuum_tau_col = continuum_tau_col
+        self.continuum_tau_file = Path(continuum_tau_file) if continuum_tau_file else None
         self.continuum_fit_window_cm1 = float(continuum_fit_window_cm1)
         self.continuum_fit_step_cm1 = float(continuum_fit_step_cm1)
         self.continuum_fit_order = int(continuum_fit_order)
@@ -1506,10 +1508,13 @@ class CRDSPipeline:
             fit_smooth_cm1=self.continuum_fit_smooth_cm1,
             fit_mode=self.continuum_step2_mode,
         )
-        tasks = [
-            task for task in proc.discover()
-            if task[0] == "CIA"
-        ]
+        if self.continuum_tau_file is not None:
+            tasks = self._continuum_tasks_from_tau_file()
+        else:
+            tasks = [
+                task for task in proc.discover()
+                if task[0] == "CIA"
+            ]
         tasks = self._filter_tasks(tasks)
         if not tasks:
             logger.error(
@@ -1517,6 +1522,27 @@ class CRDSPipeline:
             )
             return
         proc.run(tasks)
+
+    def _continuum_tasks_from_tau_file(self) -> list[tuple[str, str, str, Path]]:
+        """Build one continuum task from a user-provided wavenumber/tau file."""
+        if not self.targets or len(self.targets) != 1:
+            logger.error("  --continuum-tau-file 需要且只能指定一个 CIA 目标")
+            logger.error(
+                "  示例: python main.py --continuum --from-ringdown "
+                "'CIA/333K/Ar 500Torr' --continuum-tau-file PATH"
+            )
+            return []
+        tau_file = self.continuum_tau_file.expanduser().resolve()
+        if not tau_file.is_file():
+            logger.error(f"  --continuum-tau-file 文件不存在: {tau_file}")
+            return []
+        parts = [part for part in self.targets[0].split("/") if part]
+        if len(parts) != 3 or parts[0] != "CIA":
+            logger.error("  --continuum-tau-file 的目标格式必须为 CIA/{温度}/{气体 压力}")
+            logger.error("  示例: CIA/333K/Ar 500Torr")
+            return []
+        logger.info(f"  Continuum tau 输入文件: {tau_file}")
+        return [(parts[0], parts[1], parts[2], tau_file)]
 
     def run_continuum(self) -> None:
         """Run Step 1, then continuum absorption analysis.

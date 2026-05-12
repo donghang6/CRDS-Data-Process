@@ -45,6 +45,16 @@
       --update-derived \
       --apply
 
+    # 执行：用原始衰荡时间 tau_us 重新生成 tau_fit_us，不覆盖 tau_us
+    conda run -n CRDS-Data-Process python scripts/apply_lmfit_spline_region.py \
+      output/results/continuum/CIA/273K/Ar\\ 500Torr/continuum_step2_fit.csv \
+      --column tau_us \
+      --output-column tau_fit_us \
+      --knots-every 15 \
+      --smooth-lambda 0.1 \
+      --update-derived \
+      --apply
+
     # 多区域：每个区域使用不同的 knots_every，独立 lmfit 后拼接到新列
     conda run -n CRDS-Data-Process python scripts/apply_lmfit_spline_region.py \
       output/results/continuum/CIA/273K/Ar\\ 500Torr/continuum_step2_fit.csv \
@@ -69,7 +79,7 @@
     --weights-column NAME 可选，权重列。若为 tau_stats_us，权重约为 1/sigma。
     --output-column NAME  不覆盖时写入的新列名；默认 {column}_lmfit_spline。
     --overwrite           直接把拟合结果写回 --column。
-    --update-derived      覆盖 tau_fit_us 或 loss_fit_ppm_per_cm 时同步更新成对列和残差列。
+    --update-derived      写入/覆盖 tau_fit_us 或 loss_fit_ppm_per_cm 时同步更新成对列和残差列。
     --plot PATH           输出拟合对比图。
     --no-backup           写回 CSV 时不生成 .bak 备份。
     --apply               真正写回 CSV；不加时只预览。
@@ -232,7 +242,7 @@ def parse_args() -> argparse.Namespace:
         "--update-derived",
         action="store_true",
         help=(
-            "When overwriting tau_fit_us or loss_fit_ppm_per_cm, update the paired "
+            "When writing tau_fit_us or loss_fit_ppm_per_cm, update the paired "
             "fit column and residual columns."
         ),
     )
@@ -588,8 +598,6 @@ def main() -> None:
     csv_path = args.csv_path.expanduser().resolve()
     if not csv_path.is_file():
         raise SystemExit(f"CSV does not exist: {csv_path}")
-    if args.update_derived and not args.overwrite:
-        raise SystemExit("--update-derived requires --overwrite")
     if args.region and args.fit_range:
         raise SystemExit("--region cannot be combined with --fit-range")
     if args.region and args.n_knots is not None:
@@ -599,6 +607,12 @@ def main() -> None:
         args.column
         if args.overwrite else args.output_column or f"{args.column}_lmfit_spline"
     )
+    if args.update_derived and output_column not in {"tau_fit_us", "loss_fit_ppm_per_cm"}:
+        raise SystemExit(
+            "--update-derived requires the written column to be tau_fit_us or "
+            "loss_fit_ppm_per_cm. Use --output-column tau_fit_us when fitting "
+            "from --column tau_us."
+        )
     fit_range = normalize_range(args.fit_range[0], args.fit_range[1]) if args.fit_range else None
 
     df = pd.read_csv(csv_path)
@@ -635,7 +649,7 @@ def main() -> None:
             )
         ]
     if args.update_derived:
-        update_derived_columns(df, edited_column=args.column, target_mask=updated_mask)
+        update_derived_columns(df, edited_column=output_column, target_mask=updated_mask)
     if args.plot:
         save_plot(
             df=df,
