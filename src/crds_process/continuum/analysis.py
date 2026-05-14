@@ -49,6 +49,10 @@ TAU_US_TO_PPM_PER_CM = 1e12 / C_CM_PER_S
 HITRAN_O2_STEP_CM1 = 0.002
 HITRAN_O2_MASK_RATIO = 0.01
 HITRAN_O2_MASK_MARGIN_CM1 = 0.05
+HITRAN_O2_ALIGN_MAX_SHIFT_CM1 = 0.05
+HITRAN_O2_ALIGN_STEP_CM1 = 0.001
+HITRAN_O2_ALIGN_THRESHOLD_RATIO = 0.03
+HITRAN_O2_ALIGN_BASELINE_ORDER = 2
 
 WAVENUMBER_COLUMNS = ("wavenumber", "Wavenumber", "nu", "Total Frequency /MHz")
 TAU_COLUMNS = ("tau_mean", "tau_us", "Mean tau/us")
@@ -132,6 +136,10 @@ class ContinuumBatchProcessor:
         fit_sigma: float = 4.0,
         fit_smooth_cm1: float = 0.0,
         fit_mode: str = "auto",
+        hitran_align: bool = False,
+        hitran_align_max_shift_cm1: float = HITRAN_O2_ALIGN_MAX_SHIFT_CM1,
+        hitran_align_step_cm1: float = HITRAN_O2_ALIGN_STEP_CM1,
+        hitran_align_threshold_ratio: float = HITRAN_O2_ALIGN_THRESHOLD_RATIO,
     ):
         if reference_csv and tau0_us is not None:
             raise ValueError("reference_csv and tau0_us are mutually exclusive")
@@ -152,6 +160,10 @@ class ContinuumBatchProcessor:
         self.fit_sigma = float(fit_sigma)
         self.fit_smooth_cm1 = float(fit_smooth_cm1)
         self.fit_mode = _normalize_fit_mode(fit_mode)
+        self.hitran_align = bool(hitran_align)
+        self.hitran_align_max_shift_cm1 = max(float(hitran_align_max_shift_cm1), 0.0)
+        self.hitran_align_step_cm1 = max(float(hitran_align_step_cm1), 0.0)
+        self.hitran_align_threshold_ratio = max(float(hitran_align_threshold_ratio), 0.0)
         self._reference = self._load_reference()
 
     def discover(self) -> list[tuple[str, str, str, Path]]:
@@ -183,6 +195,13 @@ class ContinuumBatchProcessor:
                 "  Step 2: O2 HITRAN subtraction only; "
                 f"HITRAN grid step={HITRAN_O2_STEP_CM1:g} cm-1"
             )
+            if self.hitran_align:
+                logger.info(
+                    "  HITRAN alignment: enabled; "
+                    f"max_shift=±{self.hitran_align_max_shift_cm1:g} cm-1, "
+                    f"step={self.hitran_align_step_cm1:g} cm-1, "
+                    f"threshold_ratio={self.hitran_align_threshold_ratio:g}"
+                )
         elif self.fit_mode == "o2":
             logger.info(
                 "  Step 2 fit: O2 HITRAN-masked CIA baseline fit; "
@@ -193,6 +212,13 @@ class ContinuumBatchProcessor:
                 f"mask_ratio={HITRAN_O2_MASK_RATIO:g}, "
                 f"mask_margin={HITRAN_O2_MASK_MARGIN_CM1:g} cm-1"
             )
+            if self.hitran_align:
+                logger.info(
+                    "  HITRAN alignment: enabled; "
+                    f"max_shift=±{self.hitran_align_max_shift_cm1:g} cm-1, "
+                    f"step={self.hitran_align_step_cm1:g} cm-1, "
+                    f"threshold_ratio={self.hitran_align_threshold_ratio:g}"
+                )
         else:
             logger.info(
                 "  Step 2 fit: "
@@ -294,7 +320,14 @@ class ContinuumBatchProcessor:
         work.to_csv(spectrum_csv, index=False)
         active_fit_mode = _resolve_fit_mode(self.fit_mode, pressure)
         if active_fit_mode == "o2-hitran":
-            work = _add_o2_hitran_subtraction(work, pressure_label=pressure)
+            work = _add_o2_hitran_subtraction(
+                work,
+                pressure_label=pressure,
+                hitran_align=self.hitran_align,
+                hitran_align_max_shift_cm1=self.hitran_align_max_shift_cm1,
+                hitran_align_step_cm1=self.hitran_align_step_cm1,
+                hitran_align_threshold_ratio=self.hitran_align_threshold_ratio,
+            )
             fit_csv = output_dir / "continuum_step2_hitran_subtracted.csv"
         else:
             work = _add_step2_fit(
@@ -306,6 +339,10 @@ class ContinuumBatchProcessor:
                 order=self.fit_order,
                 sigma=self.fit_sigma,
                 smooth_cm1=self.fit_smooth_cm1,
+                hitran_align=self.hitran_align,
+                hitran_align_max_shift_cm1=self.hitran_align_max_shift_cm1,
+                hitran_align_step_cm1=self.hitran_align_step_cm1,
+                hitran_align_threshold_ratio=self.hitran_align_threshold_ratio,
             )
             fit_csv = output_dir / "continuum_step2_fit.csv"
         work.to_csv(fit_csv, index=False)
@@ -450,6 +487,20 @@ class ContinuumBatchProcessor:
             summary["alpha_stats_median_ppm_per_cm"] = _nanmedian(work["alpha_stats_ppm_per_cm"])
         if "hitran_o2_loss_ppm_per_cm" in work.columns:
             summary["hitran_o2_loss_mean_ppm_per_cm"] = _nanmean(work["hitran_o2_loss_ppm_per_cm"])
+        if "hitran_o2_shift_cm1" in work.columns:
+            summary["hitran_o2_shift_cm1"] = _nanmedian(work["hitran_o2_shift_cm1"])
+        if "hitran_o2_alignment_score_ppm_per_cm" in work.columns:
+            summary["hitran_o2_alignment_score_ppm_per_cm"] = _nanmedian(
+                work["hitran_o2_alignment_score_ppm_per_cm"]
+            )
+        if "hitran_o2_alignment_scale" in work.columns:
+            summary["hitran_o2_alignment_scale"] = _nanmedian(
+                work["hitran_o2_alignment_scale"]
+            )
+        if "hitran_o2_alignment_used_points" in work.columns:
+            summary["hitran_o2_alignment_used_points"] = int(
+                _nanmedian(work["hitran_o2_alignment_used_points"])
+            )
         if "hitran_temperature_c" in work.columns:
             summary["hitran_temperature_c"] = _nanmedian(work["hitran_temperature_c"])
         if "hitran_pressure_torr" in work.columns:
@@ -611,7 +662,13 @@ def _write_o2_baseline_csv(work: pd.DataFrame, csv_path: Path) -> None:
         "tau_fit_us",
         "o2_absorption_mask",
         "o2_fit_used",
+        "hitran_o2_loss_unaligned_ppm_per_cm",
         "hitran_o2_loss_ppm_per_cm",
+        "hitran_o2_shift_cm1",
+        "hitran_o2_alignment_enabled",
+        "hitran_o2_alignment_score_ppm_per_cm",
+        "hitran_o2_alignment_scale",
+        "hitran_o2_alignment_used_points",
         "hitran_mask_threshold_ppm_per_cm",
         "hitran_mask_ratio",
         "hitran_mask_margin_cm1",
@@ -674,6 +731,10 @@ def _add_step2_fit(
     order: int,
     sigma: float,
     smooth_cm1: float,
+    hitran_align: bool,
+    hitran_align_max_shift_cm1: float,
+    hitran_align_step_cm1: float,
+    hitran_align_threshold_ratio: float,
 ) -> pd.DataFrame:
     if _normalize_fit_mode(fit_mode) == "o2":
         return _add_o2_hitran_masked_baseline_fit(
@@ -684,6 +745,10 @@ def _add_step2_fit(
             order=order,
             sigma=sigma,
             smooth_cm1=smooth_cm1,
+            hitran_align=hitran_align,
+            hitran_align_max_shift_cm1=hitran_align_max_shift_cm1,
+            hitran_align_step_cm1=hitran_align_step_cm1,
+            hitran_align_threshold_ratio=hitran_align_threshold_ratio,
         )
     return _add_sliding_loss_fit(
         work=work,
@@ -698,6 +763,10 @@ def _add_step2_fit(
 def _add_o2_hitran_subtraction(
     work: pd.DataFrame,
     pressure_label: str,
+    hitran_align: bool = False,
+    hitran_align_max_shift_cm1: float = HITRAN_O2_ALIGN_MAX_SHIFT_CM1,
+    hitran_align_step_cm1: float = HITRAN_O2_ALIGN_STEP_CM1,
+    hitran_align_threshold_ratio: float = HITRAN_O2_ALIGN_THRESHOLD_RATIO,
 ) -> pd.DataFrame:
     """Subtract the HITRAN O2 simulation from measured total cavity loss."""
     out = work.copy()
@@ -722,18 +791,42 @@ def _add_o2_hitran_subtraction(
     if not np.isfinite(pressure_torr) or pressure_torr <= 0:
         raise ValueError("O2 HITRAN subtraction requires pressure_torr in the Step 1 CSV or pressure label")
 
-    hitran_loss = _simulate_o2_hitran_loss_ppm_per_cm(
+    hitran_loss_unaligned = _simulate_o2_hitran_loss_ppm_per_cm(
         wavenumber=wn,
         temperature_c=float(temperature_c),
         pressure_torr=float(pressure_torr),
     )
+    if hitran_align:
+        hitran_loss, alignment = _align_hitran_to_measured_loss(
+            wavenumber=wn,
+            measured_loss=loss,
+            hitran_loss=hitran_loss_unaligned,
+            max_shift_cm1=hitran_align_max_shift_cm1,
+            step_cm1=hitran_align_step_cm1,
+            threshold_ratio=hitran_align_threshold_ratio,
+        )
+    else:
+        hitran_loss = hitran_loss_unaligned
+        alignment = {
+            "enabled": False,
+            "shift_cm1": 0.0,
+            "score_ppm_per_cm": np.nan,
+            "scale": np.nan,
+            "used_points": 0,
+        }
     residual = loss - hitran_loss
     tau_equiv = np.full_like(residual, np.nan, dtype=float)
     positive = np.isfinite(residual) & (residual > 0)
     tau_equiv[positive] = TAU_US_TO_PPM_PER_CM / residual[positive]
 
+    out["hitran_o2_loss_unaligned_ppm_per_cm"] = hitran_loss_unaligned
     out["hitran_o2_loss_ppm_per_cm"] = hitran_loss
     out["hitran_o2_absorption_cm_inv"] = hitran_loss / 1e6
+    out["hitran_o2_shift_cm1"] = float(alignment["shift_cm1"])
+    out["hitran_o2_alignment_enabled"] = bool(alignment["enabled"])
+    out["hitran_o2_alignment_score_ppm_per_cm"] = float(alignment["score_ppm_per_cm"])
+    out["hitran_o2_alignment_scale"] = float(alignment["scale"])
+    out["hitran_o2_alignment_used_points"] = int(alignment["used_points"])
     out["loss_minus_hitran_ppm_per_cm"] = residual
     out["tau_equiv_after_hitran_us"] = tau_equiv
     out["hitran_temperature_c"] = float(temperature_c)
@@ -753,9 +846,20 @@ def _add_o2_hitran_masked_baseline_fit(
     order: int,
     sigma: float,
     smooth_cm1: float,
+    hitran_align: bool = False,
+    hitran_align_max_shift_cm1: float = HITRAN_O2_ALIGN_MAX_SHIFT_CM1,
+    hitran_align_step_cm1: float = HITRAN_O2_ALIGN_STEP_CM1,
+    hitran_align_threshold_ratio: float = HITRAN_O2_ALIGN_THRESHOLD_RATIO,
 ) -> pd.DataFrame:
     """Mask HITRAN O2 absorption points, then fit the slow CIA baseline."""
-    out = _add_o2_hitran_subtraction(work, pressure_label=pressure_label)
+    out = _add_o2_hitran_subtraction(
+        work,
+        pressure_label=pressure_label,
+        hitran_align=hitran_align,
+        hitran_align_max_shift_cm1=hitran_align_max_shift_cm1,
+        hitran_align_step_cm1=hitran_align_step_cm1,
+        hitran_align_threshold_ratio=hitran_align_threshold_ratio,
+    )
     wn = out["wavenumber"].to_numpy(dtype=float)
     loss = out["loss_ppm_per_cm"].to_numpy(dtype=float)
     hitran_loss = out["hitran_o2_loss_ppm_per_cm"].to_numpy(dtype=float)
@@ -1367,6 +1471,157 @@ def _simulate_o2_hitran_loss_ppm_per_cm(
         right=np.nan,
     )
     return hitran_loss * 1e6
+
+
+def _align_hitran_to_measured_loss(
+    wavenumber: np.ndarray,
+    measured_loss: np.ndarray,
+    hitran_loss: np.ndarray,
+    max_shift_cm1: float = HITRAN_O2_ALIGN_MAX_SHIFT_CM1,
+    step_cm1: float = HITRAN_O2_ALIGN_STEP_CM1,
+    threshold_ratio: float = HITRAN_O2_ALIGN_THRESHOLD_RATIO,
+    baseline_order: int = HITRAN_O2_ALIGN_BASELINE_ORDER,
+) -> tuple[np.ndarray, dict]:
+    """Shift HITRAN line positions to best match the measured loss spectrum.
+
+    The fitted shift is only a wavenumber correction.  The HITRAN amplitude is
+    not rescaled before subtraction; a scale factor is fitted only as a
+    diagnostic while searching for the best line-position match.
+    """
+    wn = np.asarray(wavenumber, dtype=float)
+    measured = np.asarray(measured_loss, dtype=float)
+    hitran = np.asarray(hitran_loss, dtype=float)
+    valid = np.isfinite(wn) & np.isfinite(measured) & np.isfinite(hitran)
+    empty_info = {
+        "enabled": False,
+        "shift_cm1": 0.0,
+        "score_ppm_per_cm": np.nan,
+        "scale": np.nan,
+        "used_points": 0,
+    }
+    if int(valid.sum()) < 8 or max_shift_cm1 <= 0:
+        return hitran.copy(), empty_info
+
+    peak = float(np.nanmax(hitran[valid]))
+    if not np.isfinite(peak) or peak <= 0:
+        return hitran.copy(), empty_info
+
+    threshold = peak * max(float(threshold_ratio), 0.0)
+    line_mask = valid & (hitran >= threshold)
+    if line_mask.any():
+        line_mask = _expand_mask_by_wavenumber_margin(
+            wavenumber=wn,
+            mask=line_mask,
+            margin_cm1=max(float(max_shift_cm1), HITRAN_O2_MASK_MARGIN_CM1),
+        )
+        line_mask &= valid
+    if int(line_mask.sum()) < max(baseline_order + 3, 8):
+        line_mask = valid
+    if int(line_mask.sum()) < max(baseline_order + 3, 8):
+        return hitran.copy(), empty_info
+
+    step = float(step_cm1) if step_cm1 > 0 else min(max_shift_cm1 / 50.0, 0.001)
+    if step <= 0:
+        return hitran.copy(), empty_info
+
+    candidates = np.arange(-max_shift_cm1, max_shift_cm1 + step * 0.5, step)
+    candidates = np.unique(np.round(np.append(candidates, 0.0), 10))
+    best_shift = 0.0
+    best_score = np.inf
+    best_scale = np.nan
+    best_used = 0
+
+    for shift in candidates:
+        shifted = _shift_hitran_loss_by_cm1(wn, hitran, shift)
+        local = line_mask & np.isfinite(shifted)
+        if int(local.sum()) < max(baseline_order + 3, 8):
+            continue
+        score, scale = _hitran_alignment_score(
+            wavenumber=wn[local],
+            measured_loss=measured[local],
+            shifted_hitran_loss=shifted[local],
+            baseline_order=baseline_order,
+        )
+        if np.isfinite(score) and score < best_score:
+            best_score = float(score)
+            best_scale = float(scale)
+            best_shift = float(shift)
+            best_used = int(local.sum())
+
+    if not np.isfinite(best_score):
+        return hitran.copy(), empty_info
+
+    aligned = _shift_hitran_loss_by_cm1(wn, hitran, best_shift)
+    info = {
+        "enabled": True,
+        "shift_cm1": best_shift,
+        "score_ppm_per_cm": best_score,
+        "scale": best_scale,
+        "used_points": best_used,
+    }
+    return aligned, info
+
+
+def _shift_hitran_loss_by_cm1(
+    wavenumber: np.ndarray,
+    hitran_loss: np.ndarray,
+    shift_cm1: float,
+) -> np.ndarray:
+    """Return HITRAN loss shifted by ``shift_cm1`` on the measured grid.
+
+    A positive shift moves HITRAN line centers to higher measured wavenumber:
+    ``H_shifted(nu) = H_original(nu - shift)``.
+    """
+    wn = np.asarray(wavenumber, dtype=float)
+    hitran = np.asarray(hitran_loss, dtype=float)
+    valid = np.isfinite(wn) & np.isfinite(hitran)
+    out = np.full_like(wn, np.nan, dtype=float)
+    if int(valid.sum()) < 2:
+        return out
+    order = np.argsort(wn[valid])
+    x = wn[valid][order]
+    y = hitran[valid][order]
+    out = np.interp(wn - float(shift_cm1), x, y, left=np.nan, right=np.nan)
+    return out
+
+
+def _hitran_alignment_score(
+    wavenumber: np.ndarray,
+    measured_loss: np.ndarray,
+    shifted_hitran_loss: np.ndarray,
+    baseline_order: int,
+) -> tuple[float, float]:
+    """Fit measured loss as smooth baseline + scaled HITRAN and return MAD score."""
+    x = np.asarray(wavenumber, dtype=float)
+    y = np.asarray(measured_loss, dtype=float)
+    h = np.asarray(shifted_hitran_loss, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(h)
+    if int(valid.sum()) < max(baseline_order + 3, 8):
+        return np.nan, np.nan
+
+    x = x[valid]
+    y = y[valid]
+    h = h[valid]
+    x0 = float(np.nanmean(x))
+    scale_x = float(np.nanmax(np.abs(x - x0)))
+    if not np.isfinite(scale_x) or scale_x <= 0:
+        scale_x = 1.0
+    x_scaled = (x - x0) / scale_x
+
+    columns = [h]
+    for deg in range(0, max(int(baseline_order), 0) + 1):
+        columns.append(np.power(x_scaled, deg))
+    design = np.column_stack(columns)
+    coeff, *_ = np.linalg.lstsq(design, y, rcond=None)
+    scale = float(coeff[0])
+    if not np.isfinite(scale) or scale <= 0:
+        return np.inf, scale
+
+    residual = y - design @ coeff
+    score = _robust_scale(residual)
+    if not np.isfinite(score) or score <= 0:
+        score = float(np.sqrt(np.nanmean(np.square(residual))))
+    return score, scale
 
 
 def _resolve_o2_hitran_table(hapi) -> str:

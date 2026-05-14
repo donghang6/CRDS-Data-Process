@@ -432,6 +432,10 @@ class CRDSPipeline:
         continuum_fit_sigma: float = 4.0,
         continuum_fit_smooth_cm1: float = 0.0,
         continuum_step2_mode: str = "auto",
+        continuum_hitran_align: bool = False,
+        continuum_hitran_align_max_shift_cm1: float = 0.05,
+        continuum_hitran_align_step_cm1: float = 0.001,
+        continuum_hitran_align_threshold_ratio: float = 0.03,
     ):
         # ── 路径 ──
         self.raw_root = Path(raw_root) if raw_root else _DEFAULT_PATHS["raw"]
@@ -508,6 +512,10 @@ class CRDSPipeline:
         self.continuum_fit_sigma = float(continuum_fit_sigma)
         self.continuum_fit_smooth_cm1 = float(continuum_fit_smooth_cm1)
         self.continuum_step2_mode = continuum_step2_mode
+        self.continuum_hitran_align = bool(continuum_hitran_align)
+        self.continuum_hitran_align_max_shift_cm1 = max(float(continuum_hitran_align_max_shift_cm1), 0.0)
+        self.continuum_hitran_align_step_cm1 = max(float(continuum_hitran_align_step_cm1), 0.0)
+        self.continuum_hitran_align_threshold_ratio = max(float(continuum_hitran_align_threshold_ratio), 0.0)
 
         # ── MATS 拟合参数 ──
         self.lineprofile = lineprofile
@@ -1507,6 +1515,10 @@ class CRDSPipeline:
             fit_sigma=self.continuum_fit_sigma,
             fit_smooth_cm1=self.continuum_fit_smooth_cm1,
             fit_mode=self.continuum_step2_mode,
+            hitran_align=self.continuum_hitran_align,
+            hitran_align_max_shift_cm1=self.continuum_hitran_align_max_shift_cm1,
+            hitran_align_step_cm1=self.continuum_hitran_align_step_cm1,
+            hitran_align_threshold_ratio=self.continuum_hitran_align_threshold_ratio,
         )
         if self.continuum_tau_file is not None:
             tasks = self._continuum_tasks_from_tau_file()

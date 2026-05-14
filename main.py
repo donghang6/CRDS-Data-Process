@@ -61,6 +61,12 @@
     # O2 连续吸收示例：只输出总损耗减 HITRAN2024 仿真，不做拟合
     python main.py --continuum --from-ringdown "CIA/273K/O2 500Torr" \
         --continuum-step2-mode o2-hitran
+    # O2 连续吸收示例：先把 HITRAN 线吸收在波数轴上对齐，再用于扣除/mask
+    python main.py --continuum --from-ringdown "CIA/273K/O2 500Torr" \
+        --continuum-step2-mode o2 --hitran-align \
+        --hitran-align-max-shift 0.05 --hitran-align-step 0.001 \
+        --cia-fit-window 8 --cia-fit-step 1 --cia-fit-order 2 \
+        --cia-fit-sigma 2 --cia-fit-smooth 2
 
     # CIA 连续吸收 Step 2 参数说明（不同气体/压力需要分别调参）:
     #   --continuum
@@ -90,6 +96,16 @@
     #       ar: loss 域连续背景拟合，适合 Ar 等无窄吸收的背景气。
     #       o2: 用 HITRAN2024 O2 仿真定位吸收区，剔除后只用非吸收区 loss 拟合 CIA 基线。
     #       o2-hitran: 只计算 loss - HITRAN2024 O2 仿真结果，先不拟合。
+    #   --hitran-align
+    #       O2 专用。扣除/遮罩 HITRAN 前，先在 ±--hitran-align-max-shift 范围内搜索
+    #       最优波数平移，使 HITRAN 线结构与实测总损耗尽量对齐；只平移波数轴，
+    #       不缩放 HITRAN 强度。输出列 hitran_o2_shift_cm1 记录平移量。
+    #   --hitran-align-max-shift VALUE
+    #       HITRAN 对齐最大搜索平移，单位 cm-1，默认 0.05。
+    #   --hitran-align-step VALUE
+    #       HITRAN 对齐搜索步长，单位 cm-1，默认 0.001。
+    #   --hitran-align-threshold VALUE
+    #       用于对齐的 HITRAN 线强阈值，相对最强线峰值的比例，默认 0.03。
     #   --continuum-window START,END
     #       可选，只处理指定波数范围。
     #   --continuum-tau-col NAME
@@ -181,6 +197,10 @@ def _parse_args(argv: list[str]) -> dict:
     continuum_fit_sigma = 4.0
     continuum_fit_smooth_cm1 = 0.0
     continuum_step2_mode = "auto"
+    continuum_hitran_align = False
+    continuum_hitran_align_max_shift_cm1 = 0.05
+    continuum_hitran_align_step_cm1 = 0.001
+    continuum_hitran_align_threshold_ratio = 0.03
     step1_dir = None
     step1_output = None
 
@@ -301,6 +321,39 @@ def _parse_args(argv: list[str]) -> dict:
                     continuum_step2_mode = mode
                 else:
                     print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 auto")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--hitran-align", "--o2-hitran-align"):
+            continuum_hitran_align = True
+            i += 1
+        elif arg in ("--hitran-align-max-shift", "--o2-hitran-align-max-shift"):
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_hitran_align_max_shift_cm1 = max(float(argv[i]), 0.0)
+                except ValueError:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 0.05")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--hitran-align-step", "--o2-hitran-align-step"):
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_hitran_align_step_cm1 = max(float(argv[i]), 0.0)
+                except ValueError:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 0.001")
+            else:
+                print(f"警告: {arg} 缺少参数，已忽略")
+            i += 1
+        elif arg in ("--hitran-align-threshold", "--o2-hitran-align-threshold"):
+            i += 1
+            if i < len(argv):
+                try:
+                    continuum_hitran_align_threshold_ratio = max(float(argv[i]), 0.0)
+                except ValueError:
+                    print(f"警告: {arg} 参数无效: {argv[i]}，使用默认值 0.03")
             else:
                 print(f"警告: {arg} 缺少参数，已忽略")
             i += 1
@@ -447,6 +500,10 @@ def _parse_args(argv: list[str]) -> dict:
         "continuum_fit_sigma": continuum_fit_sigma,
         "continuum_fit_smooth_cm1": continuum_fit_smooth_cm1,
         "continuum_step2_mode": continuum_step2_mode,
+        "continuum_hitran_align": continuum_hitran_align,
+        "continuum_hitran_align_max_shift_cm1": continuum_hitran_align_max_shift_cm1,
+        "continuum_hitran_align_step_cm1": continuum_hitran_align_step_cm1,
+        "continuum_hitran_align_threshold_ratio": continuum_hitran_align_threshold_ratio,
         "_n2_only": n2_only,
         "_from_ringdown": from_ringdown,
         "_from_etalon": from_etalon,

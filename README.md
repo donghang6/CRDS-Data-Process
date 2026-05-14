@@ -130,6 +130,14 @@ conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
   --continuum --from-ringdown 'CIA/273K/O2 500Torr' \
   --continuum-step2-mode o2-hitran
 
+# O2 示例：HITRAN 与实测线位置有微小偏差时，先对齐 HITRAN 波数轴再扣除/遮罩
+conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
+  --continuum --from-ringdown 'CIA/273K/O2 500Torr' \
+  --continuum-step2-mode o2 \
+  --hitran-align --hitran-align-max-shift 0.05 --hitran-align-step 0.001 \
+  --cia-fit-window 8 --cia-fit-step 1 --cia-fit-order 2 \
+  --cia-fit-sigma 2 --cia-fit-smooth 2
+
 # 仅对一个指定目录运行 Step 1
 # 支持文件名只保留波数，例如 9630.00400.txt
 python main.py --step1-dir '/Users/donghang/科研/实验数据/氧气连续吸收温度/原始数据初步处理/273K/Ar 500Torr'
@@ -302,6 +310,10 @@ conda run -n CRDS-Data-Process env PYTHONPATH=src python main.py \
 | `'CIA/273K/Ar 500Torr'` | 处理目标，格式为 `CIA/{温度}/{气体 压力}`。 |
 | `--continuum-step2-mode o2` | 指定 O2 的 Step 2 模式；用相同温度/压力下的 HITRAN2024 O2 仿真定位吸收区，剔除这些点后只拟合缓慢变化的 CIA baseline。Ar 示例可不加，默认 `auto` 会识别。 |
 | `--continuum-step2-mode o2-hitran` | O2 专用中间输出模式；计算 `loss_ppm_per_cm - hitran_o2_loss_ppm_per_cm`，不做 Step 2 拟合，用于先检查扣除 HITRAN2024 后的背景。 |
+| `--hitran-align` | O2 专用；扣除或遮罩 HITRAN 前，搜索一个小的波数平移，使 HITRAN 线结构与实测总损耗尽量对齐。只平移 HITRAN 波数轴，不缩放 HITRAN 强度。 |
+| `--hitran-align-max-shift 0.05` | HITRAN 对齐最大搜索范围，单位 `cm-1`；表示在 `±0.05 cm-1` 内搜索。 |
+| `--hitran-align-step 0.001` | HITRAN 对齐搜索步长，单位 `cm-1`。 |
+| `--hitran-align-threshold 0.03` | 用于对齐的 HITRAN 线强阈值，相对最强线峰值的比例；默认只用较明显的线结构估计平移。 |
 | `--cia-fit-window 40` | Step 2 在 loss 域滑动拟合的窗口宽度，单位 `cm-1`。数值越大越平滑；默认 `20`。这里的 `40` 是 Ar 示例值。 |
 | `--cia-fit-step 5` | 连续拟合锚点间隔，单位 `cm-1`。数值越小锚点越密、越贴近局部结构；默认 `5`。 |
 | `--cia-fit-order 2` | 每个窗口内的多项式阶数。推荐 `2`；局部曲率复杂可试 `3`；默认 `2`。 |
@@ -324,6 +336,10 @@ CIA 连续吸收相关参数：
 | `--cia-fit-order VALUE` / `--continuum-fit-order VALUE` | `2` | 每个窗口内的多项式阶数。 |
 | `--cia-fit-sigma VALUE` / `--continuum-fit-sigma VALUE` | `4` | 每个窗口内 robust 拟合的离群点阈值。 |
 | `--cia-fit-smooth VALUE` / `--continuum-fit-smooth VALUE` | `0` | 对 Step 2 拟合线额外平滑的宽度，单位 `cm-1`。 |
+| `--hitran-align` / `--o2-hitran-align` | 关闭 | O2 专用；对齐 HITRAN 与实测线位置后再扣除/遮罩。输出 `hitran_o2_shift_cm1`、`hitran_o2_loss_unaligned_ppm_per_cm` 等列供检查。 |
+| `--hitran-align-max-shift VALUE` | `0.05` | HITRAN 波数平移搜索半宽，单位 `cm-1`。 |
+| `--hitran-align-step VALUE` | `0.001` | HITRAN 波数平移搜索步长，单位 `cm-1`。 |
+| `--hitran-align-threshold VALUE` | `0.03` | 对齐时使用的 HITRAN 线强阈值，相对最强峰值的比例。 |
 
 推荐调参：
 
@@ -337,9 +353,9 @@ CIA 连续吸收相关参数：
 主要输出：
 
 - `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum supplement.csv`：Step 1 tau 转换出的原始 loss 表。
-- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_fit.csv`：Step 2 拟合结果。Ar 模式含 `loss_fit_ppm_per_cm`、`tau_fit_us` 和残差列；O2 模式额外含 `hitran_o2_loss_ppm_per_cm`、`o2_absorption_mask`、`o2_fit_used`、`cia_baseline_loss_ppm_per_cm`。
-- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_cia_baseline.csv`：O2 模式额外输出的纯 CIA 基线表，只保留 `wavenumber`、`cia_baseline_loss_ppm_per_cm`、`tau_fit_us` 和 mask/HITRAN 条件列。
-- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_hitran_subtracted.csv`：O2 `o2-hitran` 模式输出，含 `hitran_o2_loss_ppm_per_cm`、`loss_minus_hitran_ppm_per_cm` 和 HITRAN 使用的温度/压力列。
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_fit.csv`：Step 2 拟合结果。Ar 模式含 `loss_fit_ppm_per_cm`、`tau_fit_us` 和残差列；O2 模式额外含 `hitran_o2_loss_ppm_per_cm`、`o2_absorption_mask`、`o2_fit_used`、`cia_baseline_loss_ppm_per_cm`。若启用 `--hitran-align`，还会包含 `hitran_o2_loss_unaligned_ppm_per_cm`、`hitran_o2_shift_cm1` 和对齐质量诊断列。
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_cia_baseline.csv`：O2 模式额外输出的纯 CIA 基线表，只保留 `wavenumber`、`cia_baseline_loss_ppm_per_cm`、`tau_fit_us` 和 mask/HITRAN 条件列；启用对齐时同时保留 HITRAN 平移量。
+- `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_step2_hitran_subtracted.csv`：O2 `o2-hitran` 模式输出，含 `hitran_o2_loss_ppm_per_cm`、`loss_minus_hitran_ppm_per_cm` 和 HITRAN 使用的温度/压力列；启用对齐时 `hitran_o2_loss_ppm_per_cm` 为平移后的 HITRAN，未平移值保存在 `hitran_o2_loss_unaligned_ppm_per_cm`。
 - `output/results/continuum/CIA/{temperature}/{gas pressure}/continuum_spectrum.png`：上 tau、下 loss 的拟合图。
 - `output/results/continuum/continuum_summary.csv`：汇总表，包含 Step 2 拟合参数和残差统计。
 - `output/results/continuum/continuum_pressure_fits.csv`：多压力数据存在时的压力依赖拟合结果。
